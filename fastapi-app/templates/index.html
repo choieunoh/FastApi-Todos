@@ -12,21 +12,65 @@
         li { display: flex; align-items: center; gap: .5rem; padding: .4rem 0; border-bottom: 1px solid #e5e5e5; }
         li span { flex: 1; }
         .done { text-decoration: line-through; color: #888; }
+        .version {
+         color: #666;
+         font-size: 0.9rem;
+         margin-top: -1rem;
+         margin-bottom: 1.5rem;
+        }
         #error { color: #b00020; }
+        .controls {
+           margin-bottom: 1rem;
+         }
+
+        #search {
+         width: 100%;
+         padding: .5rem;
+         box-sizing: border-box;
+        }
+        .filter-buttons {
+         display: flex;
+         gap: .5rem;
+         margin-top: .5rem;
+        }
+
+        .filter-buttons button {
+         padding: .4rem .8rem;
+         cursor: pointer;
+        }
     </style>
 </head>
 <body>
     <h1>To-Do List</h1>
+    <p class="version">Version 2.0.0</p>
     <form id="todo-form">
         <input type="text" id="title" placeholder="제목 (예: 20231234)" required>
         <input type="text" id="description" placeholder="설명 (예: 홍길동)">
         <button type="submit">Add To-Do</button>
     </form>
+    <div class="controls">
+      <input
+        type="text"
+        id="search"
+        placeholder="할 일 검색"
+      >
+      <div class="filter-buttons">
+        <button type="button" data-filter="all">전체</button>
+        <button type="button" data-filter="active">진행 중</button>
+        <button type="button" data-filter="completed">완료</button>
+     </div>
+    </div>
     <p id="error" role="alert" hidden></p>
     <ul id="todo-list"></ul>
     <script>
         const $ = (id) => document.getElementById(id);
         const listEl = $("todo-list"), errorEl = $("error");
+        let allTodos = [];
+
+        const searchEl = $("search");
+        let currentFilter = "all";
+
+        const filterButtons = document.querySelectorAll("[data-filter]");
 
         // 모든 요청을 한 곳에서 처리하고, 실패는 조용히 넘기지 않는다
         async function api(url, method = "GET", body) {
@@ -48,7 +92,37 @@
           }
         }
 
-        const load = () => run("목록 불러오기", async () => render(await api("/todos")));
+        const load = () => run("목록 불러오기", async () => {
+        allTodos = await api("/todos");
+        applyFilters();
+        });
+
+        function applyFilters() {
+        const keyword = searchEl.value.trim().toLowerCase();
+
+        const filtered = allTodos.filter((todo) => {
+        const matchesSearch =
+        todo.title.toLowerCase().includes(keyword) ||
+        todo.description.toLowerCase().includes(keyword);
+
+        const matchesFilter =
+        currentFilter === "all" ||
+        (currentFilter === "active" && !todo.completed) ||
+        (currentFilter === "completed" && todo.completed);
+
+        return matchesSearch && matchesFilter;
+        });
+
+        render(filtered);
+        }
+
+        searchEl.addEventListener("input", applyFilters);
+        filterButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+        currentFilter = button.dataset.filter;
+        applyFilters();
+        });
+        });
         const save = (id, todo) => run("수정", async () => { await api(`/todos/${id}`, "PUT", todo); await load(); });
 
         function button(label, onclick) {
@@ -95,6 +169,6 @@
         };
 
         load();
-    </script>
+     </script>
 </body>
 </html>
