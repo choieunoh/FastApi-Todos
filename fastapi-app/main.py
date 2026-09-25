@@ -15,10 +15,12 @@ if not TODO_FILE.exists():                       # 없으면 빈 목록으로 �
 app = FastAPI(title="To-Do List API")
 
 
-class TodoIn(BaseModel):                         # 클라이언트가 보내는 데이터 (id 없음)
+class TodoIn(BaseModel):
     title: str = Field(min_length=1, max_length=100)
     description: str = ""
     completed: bool = False
+    priority: str = "보통"
+    due_date: str = ""
 
 
 class TodoItem(TodoIn):                          # 서버가 돌려주는 데이터 (id 있음)

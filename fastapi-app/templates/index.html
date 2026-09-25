@@ -38,15 +38,52 @@
          padding: .4rem .8rem;
          cursor: pointer;
         }
-    </style>
+        .sort-controls {
+         display: flex;
+         align-items: center;
+         gap: .5rem;
+         margin-top: .8rem;
+        }
+
+        .sort-controls select {
+         padding: .4rem;
+        }
+
+        .overdue {
+         color: #b00020;
+         font-weight: bold;
+        }
+     </style>
 </head>
 <body>
     <h1>To-Do List</h1>
-    <p class="version">Version 2.0.0</p>
+    <p class="version">Version 3.0.0</p>
     <form id="todo-form">
-        <input type="text" id="title" placeholder="제목 (예: 20231234)" required>
-        <input type="text" id="description" placeholder="설명 (예: 홍길동)">
-        <button type="submit">Add To-Do</button>
+      <input
+        type="text"
+        id="title"
+        placeholder="제목 (예: 오픈소스 과제)"
+        required
+      >
+
+      <input
+        type="text"
+        id="description"
+        placeholder="설명 (예: 보고서 작성)"
+      >
+
+      <select id="priority">
+        <option value="높음">높음</option>
+        <option value="보통" selected>보통</option>
+        <option value="낮음">낮음</option>
+      </select>
+
+      <input
+        type="date"
+        id="due-date"
+      >
+
+      <button type="submit">Add To-Do</button>
     </form>
     <div class="controls">
       <input
@@ -58,7 +95,15 @@
         <button type="button" data-filter="all">전체</button>
         <button type="button" data-filter="active">진행 중</button>
         <button type="button" data-filter="completed">완료</button>
-     </div>
+      </div>
+      <div class="sort-controls">
+       <label for="sort">정렬:</label>
+       <select id="sort">
+         <option value="default">기본순</option>
+         <option value="priority">우선순위순</option>
+         <option value="due-date">마감일순</option>
+       </select>
+      </div>
     </div>
     <p id="error" role="alert" hidden></p>
     <ul id="todo-list"></ul>
@@ -68,6 +113,8 @@
         let allTodos = [];
 
         const searchEl = $("search");
+        const sortEl = $("sort");
+
         let currentFilter = "all";
 
         const filterButtons = document.querySelectorAll("[data-filter]");
@@ -112,11 +159,35 @@
 
         return matchesSearch && matchesFilter;
         });
+        // 정렬
+        if (sortEl.value === "priority") {
+          const priorityOrder = {
+            "높음": 1,
+            "보통": 2,
+            "낮음": 3
+          };
+
+          filtered.sort((a, b) => {
+            return (priorityOrder[a.priority] || 2) -
+                   (priorityOrder[b.priority] || 2);
+          });
+        }
+
+        if (sortEl.value === "due-date") {
+          filtered.sort((a, b) => {
+            if (!a.due_date && !b.due_date) return 0;
+            if (!a.due_date) return 1;
+            if (!b.due_date) return -1;
+
+            return a.due_date.localeCompare(b.due_date);
+          });
+        }
 
         render(filtered);
         }
 
         searchEl.addEventListener("input", applyFilters);
+        sortEl.addEventListener("change", applyFilters);
         filterButtons.forEach((button) => {
         button.addEventListener("click", () => {
         currentFilter = button.dataset.filter;
@@ -136,9 +207,29 @@
               checked: todo.completed,
               onchange: () => save(todo.id, { ...todo, completed: check.checked }),
             });
+            const now = new Date();
+            const today =
+              `${now.getFullYear()}-` +
+              `${String(now.getMonth() + 1).padStart(2, "0")}-` +
+              `${String(now.getDate()).padStart(2, "0")}`;
+
+            const isOverdue =
+              todo.due_date &&
+              todo.due_date < today &&
+              !todo.completed;
+
             const text = Object.assign(document.createElement("span"), {
-              textContent: `${todo.title} — ${todo.description}`,
-              className: todo.completed ? "done" : "",
+              textContent:
+                `${todo.title} — ${todo.description} | ` +
+                `우선순위: ${todo.priority || "보통"} | ` +
+                `마감일: ${todo.due_date || "없음"}` +
+                (isOverdue ? " | ⚠ 기한 초과" : ""),
+
+              className: todo.completed
+                ? "done"
+                : isOverdue
+                  ? "overdue"
+                  : "",
             });
             const li = document.createElement("li");
             li.append(check, text, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
@@ -149,9 +240,34 @@
         function edit(todo) {
           const title = prompt("새 제목:", todo.title);
           if (title === null) return;
+
           const description = prompt("새 설명:", todo.description);
           if (description === null) return;
-          save(todo.id, { ...todo, title: title.trim(), description: description.trim() });
+
+          const priority = prompt(
+            "새 우선순위 (높음 / 보통 / 낮음):",
+            todo.priority || "보통"
+          );
+          if (priority === null) return;
+
+          if (!["높음", "보통", "낮음"].includes(priority.trim())) {
+            alert("우선순위는 높음, 보통, 낮음 중 하나를 입력해주세요.");
+            return;
+          }
+
+          const dueDate = prompt(
+            "새 마감일 (YYYY-MM-DD, 없으면 빈칸):",
+            todo.due_date || ""
+          );
+          if (dueDate === null) return;
+
+          save(todo.id, {
+            ...todo,
+            title: title.trim(),
+            description: description.trim(),
+            priority: priority.trim(),
+            due_date: dueDate.trim()
+          });
         }
 
         function remove(id) {
@@ -161,8 +277,15 @@
 
         $("todo-form").onsubmit = (event) => {
           event.preventDefault();
+
           run("추가", async () => {
-            await api("/todos", "POST", { title: $("title").value.trim(), description: $("description").value.trim() });
+            await api("/todos", "POST", {
+              title: $("title").value.trim(),
+              description: $("description").value.trim(),
+              priority: $("priority").value,
+              due_date: $("due-date").value
+            });
+
             event.target.reset();
             await load();
           });
