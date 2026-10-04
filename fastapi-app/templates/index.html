@@ -10,54 +10,89 @@
         input[type="text"] { flex: 1 1 12rem; padding: .5rem; }
         ul { list-style: none; padding: 0; }
         li { display: flex; align-items: center; gap: .5rem; padding: .4rem 0; border-bottom: 1px solid #e5e5e5; }
-        li span { flex: 1; }
+        .content { flex: 1; display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
         .done { text-decoration: line-through; color: #888; }
         .version {
-         color: #666;
-         font-size: 0.9rem;
-         margin-top: -1rem;
-         margin-bottom: 1.5rem;
+          color: #666;
+          font-size: 0.9rem;
+          margin-top: -1rem;
+          margin-bottom: 1.5rem;
         }
         #error { color: #b00020; }
         .controls {
-           margin-bottom: 1rem;
-         }
+          margin-bottom: 1rem;
+        }
 
         #search {
-         width: 100%;
-         padding: .5rem;
-         box-sizing: border-box;
+          width: 100%;
+          padding: .5rem;
+          box-sizing: border-box;
         }
         .filter-buttons {
-         display: flex;
-         gap: .5rem;
-         margin-top: .5rem;
+          display: flex;
+          gap: .5rem;
+          margin-top: .5rem;
         }
 
         .filter-buttons button {
-         padding: .4rem .8rem;
-         cursor: pointer;
+          padding: .4rem .8rem;
+          cursor: pointer;
+        }
+        .filter-buttons button.active {
+          background: #333;
+          color: #fff;
+          border-color: #333;
         }
         .sort-controls {
-         display: flex;
-         align-items: center;
-         gap: .5rem;
-         margin-top: .8rem;
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: .5rem;
+          margin-top: .8rem;
         }
 
         .sort-controls select {
-         padding: .4rem;
+          padding: .4rem;
         }
 
         .overdue {
-         color: #b00020;
-         font-weight: bold;
+          color: #b00020;
+          font-weight: bold;
         }
+
+        .stats {
+          display: flex;
+          flex-wrap: wrap;
+          gap: .4rem 1rem;
+          padding: .6rem .8rem;
+          margin-bottom: 1rem;
+          background: #f5f5f5;
+          border-radius: 6px;
+        }
+
+        .tags { display: flex; flex-wrap: wrap; gap: .3rem; }
+        .tags:empty { display: none; }
+        .tag {
+          padding: .1rem .5rem;
+          font-size: .8rem;
+          border: 1px solid #c8d6f0;
+          border-radius: 999px;
+          background: #eef3fc;
+          color: #2a4a8a;
+          cursor: pointer;
+        }
+
+        .meta { display: flex; flex-wrap: wrap; gap: .6rem; font-size: .8rem; color: #777; }
+        .meta:empty { display: none; }
+        .dday { font-weight: bold; color: #2a4a8a; }
+        .dday.overdue { color: #b00020; }
+
+        .edit-form { flex: 1; margin: 0; }
      </style>
 </head>
 <body>
     <h1>To-Do List</h1>
-    <p class="version">Version 3.0.0</p>
+    <p class="version">Version 4.0.0</p>
     <form id="todo-form">
       <input
         type="text"
@@ -72,19 +107,29 @@
         placeholder="설명 (예: 보고서 작성)"
       >
 
-      <select id="priority">
-        <option value="높음">높음</option>
-        <option value="보통" selected>보통</option>
-        <option value="낮음">낮음</option>
-      </select>
+      <select id="priority" aria-label="우선순위"></select>
 
       <input
         type="date"
         id="due-date"
+        aria-label="마감일"
+      >
+
+      <input
+        type="text"
+        id="tags"
+        placeholder="태그 (쉼표로 구분, 예: 학교, 과제)"
       >
 
       <button type="submit">Add To-Do</button>
     </form>
+    <div class="stats" aria-label="진행률 통계">
+      <span>전체 <strong id="stat-total" data-testid="stat-total">0</strong></span>
+      <span>완료 <strong id="stat-completed" data-testid="stat-completed">0</strong></span>
+      <span>진행 중 <strong id="stat-active" data-testid="stat-active">0</strong></span>
+      <span>기한 초과 <strong id="stat-overdue" data-testid="stat-overdue">0</strong></span>
+      <span>완료율 <strong id="stat-rate" data-testid="stat-rate">0%</strong></span>
+    </div>
     <div class="controls">
       <input
         type="text"
@@ -97,12 +142,16 @@
         <button type="button" data-filter="completed">완료</button>
       </div>
       <div class="sort-controls">
-       <label for="sort">정렬:</label>
-       <select id="sort">
-         <option value="default">기본순</option>
-         <option value="priority">우선순위순</option>
-         <option value="due-date">마감일순</option>
-       </select>
+        <label for="sort">정렬:</label>
+        <select id="sort">
+          <option value="default">기본순</option>
+          <option value="priority">우선순위순</option>
+          <option value="due-date">마감일순</option>
+        </select>
+        <label for="tag-filter">태그:</label>
+        <select id="tag-filter" data-testid="tag-filter">
+          <option value="">전체 태그</option>
+        </select>
       </div>
     </div>
     <p id="error" role="alert" hidden></p>
@@ -110,14 +159,17 @@
     <script>
         const $ = (id) => document.getElementById(id);
         const listEl = $("todo-list"), errorEl = $("error");
-        let allTodos = [];
-
-        const searchEl = $("search");
-        const sortEl = $("sort");
-
-        let currentFilter = "all";
-
+        const searchEl = $("search"), sortEl = $("sort"), tagFilterEl = $("tag-filter");
         const filterButtons = document.querySelectorAll("[data-filter]");
+
+        // 우선순위는 여기 한 곳에서만 정의한다
+        const PRIORITIES = ["높음", "보통", "낮음"];
+        const DEFAULT_PRIORITY = "보통";
+        const PRIORITY_ORDER = Object.fromEntries(PRIORITIES.map((p, i) => [p, i]));
+
+        let allTodos = [];
+        let currentFilter = "all";
+        let editingId = null;                    // 수정 폼이 열린 항목 (한 번에 하나)
 
         // 모든 요청을 한 곳에서 처리하고, 실패는 조용히 넘기지 않는다
         async function api(url, method = "GET", body) {
@@ -139,141 +191,232 @@
           }
         }
 
+        function el(tag, props = {}) {
+          return Object.assign(document.createElement(tag), props);
+        }
+
+        function button(label, onclick) {
+          return el("button", { type: "button", textContent: label, onclick });
+        }
+
+        function priorityOptions(select, selected) {
+          select.replaceChildren(...PRIORITIES.map((p) =>
+            el("option", { value: p, textContent: p, defaultSelected: p === selected, selected: p === selected })));
+        }
+
+        // 날짜는 모두 브라우저 로컬 기준 YYYY-MM-DD 로 다룬다
+        function ymd(d) {
+          return `${d.getFullYear()}-` +
+            `${String(d.getMonth() + 1).padStart(2, "0")}-` +
+            `${String(d.getDate()).padStart(2, "0")}`;
+        }
+
+        const todayStr = () => ymd(new Date());
+
+        const parseTags = (text) => text.split(",").map((t) => t.trim()).filter(Boolean);
+
+        const isOverdue = (todo, today) =>
+          Boolean(todo.due_date) && todo.due_date < today && !todo.completed;
+
+        function ddayLabel(dueDate, today) {
+          const toUtc = (s) => { const [y, m, d] = s.split("-").map(Number); return Date.UTC(y, m - 1, d); };
+          const days = Math.round((toUtc(dueDate) - toUtc(today)) / 86400000);
+          if (days > 0) return `D-${days}`;
+          if (days === 0) return "오늘 마감";
+          return `D+${-days}`;
+        }
+
         const load = () => run("목록 불러오기", async () => {
-        allTodos = await api("/todos");
-        applyFilters();
+          allTodos = await api("/todos");
+          renderTagOptions();
+          applyFilters();
         });
+
+        // 지금 존재하는 태그로 필터 목록을 다시 만든다 (선택한 태그가 사라지면 전체로)
+        function renderTagOptions() {
+          const selected = tagFilterEl.value;
+          const tags = [...new Set(allTodos.flatMap((todo) => todo.tags))].sort((a, b) => a.localeCompare(b, "ko"));
+          tagFilterEl.replaceChildren(
+            el("option", { value: "", textContent: "전체 태그" }),
+            ...tags.map((tag) => el("option", { value: tag, textContent: tag })),
+          );
+          tagFilterEl.value = tags.includes(selected) ? selected : "";
+        }
 
         function applyFilters() {
-        const keyword = searchEl.value.trim().toLowerCase();
+          const keyword = searchEl.value.trim().toLowerCase();
+          const tag = tagFilterEl.value;
 
-        const filtered = allTodos.filter((todo) => {
-        const matchesSearch =
-        todo.title.toLowerCase().includes(keyword) ||
-        todo.description.toLowerCase().includes(keyword);
+          const filtered = allTodos.filter((todo) => {
+            const matchesSearch =
+              todo.title.toLowerCase().includes(keyword) ||
+              todo.description.toLowerCase().includes(keyword);
 
-        const matchesFilter =
-        currentFilter === "all" ||
-        (currentFilter === "active" && !todo.completed) ||
-        (currentFilter === "completed" && todo.completed);
+            const matchesFilter =
+              currentFilter === "all" ||
+              (currentFilter === "active" && !todo.completed) ||
+              (currentFilter === "completed" && todo.completed);
 
-        return matchesSearch && matchesFilter;
-        });
-        // 정렬
-        if (sortEl.value === "priority") {
-          const priorityOrder = {
-            "높음": 1,
-            "보통": 2,
-            "낮음": 3
-          };
+            const matchesTag = !tag || todo.tags.includes(tag);
 
-          filtered.sort((a, b) => {
-            return (priorityOrder[a.priority] || 2) -
-                   (priorityOrder[b.priority] || 2);
+            return matchesSearch && matchesFilter && matchesTag;
           });
+
+          // 정렬
+          if (sortEl.value === "priority") {
+            const order = (p) => PRIORITY_ORDER[p] ?? PRIORITY_ORDER[DEFAULT_PRIORITY];
+            filtered.sort((a, b) => order(a.priority) - order(b.priority));
+          }
+
+          if (sortEl.value === "due-date") {
+            filtered.sort((a, b) => {
+              if (!a.due_date && !b.due_date) return 0;
+              if (!a.due_date) return 1;
+              if (!b.due_date) return -1;
+
+              return a.due_date.localeCompare(b.due_date);
+            });
+          }
+
+          filterButtons.forEach((btn) => {
+            const active = btn.dataset.filter === currentFilter;
+            btn.classList.toggle("active", active);
+            btn.setAttribute("aria-pressed", active);
+          });
+
+          const today = todayStr();
+          renderStats(today);
+          render(filtered, today);
         }
 
-        if (sortEl.value === "due-date") {
-          filtered.sort((a, b) => {
-            if (!a.due_date && !b.due_date) return 0;
-            if (!a.due_date) return 1;
-            if (!b.due_date) return -1;
-
-            return a.due_date.localeCompare(b.due_date);
-          });
-        }
-
-        render(filtered);
+        // 통계는 필터와 상관없이 전체 목록 기준
+        function renderStats(today) {
+          const total = allTodos.length;
+          const completed = allTodos.filter((todo) => todo.completed).length;
+          const overdue = allTodos.filter((todo) => isOverdue(todo, today)).length;
+          $("stat-total").textContent = total;
+          $("stat-completed").textContent = completed;
+          $("stat-active").textContent = total - completed;
+          $("stat-overdue").textContent = overdue;
+          $("stat-rate").textContent = `${total ? Math.round(completed / total * 100) : 0}%`;
         }
 
         searchEl.addEventListener("input", applyFilters);
         sortEl.addEventListener("change", applyFilters);
-        filterButtons.forEach((button) => {
-        button.addEventListener("click", () => {
-        currentFilter = button.dataset.filter;
-        applyFilters();
+        tagFilterEl.addEventListener("change", applyFilters);
+        filterButtons.forEach((btn) => {
+          btn.addEventListener("click", () => {
+            currentFilter = btn.dataset.filter;
+            applyFilters();
+          });
         });
-        });
+
         const save = (id, todo) => run("수정", async () => { await api(`/todos/${id}`, "PUT", todo); await load(); });
 
-        function button(label, onclick) {
-          return Object.assign(document.createElement("button"), { textContent: label, onclick });
+        function render(todos, today) {
+          listEl.replaceChildren(...todos.map((todo) =>
+            todo.id === editingId ? renderEditItem(todo) : renderItem(todo, today)));
         }
 
-        function render(todos) {
-          listEl.replaceChildren(...todos.map((todo) => {
-            const check = Object.assign(document.createElement("input"), {
-              type: "checkbox",
-              checked: todo.completed,
-              onchange: () => save(todo.id, { ...todo, completed: check.checked }),
-            });
-            const now = new Date();
-            const today =
-              `${now.getFullYear()}-` +
-              `${String(now.getMonth() + 1).padStart(2, "0")}-` +
-              `${String(now.getDate()).padStart(2, "0")}`;
+        function renderItem(todo, today) {
+          const check = el("input", {
+            type: "checkbox",
+            checked: todo.completed,
+            onchange: () => save(todo.id, { ...todo, completed: check.checked }),
+          });
 
-            const isOverdue =
-              todo.due_date &&
-              todo.due_date < today &&
-              !todo.completed;
+          const overdue = isOverdue(todo, today);
+          const text = el("span", {
+            textContent:
+              `${todo.title} — ${todo.description} | ` +
+              `우선순위: ${todo.priority || DEFAULT_PRIORITY} | ` +
+              `마감일: ${todo.due_date || "없음"}` +
+              (overdue ? " | ⚠ 기한 초과" : ""),
+            className: todo.completed ? "done" : overdue ? "overdue" : "",
+          });
 
-            const text = Object.assign(document.createElement("span"), {
-              textContent:
-                `${todo.title} — ${todo.description} | ` +
-                `우선순위: ${todo.priority || "보통"} | ` +
-                `마감일: ${todo.due_date || "없음"}` +
-                (isOverdue ? " | ⚠ 기한 초과" : ""),
-
-              className: todo.completed
-                ? "done"
-                : isOverdue
-                  ? "overdue"
-                  : "",
-            });
-            const li = document.createElement("li");
-            li.append(check, text, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
-            return li;
+          const tags = el("div", { className: "tags" });
+          tags.append(...todo.tags.map((tag) => {
+            const chip = button(`#${tag}`, () => { tagFilterEl.value = tag; applyFilters(); });
+            chip.className = "tag";
+            chip.dataset.testid = "todo-tag";
+            return chip;
           }));
+
+          const meta = el("div", { className: "meta" });
+          if (todo.due_date && !todo.completed) {
+            const dday = el("span", { className: overdue ? "dday overdue" : "dday", textContent: ddayLabel(todo.due_date, today) });
+            dday.dataset.testid = "dday";
+            meta.append(dday);
+          }
+          if (todo.created_at) meta.append(el("span", { textContent: `생성: ${ymd(new Date(todo.created_at))}` }));
+          if (todo.completed && todo.completed_at) meta.append(el("span", { textContent: `완료: ${ymd(new Date(todo.completed_at))}` }));
+
+          const content = el("div", { className: "content" });
+          content.append(text, tags, meta);
+
+          const li = el("li");
+          li.dataset.testid = "todo-item";
+          li.append(check, content, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
+          return li;
+        }
+
+        // 수정 폼 — 저장에 실패하면 폼을 그대로 두고 오류만 띄운다
+        function renderEditItem(todo) {
+          const title = el("input", { type: "text", value: todo.title, placeholder: "제목" });
+          const description = el("input", { type: "text", value: todo.description, placeholder: "설명" });
+          const priority = el("select");
+          priorityOptions(priority, todo.priority || DEFAULT_PRIORITY);
+          const dueDate = el("input", { type: "date", value: todo.due_date || "" });
+          const tags = el("input", { type: "text", value: todo.tags.join(", "), placeholder: "태그 (쉼표로 구분)" });
+          title.setAttribute("aria-label", "제목");
+          description.setAttribute("aria-label", "설명");
+          priority.setAttribute("aria-label", "우선순위");
+          dueDate.setAttribute("aria-label", "마감일");
+          tags.setAttribute("aria-label", "태그");
+
+          const saveBtn = el("button", { type: "submit", textContent: "저장" });
+          saveBtn.dataset.testid = "edit-save";
+          const cancelBtn = button("취소", () => { editingId = null; applyFilters(); });
+          cancelBtn.dataset.testid = "edit-cancel";
+
+          const form = el("form", { className: "edit-form" });
+          form.dataset.testid = "edit-form";
+          form.append(title, description, priority, dueDate, tags, saveBtn, cancelBtn);
+          form.onsubmit = (event) => {
+            event.preventDefault();
+            run("수정", async () => {
+              await api(`/todos/${todo.id}`, "PUT", {
+                title: title.value.trim(),
+                description: description.value.trim(),
+                completed: todo.completed,
+                priority: priority.value,
+                due_date: dueDate.value,
+                tags: parseTags(tags.value),
+              });
+              editingId = null;
+              await load();
+            });
+          };
+
+          const li = el("li");
+          li.dataset.testid = "todo-item";
+          li.append(form);
+          return li;
         }
 
         function edit(todo) {
-          const title = prompt("새 제목:", todo.title);
-          if (title === null) return;
-
-          const description = prompt("새 설명:", todo.description);
-          if (description === null) return;
-
-          const priority = prompt(
-            "새 우선순위 (높음 / 보통 / 낮음):",
-            todo.priority || "보통"
-          );
-          if (priority === null) return;
-
-          if (!["높음", "보통", "낮음"].includes(priority.trim())) {
-            alert("우선순위는 높음, 보통, 낮음 중 하나를 입력해주세요.");
-            return;
-          }
-
-          const dueDate = prompt(
-            "새 마감일 (YYYY-MM-DD, 없으면 빈칸):",
-            todo.due_date || ""
-          );
-          if (dueDate === null) return;
-
-          save(todo.id, {
-            ...todo,
-            title: title.trim(),
-            description: description.trim(),
-            priority: priority.trim(),
-            due_date: dueDate.trim()
-          });
+          editingId = todo.id;
+          applyFilters();
+          listEl.querySelector(".edit-form input")?.focus();
         }
 
         function remove(id) {
           if (!confirm("정말 삭제할까요?")) return;
           run("삭제", async () => { await api(`/todos/${id}`, "DELETE"); await load(); });
         }
+
+        priorityOptions($("priority"), DEFAULT_PRIORITY);
 
         $("todo-form").onsubmit = (event) => {
           event.preventDefault();
@@ -283,7 +426,8 @@
               title: $("title").value.trim(),
               description: $("description").value.trim(),
               priority: $("priority").value,
-              due_date: $("due-date").value
+              due_date: $("due-date").value,
+              tags: parseTags($("tags").value),
             });
 
             event.target.reset();
