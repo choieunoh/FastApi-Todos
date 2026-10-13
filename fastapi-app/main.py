@@ -18,14 +18,16 @@ if not TODO_FILE.exists():                       # 없으면 빈 목록으로 �
 app = FastAPI(title="To-Do List API")
 
 Priority = Literal["높음", "보통", "낮음"]
+Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]  # 할 일·하위 할 일 공용
 MAX_TAGS, MAX_TAG_LEN = 10, 20
 UNDO_TTL = timedelta(seconds=30)                 # 삭제 후 복구할 수 있는 시간
 BULK_MAX = 100                                   # 일괄 작업 한 번에 고를 수 있는 최대 건수
 UNDO_MAX = BULK_MAX                              # 복구 버퍼·복구 요청 최대 건수 — 일괄 삭제 한 번을 모두 되돌릴 수 있게
+SUBTASK_MAX = 20                                 # 할 일 하나에 둘 수 있는 하위 할 일 수
 
 
 class TodoIn(BaseModel):                         # 클라이언트가 보내는 데이터 — 시각 필드는 받지 않는다
-    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+    title: Title
     description: Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)] = ""
     completed: bool = False
     priority: Priority = "보통"
@@ -59,10 +61,26 @@ class TodoIn(BaseModel):                         # 클라이언트가 보내는 
         return result
 
 
-class TodoItem(TodoIn):                          # 서버가 돌려주는 데이터 (id·시각 있음)
+class Subtask(BaseModel):                        # 하위 할 일 — id 는 그 할 일 안에서만 고유하다
+    id: int
+    title: Title
+    completed: bool = False
+
+
+class SubtaskIn(BaseModel):                      # 하위 할 일 추가 요청
+    title: Title
+
+
+class SubtaskUpdate(BaseModel):                  # 하위 할 일 수정 요청 — 전체 교체라 두 필드 모두 필수
+    title: Title
+    completed: StrictBool
+
+
+class TodoItem(TodoIn):                          # 서버가 돌려주는 데이터 (id·시각·하위 할 일 있음)
     id: int
     created_at: datetime | None = None
     completed_at: datetime | None = None
+    subtasks: list[Subtask] = []                 # 서버가 관리 — POST/PUT 본문의 값은 받지 않는다
 
 
 class RestoreIn(BaseModel):                      # 삭제 실행 취소 요청
@@ -146,6 +164,13 @@ def find_index(todos: list[TodoItem], todo_id: int) -> int:
     raise HTTPException(404, "To-Do item not found")
 
 
+def find_subtask_index(todo: TodoItem, subtask_id: int) -> int:
+    for i, subtask in enumerate(todo.subtasks):
+        if subtask.id == subtask_id:
+            return i
+    raise HTTPException(404, "Subtask not found")
+
+
 # find_index가 던지는 404를 OpenAPI 문서에 명시
 NOT_FOUND_RESPONSE: dict[int | str, dict[str, object]] = {
     404: {"description": "To-Do item not found"},
@@ -212,7 +237,8 @@ def update_todo(todo_id: int, payload: TodoIn) -> TodoItem:
     todos = load_todos()
     index = find_index(todos, todo_id)
     old = todos[index]
-    todo = apply_completion(old, TodoItem(id=todo_id, created_at=old.created_at, **payload.model_dump()))
+    todo = apply_completion(old, TodoItem(
+        id=todo_id, created_at=old.created_at, subtasks=old.subtasks, **payload.model_dump()))
     todos[index] = todo
     save_todos(todos)
     return todo
@@ -225,6 +251,43 @@ def delete_todo(todo_id: int) -> None:
     todo = todos.pop(index)
     save_todos(todos)
     remember_deleted(todo, index)
+
+
+# ---------- 하위 할 일 — 상위 할 일의 completed 와는 연동하지 않는다 ----------
+
+SUBTASK_RESPONSES: dict[int | str, dict[str, object]] = {
+    404: {"description": "To-Do item or subtask not found"},
+}
+
+
+@app.post("/todos/{todo_id}/subtasks", status_code=201,
+          responses={**SUBTASK_RESPONSES, 422: {"description": f"제목 검증 실패 또는 {SUBTASK_MAX}개 초과"}})
+def add_subtask(todo_id: int, payload: SubtaskIn) -> TodoItem:
+    todos = load_todos()
+    todo = todos[find_index(todos, todo_id)]
+    if len(todo.subtasks) >= SUBTASK_MAX:        # 개수 한도는 저장된 상태로만 알 수 있다
+        raise HTTPException(422, f"하위 할 일은 최대 {SUBTASK_MAX}개입니다")
+    new_id = max((s.id for s in todo.subtasks), default=0) + 1
+    todo.subtasks.append(Subtask(id=new_id, title=payload.title))
+    save_todos(todos)
+    return todo
+
+
+@app.put("/todos/{todo_id}/subtasks/{subtask_id}", responses=SUBTASK_RESPONSES)
+def update_subtask(todo_id: int, subtask_id: int, payload: SubtaskUpdate) -> TodoItem:
+    todos = load_todos()
+    todo = todos[find_index(todos, todo_id)]
+    todo.subtasks[find_subtask_index(todo, subtask_id)] = Subtask(id=subtask_id, **payload.model_dump())
+    save_todos(todos)
+    return todo
+
+
+@app.delete("/todos/{todo_id}/subtasks/{subtask_id}", status_code=204, responses=SUBTASK_RESPONSES)
+def delete_subtask(todo_id: int, subtask_id: int) -> None:
+    todos = load_todos()
+    todo = todos[find_index(todos, todo_id)]
+    del todo.subtasks[find_subtask_index(todo, subtask_id)]
+    save_todos(todos)
 
 
 @app.get("/", include_in_schema=False)           # 화면 서빙

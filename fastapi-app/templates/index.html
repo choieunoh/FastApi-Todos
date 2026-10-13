@@ -125,6 +125,17 @@
           cursor: pointer;
         }
 
+        .subtask-head { display: flex; align-items: center; gap: .6rem; font-size: .85rem; }
+        .subtask-toggle { padding: 0; color: #2a4a8a; background: none; border: none; cursor: pointer; }
+        .subtask-progress { display: inline-flex; align-items: center; gap: .3rem; color: #555; }
+        .subtask-progress progress { width: 5rem; height: .6rem; }
+        .subtasks { margin-top: .2rem; padding-left: .6rem; border-left: 2px solid #e5e5e5; }
+        .subtasks ul { margin: 0; }
+        .subtasks li { padding: .15rem 0; border-bottom: none; font-size: .9rem; }
+        .subtasks li span { flex: 1; min-width: 0; }
+        .subtasks form { margin: .2rem 0 0; }
+        .subtasks input[type="text"] { flex: 1 1 8rem; padding: .25rem; }
+
         .favorite {
           padding: 0 .2rem;
           font-size: 1.2rem;
@@ -239,6 +250,9 @@
 
         const selectedIds = new Set();           // 일괄 작업 대상 (지금 보이는 항목만 남긴다)
         let visibleIds = [];
+
+        const expandedSubtasks = new Set();      // 하위 목록을 펼친 할 일 (새로고침하면 다시 접힌다)
+        let editingSubtask = null;               // 제목을 고치는 하위 할 일 { todoId, id } — 한 번에 하나
         let editingId = null;                    // 수정 폼이 열린 항목 (한 번에 하나)
 
         // 모든 요청을 한 곳에서 처리하고, 실패는 조용히 넘기지 않는다
@@ -439,6 +453,7 @@
             checked: todo.completed,
             onchange: () => save(todo, { completed: check.checked }),
           });
+          check.className = "todo-check";
           check.setAttribute("aria-label", `${todo.title} 완료`);
 
           const star = button(todo.favorite ? "★" : "☆", () => save(todo, { favorite: !todo.favorite }));
@@ -475,10 +490,111 @@
           if (todo.completed && todo.completed_at) meta.append(el("span", { textContent: `완료: ${ymd(new Date(todo.completed_at))}` }));
 
           const content = el("div", { className: "content" });
-          content.append(text, tags, meta);
+          content.append(text, tags, meta, renderSubtasks(todo));
 
           li.dataset.testid = "todo-item";
           li.append(pick, check, star, content, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
+          return li;
+        }
+
+        // 하위 할 일 — 상위 completed 와 연동하지 않고 진행률만 보여준다
+        const subtaskUrl = (todoId, id) => `/todos/${todoId}/subtasks${id ? `/${id}` : ""}`;
+
+        function subtaskJob(what, job) {
+          return run(what, async () => { await job(); await load(); });
+        }
+
+        function renderSubtasks(todo) {
+          const total = todo.subtasks.length;
+          const done = todo.subtasks.filter((s) => s.completed).length;
+          const expanded = expandedSubtasks.has(todo.id);
+
+          const toggle = button(`${expanded ? "▾" : "▸"} 하위 작업 (${total})`, () => {
+            if (expanded) expandedSubtasks.delete(todo.id); else expandedSubtasks.add(todo.id);
+            applyFilters();
+          });
+          toggle.className = "subtask-toggle";
+          toggle.dataset.testid = "subtask-toggle";
+          toggle.setAttribute("aria-expanded", expanded);
+
+          const head = el("div", { className: "subtask-head" });
+          head.append(toggle);
+          if (total) {                           // 하위가 없으면 진행률을 숨긴다
+            const progress = el("span", { className: "subtask-progress" });
+            progress.dataset.testid = "subtask-progress";
+            progress.append(el("progress", { max: total, value: done }),
+              `${done}/${total} (${Math.round(done / total * 100)}%)`);
+            head.append(progress);
+          }
+
+          const wrap = el("div");
+          wrap.append(head);
+          if (!expanded) return wrap;
+
+          const list = el("div", { className: "subtasks" });
+          list.dataset.testid = "subtask-list";
+          const ul = el("ul");
+          ul.append(...todo.subtasks.map((subtask) => renderSubtask(todo, subtask)));
+
+          const input = el("input", { type: "text", placeholder: "하위 작업 추가" });
+          input.dataset.testid = "subtask-add";
+          input.dataset.todoId = todo.id;
+          input.setAttribute("aria-label", `${todo.title} 하위 작업 추가`);
+          const form = el("form");
+          form.append(input, el("button", { type: "submit", textContent: "추가" }));
+          form.onsubmit = (event) => {
+            event.preventDefault();
+            subtaskJob("하위 작업 추가", async () => {
+              await api(subtaskUrl(todo.id), "POST", { title: input.value.trim() });
+            }).then(() => listEl.querySelector(`[data-testid=subtask-add][data-todo-id="${todo.id}"]`)?.focus());
+          };
+
+          list.append(ul, form);
+          wrap.append(list);
+          return wrap;
+        }
+
+        function renderSubtask(todo, subtask) {
+          const li = el("li");
+          li.dataset.testid = "subtask-item";
+          const url = subtaskUrl(todo.id, subtask.id);
+
+          if (editingSubtask?.todoId === todo.id && editingSubtask.id === subtask.id) {
+            const input = el("input", { type: "text", value: subtask.title });
+            input.setAttribute("aria-label", "하위 작업 제목");
+            const cancel = () => { editingSubtask = null; applyFilters(); };
+            const submit = () => subtaskJob("하위 작업 수정", async () => {
+              await api(url, "PUT", { title: input.value.trim(), completed: subtask.completed });
+              editingSubtask = null;
+            });
+            input.onkeydown = (event) => {
+              if (event.key === "Enter") submit();
+              if (event.key === "Escape") cancel();
+            };
+            li.append(input, button("저장", submit), button("취소", cancel));
+            return li;
+          }
+
+          const box = el("input", {
+            type: "checkbox",
+            checked: subtask.completed,
+            onchange: () => subtaskJob("하위 작업 수정", () =>
+              api(url, "PUT", { title: subtask.title, completed: box.checked })),
+          });
+          box.setAttribute("aria-label", `${subtask.title} 완료`);
+          const title = el("span", { textContent: subtask.title, className: subtask.completed ? "done" : "" });
+          const editBtn = button("수정", () => {
+            editingSubtask = { todoId: todo.id, id: subtask.id };
+            applyFilters();
+            listEl.querySelector("[aria-label='하위 작업 제목']")?.focus();
+          });
+          const deleteBtn = button("삭제", () => {
+            if (!confirm("정말 삭제할까요?")) return;   // 상위 할 일 삭제와 같은 확인 (하위는 실행 취소가 없다)
+            subtaskJob("하위 작업 삭제", () => api(url, "DELETE"));
+          });
+          editBtn.setAttribute("aria-label", `${subtask.title} 수정`);
+          deleteBtn.setAttribute("aria-label", `${subtask.title} 삭제`);
+          li.append(box, title, editBtn, deleteBtn);
           return li;
         }
 
