@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.playwright-mcp/
+.venv/
+venv/
+.env
+coverage.xml
+.coverage
+report.html
+test-results/
