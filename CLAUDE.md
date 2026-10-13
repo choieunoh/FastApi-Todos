@@ -182,9 +182,12 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - `recurrence`가 `none`이 아니면 `due_date`가 필수다 (없으면 422).
 - 반복 항목이 완료로 바뀌면(PUT, bulk complete, `completed:true` POST) 서버가 다음 일정을 하나 만든다.
   - 다음 마감일: daily +1일, weekly +7일, monthly +1개월 (없는 날은 그 달 마지막 날: 1/31 → 2/28).
+  - 기준은 항상 **직전 마감일**이다. 월말로 당겨진 날짜는 그대로 이어진다(1/31 → 2/28 → 3/28).
+  - 마감일이 지난 뒤 완료해도 한 주기만 더한다(오늘 이후로 건너뛰지 않는다). 다음 일정이 곧바로 기한 초과일 수 있다.
+  - 다음 일정은 목록 끝에 붙고, id는 `next_id()`로 매긴다. bulk 응답의 `updated`에는 넣지 않는다(목록을 다시 불러와 확인).
   - 복사: title, description, priority, tags, favorite, recurrence, subtasks(모두 미완료, sid 새로).
   - 원본은 `next_spawned=true`가 되어, 완료를 취소했다가 다시 완료해도 또 만들지 않는다.
-- UI: 추가 폼·수정 폼에 반복 select, 항목에 `🔁 매주` 같은 배지.
+- UI: 추가 폼·수정 폼에 반복 select(`반복 없음/매일/매주/매월`), 반복 항목에만 `🔁 매주` 같은 배지. 다음 일정 생성 여부는 따로 표시하지 않는다.
 
 ### 16. 작업 템플릿 (6단계)
 - 저장소 `task_templates.json` (환경변수 `TEMPLATE_FILE`). 필드: `id, name(1~50), title, description, priority, tags, recurrence, subtasks: list[str]`. 검증은 Todo와 같은 규칙을 공유한다.
@@ -270,8 +273,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - [x] 4-2. UI: 추가/체크/제목 수정/삭제(confirm 수락 시만)가 반영되고 새로고침 후에도 유지된다. 진행률 `1/2 (50%)`, 0개면 숨김. 상위 통계는 바뀌지 않는다.
 
 ### 5. 반복 일정
-- [ ] 5-1. API: 반복 + 마감일 없음 → 422. daily/weekly/monthly 완료 시 다음 마감일 항목 생성. 1/31 monthly → 2/28(윤년 2/29). 완료 취소 후 재완료해도 추가 생성 없음. 하위는 미완료로 복사. bulk complete와 `completed:true` POST에서도 동작.
-- [ ] 5-2. UI: 반복 select(추가·수정 폼), 배지, 체크하면 다음 일정이 목록에 나타난다.
+- [x] 5-1. API: 반복 + 마감일 없음 → 422. daily/weekly/monthly 완료 시 다음 마감일 항목 생성. 1/31 monthly → 2/28(윤년 2/29). 완료 취소 후 재완료해도 추가 생성 없음. 하위는 미완료로 복사. bulk complete와 `completed:true` POST에서도 동작.
+- [x] 5-2. UI: 반복 select(추가·수정 폼), 배지, 체크하면 다음 일정이 목록에 나타난다.
 
 ### 6. 작업 템플릿
 - [ ] 6-1. API: CRUD 상태 코드(201/200/204/404), 이름 1~50자, 태그 규칙은 A8~A10과 같다. 테스트는 `TEMPLATE_FILE`을 `tmp_path`로 둔다.
