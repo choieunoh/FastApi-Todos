@@ -194,6 +194,16 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - `GET/POST /task-templates`, `PUT/DELETE /task-templates/{id}` (201/200/204/404).
 - 재사용은 **추가 폼에 값을 채우는 방식**이다. 생성은 기존 `POST /todos` + 하위 할 일 POST로 한다 (apply API 없음).
 - UI: 템플릿 select, [불러오기], [현재 폼을 템플릿으로 저장](이름 입력), 인라인 수정, 삭제(`confirm`). `prompt()`를 쓰지 않는다.
+- 이름은 trim 후 1~50자이고, 대소문자를 구분하지 않고 겹치면 POST·PUT 모두 **409**다(자기 자신으로 바꾸는 것은 허용).
+- `subtasks`는 제목 목록이며 하위 할 일과 같은 규칙(trim 후 1~100자, 최대 20개)이다.
+- 템플릿에는 `recurrence`만 있고 마감일이 없으므로 '반복이면 마감일 필수'는 템플릿에 적용하지 않는다. 할 일을 만들 때(POST /todos) 검사한다.
+- id는 템플릿 목록 안에서 최대 id + 1이다(할 일 id와 별개). 파일은 서버 시작 때 만들지 않고 처음 저장할 때 만든다.
+- **Git 제외**: `fastapi-app/task_templates.json`은 사용자 데이터라 `.gitignore`에 넣고 커밋하지 않는다. 다른 경로를 쓰려면 `TEMPLATE_FILE` 환경변수로 지정한다.
+- **Docker 주의**: 이미지에는 템플릿 파일을 넣지 않고 컨테이너 안 `/app`에 처음 저장할 때 만들어진다. 볼륨이 없으므로 컨테이너를 다시 만들면(`docker compose up --build` 등) 템플릿이 사라진다. 보존 방법(볼륨 등)은 이후 배포 설정 단계에서 정하며, 그 전까지 Dockerfile·docker-compose·Jenkins 설정은 바꾸지 않는다.
+- 이름 중복(409)은 저장된 목록을 봐야 알 수 있으므로, 404 처리처럼 `check_template_name()`에서 검사한다(아래 코딩 규칙의 '엔드포인트 안 수동 검증 금지'의 허용된 예외).
+- 템플릿으로 만든 할 일의 id는 일반 추가와 같은 `next_id()`를 거친다(복구 대기 id와도 겹치지 않는다).
+- 추가 폼에 '하위 작업 (한 줄에 하나)' 여러 줄 입력란을 둔다. 템플릿을 불러오면 여기에 채워지고, 템플릿 없이도 쓸 수 있다. 추가하면 POST /todos 뒤 하위 할 일을 차례로 POST한다. 할 일이 만들어진 뒤에는 하위 추가가 실패해도 폼을 비운다(중복 추가 방지).
+- 불러오기는 제목·설명·우선순위·반복·태그·하위 작업을 채우고 마감일은 건드리지 않는다. 인라인 수정 폼은 모든 필드를 고치며 한 번에 하나만 열린다.
 
 ### 17. 데이터 내보내기 (7단계)
 - `GET /todos/export?format=json|csv`, `Content-Disposition: attachment; filename=todos-YYYYMMDD.{json|csv}`. 다른 format은 422.
@@ -224,7 +234,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 테스트는 실제 `todo.json`, `task_templates.json`을 건드리면 안 된다.
   - 저장 경로는 환경변수 `TODO_FILE`, `TEMPLATE_FILE`로 바꿀 수 있게 한다.
   - API 테스트는 `tmp_path` + monkeypatch, UI 테스트는 `conftest.py`가 임시 파일로 띄운 uvicorn을 쓴다.
-  - `conftest.py`가 세션 종료 시 실제 `todo.json`의 해시가 그대로인지 확인한다.
+  - `conftest.py`가 세션 종료 시 실제 `todo.json`, `task_templates.json`의 해시(없으면 없는 상태)가 그대로인지 확인한다.
 - 배포 서버 테스트(`test_integration.py`)는 `integration` 마커로 분리하고 기본 실행에서 제외한다.
 - `tests/`와 `requirements-dev.txt`는 Docker 이미지에 넣지 않는다 (`.dockerignore`).
 - 사용자 입력은 계속 `textContent`로 출력한다. 사용자 데이터에 `innerHTML`을 쓰지 않는다.
@@ -240,7 +250,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - 우선순위·반복 종류·클라이언트 필드 목록 같은 상수는 한 곳에만 정의한다.
 - **테스트용 선택자**: UI 테스트 대상 요소에는 `data-testid`를 붙인다.
   - v4: `todo-item`, `todo-tag`, `tag-filter`, `edit-form`, `edit-save`, `edit-cancel`, `stat-total`, `stat-completed`, `stat-active`, `stat-overdue`, `stat-rate`, `dday`
-  - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-toggle`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`
+  - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-toggle`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `template-load`, `template-edit`, `template-delete`, `template-name`, `template-save`, `template-edit-form`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`
 - **커밋**: Conventional Commits 형식이다 (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
   - 기능 커밋 예: `feat: add favorites for Version 5.0.0`
 
@@ -277,8 +287,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - [x] 5-2. UI: 반복 select(추가·수정 폼), 배지, 체크하면 다음 일정이 목록에 나타난다.
 
 ### 6. 작업 템플릿
-- [ ] 6-1. API: CRUD 상태 코드(201/200/204/404), 이름 1~50자, 태그 규칙은 A8~A10과 같다. 테스트는 `TEMPLATE_FILE`을 `tmp_path`로 둔다.
-- [ ] 6-2. UI: 현재 폼 → 템플릿 저장 → select에 표시, 불러오기 → 추가 폼과 반복 select가 채워지고 추가하면 하위 할 일까지 생성된다. 수정·삭제(confirm) 동작, `prompt()` 없음.
+- [x] 6-1. API: CRUD 상태 코드(201/200/204/404), 이름 1~50자, 태그 규칙은 A8~A10과 같다. 테스트는 `TEMPLATE_FILE`을 `tmp_path`로 둔다.
+- [x] 6-2. UI: 현재 폼 → 템플릿 저장 → select에 표시, 불러오기 → 추가 폼과 반복 select가 채워지고 추가하면 하위 할 일까지 생성된다. 수정·삭제(confirm) 동작, `prompt()` 없음.
 
 ### 7. 데이터 내보내기
 - [ ] 7-1. API: JSON은 `GET /todos`와 같고 파일명이 `.json`. CSV는 BOM, 고정 헤더, 행 수 = 항목 수, 한글·쉼표·줄바꿈 값이 `csv.reader`로 복원된다. `=SUM(1)` 제목은 `'`로 무력화된다. `format=xml` → 422.

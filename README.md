@@ -19,7 +19,8 @@ FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 데이터는 JSON 파�
 | 3 | 일괄 작업 (선택 체크박스, 보이는 항목 전체 선택, 일괄 완료·미완료·삭제) | 완료 |
 | 4 | 하위 할 일 (펼치기/접기, 추가·수정·완료·삭제(확인창), 진행률 `1/2 (50%)`) | 완료 |
 | 5 | 반복 일정 (매일·매주·매월, 완료하면 다음 일정 1회 생성, `🔁` 배지) | 완료 |
-| 6~8 | 작업 템플릿, 내보내기, 캘린더 | 예정 |
+| 6 | 작업 템플릿 (현재 폼을 템플릿으로 저장, 불러오기로 추가 폼 채우기, 인라인 수정·삭제) | 완료 |
+| 7~8 | 내보내기, 캘린더 | 예정 |
 
 ## 실행
 
@@ -29,13 +30,15 @@ docker compose up --build fastapi-app
 ```
 http://localhost:5004 에서 열립니다.
 
+> **주의**: 작업 템플릿(`task_templates.json`)은 컨테이너 안에만 저장됩니다. 볼륨을 설정하지 않았으므로 컨테이너를 다시 만들면(`docker compose up --build` 등) 저장한 템플릿이 사라집니다. 데이터 보존은 이후 배포 설정 단계에서 다룰 예정입니다.
+
 ### 로컬
 ```bash
 cd fastapi-app
 pip install -r requirements.txt
 uvicorn main:app --reload
 ```
-http://localhost:8000 에서 열립니다. 데이터 파일 위치는 환경변수 `TODO_FILE`로 바꿀 수 있습니다 (기본값 `fastapi-app/todo.json`).
+http://localhost:8000 에서 열립니다. 데이터 파일 위치는 환경변수 `TODO_FILE`로 바꿀 수 있습니다 (기본값 `fastapi-app/todo.json`). 작업 템플릿은 `TEMPLATE_FILE`(기본값 `fastapi-app/task_templates.json`)에 저장되며, 처음 템플릿을 저장할 때 만들어집니다. 이 파일은 사용자 데이터라 `.gitignore`에 들어 있어 Git에 커밋되지 않습니다.
 
 ## API
 | 메서드 | 경로 | 동작 |
@@ -49,6 +52,10 @@ http://localhost:8000 에서 열립니다. 데이터 파일 위치는 환경변�
 | POST | `/todos/{id}/subtasks` | `{"title": "..."}` — 하위 할 일 추가 (201, 갱신된 할 일). 할 일당 20개까지 |
 | PUT | `/todos/{id}/subtasks/{sid}` | `{"title": "...", "completed": true}` — 둘 다 필수 (200, 갱신된 할 일) |
 | DELETE | `/todos/{id}/subtasks/{sid}` | 하위 할 일 삭제 (204). 없는 할 일·하위 할 일은 404 |
+| GET | `/task-templates` | 템플릿 목록 |
+| POST | `/task-templates` | `{"name", "title", "description", "priority", "tags", "recurrence", "subtasks": ["..."]}` — 템플릿 생성 (201). 이름이 겹치면 409 |
+| PUT | `/task-templates/{id}` | 템플릿 전체 수정 (200, 없으면 404, 이름이 겹치면 409) |
+| DELETE | `/task-templates/{id}` | 템플릿 삭제 (204, 없으면 404) |
 | GET | `/` | 화면 |
 
 반복 일정은 `recurrence`(`none`·`daily`·`weekly`·`monthly`)로 정하며, 반복하려면 `due_date`가 필요합니다. 반복 항목이 미완료에서 완료로 바뀌면(PUT, 일괄 완료, `completed: true`로 생성) 직전 마감일 + 1주기를 마감일로 하는 다음 일정이 한 번 만들어집니다. 매월 반복에서 없는 날짜는 그 달 말일로 당깁니다(1/31 → 2/28).
