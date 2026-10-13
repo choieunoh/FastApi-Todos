@@ -964,3 +964,120 @@ def test_todo_from_template_flow_avoids_id_conflicts():
     assert saved["subtasks"] == [{"id": 1, "title": "안건", "completed": False},
                                  {"id": 2, "title": "정리", "completed": False}]
     assert restore(deleted).status_code == 200
+
+
+# ---------- 5.0.0 7단계: 내보내기 ----------
+
+import csv as csv_module  # noqa: E402
+import io as io_module  # noqa: E402
+import json as json_module  # noqa: E402
+
+CSV_HEADER = ["id", "title", "description", "completed", "priority", "due_date", "tags",
+              "favorite", "recurrence", "subtasks", "created_at", "completed_at"]
+
+
+def export(fmt: str | None):
+    return client.get("/todos/export", params={} if fmt is None else {"format": fmt})
+
+
+def csv_rows(res) -> list[list[str]]:
+    assert res.content.startswith(b"\xef\xbb\xbf")                  # UTF-8 BOM
+    return list(csv_module.reader(io_module.StringIO(res.content.decode("utf-8-sig"), newline="")))
+
+
+def seed_rich_data() -> None:
+    first = create(title="주간 보고, \"최종\"", description="1행\n2행, 쉼표", priority="높음",
+                   due_date="2026-10-20", tags=["회사", "보고"], favorite=True, recurrence="weekly").json()
+    add_sub(first["id"], "자료")
+    add_sub(first["id"], "초안")
+    put_sub(first["id"], 1, title="자료", completed=True)
+    create(title="완료된 일", completed=True)
+
+
+def test_export_json_matches_get_todos():
+    seed_rich_data()
+    res = export("json")
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "application/json; charset=utf-8"
+    assert json_module.loads(res.content.decode("utf-8")) == client.get("/todos").json()
+    assert "주간 보고" in res.content.decode("utf-8")                 # 한글을 \\uXXXX 로 바꾸지 않는다
+    body = res.json()
+    assert body[0]["subtasks"] == [{"id": 1, "title": "자료", "completed": True},
+                                   {"id": 2, "title": "초안", "completed": False}]
+    assert (body[0]["recurrence"], body[0]["next_spawned"], body[0]["favorite"]) == ("weekly", False, True)
+
+
+@pytest.mark.parametrize("fmt", ["json", "csv"])
+def test_export_filename_uses_kst_date(fmt, monkeypatch):
+    monkeypatch.setattr(main, "now", lambda: datetime(2026, 10, 12, 14, 59, 59, tzinfo=main.timezone.utc))
+    assert export(fmt).headers["content-disposition"] == f"attachment; filename=todos-20261012.{fmt}"
+    monkeypatch.setattr(main, "now", lambda: datetime(2026, 10, 12, 15, 0, 0, tzinfo=main.timezone.utc))
+    assert export(fmt).headers["content-disposition"] == f"attachment; filename=todos-20261013.{fmt}"   # KST 자정
+
+
+def test_export_csv_columns_and_values():
+    seed_rich_data()
+    res = export("csv")
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "text/csv; charset=utf-8"
+    header, first, second = csv_rows(res)
+    assert header == CSV_HEADER                                      # 고정 헤더, next_spawned 없음
+    todos = client.get("/todos").json()
+    assert first == [str(todos[0]["id"]), "주간 보고, \"최종\"", "1행\n2행, 쉼표", "false", "높음", "2026-10-20",
+                     "회사;보고", "true", "weekly", "1/2", todos[0]["created_at"], ""]
+    assert first[1:3] == [todos[0]["title"], todos[0]["description"]]   # 쉼표·따옴표·줄바꿈 복원
+    assert second[3] == "true" and second[11] == todos[1]["completed_at"] and second[5] == "" and second[9] == "0/0"
+
+
+def test_export_csv_row_count_matches_items():
+    for i in range(5):
+        create(title=f"할 일 {i}")
+    assert len(csv_rows(export("csv"))) == 1 + 5
+
+
+def test_export_empty_list():
+    assert export("json").json() == []
+    assert csv_rows(export("csv")) == [CSV_HEADER]
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("=SUM(1)", "'=SUM(1)"), ("+1", "'+1"), ("-1", "'-1"), ("@cmd", "'@cmd"),
+    ("a=b", "a=b"), ("안전한 제목", "안전한 제목"),
+])
+def test_export_csv_neutralizes_formulas(value, expected):
+    create(title=value, description=value, tags=[value.replace(",", "")])
+    row = csv_rows(export("csv"))[1]
+    assert (row[1], row[2], row[6]) == (expected, expected, expected)
+    assert export("json").json()[0]["title"] == value                # JSON 은 원래 값 그대로
+
+
+@pytest.mark.parametrize("params", [{}, {"format": "xml"}, {"format": "CSV"}, {"format": ""}])
+def test_export_invalid_format_422(params):
+    assert client.get("/todos/export", params=params).status_code == 422
+
+
+def test_export_is_read_only(isolated_file):
+    seed_rich_data()
+    deleted = create(title="지움").json()["id"]
+    delete(deleted)
+    before = isolated_file.read_bytes()
+    buffer_before = dict(main.RECENTLY_DELETED)
+    for fmt in ("json", "csv"):
+        assert export(fmt).status_code == 200
+    assert isolated_file.read_bytes() == before
+    assert main.RECENTLY_DELETED == buffer_before
+    assert not main.TEMPLATE_FILE.exists()                           # 템플릿 파일도 만들지 않는다
+    assert restore(deleted).status_code == 200
+
+
+def test_export_v1_data(isolated_file):
+    isolated_file.write_text('[{"id": 1, "title": "옛 데이터", "description": "", "completed": false}]',
+                             encoding="utf-8")
+    assert export("json").json() == client.get("/todos").json()
+    assert csv_rows(export("csv"))[1] == ["1", "옛 데이터", "", "false", "보통", "", "", "false", "none", "0/0", "", ""]
+
+
+def test_export_route_does_not_shadow_todo_routes():
+    todo_id = create().json()["id"]
+    assert put(todo_id, title="수정").status_code == 200
+    assert client.delete(f"/todos/{todo_id}").status_code == 204

@@ -1109,3 +1109,79 @@ def test_template_flows_never_prompt(page: Page, seed):
     page.get_by_test_id("template-edit-form").get_by_role("button", name="저장").click()
     expect(page.get_by_test_id("template-edit-form")).to_have_count(0)
     assert "prompt" not in dialogs and dialogs == []
+
+
+# ---------- 5.0.0 7단계: 내보내기 ----------
+
+import csv as csv_module  # noqa: E402
+import io as io_module  # noqa: E402
+import json as json_module  # noqa: E402
+from datetime import datetime as dt, timedelta as td, timezone as tz  # noqa: E402
+from pathlib import Path as FilePath  # noqa: E402
+
+EXPORT_TODOS = [
+    todo(1, "주간 보고, \"최종\"", description="1행\n2행", priority="높음", due_date="2026-10-20",
+         tags=["회사", "보고"], favorite=True, recurrence="weekly",
+         subtasks=[sub(1, "자료", True), sub(2, "초안")]),
+    todo(2, "=SUM(1)", completed=True),
+    todo(3, "숨겨질 항목", tags=["개인"]),
+]
+
+
+def kst_names(ext: str) -> set[str]:
+    # 서버가 KST 날짜로 이름을 짓는다 — 자정을 걸쳐도 통과하도록 앞뒤 1분을 함께 허용
+    now = dt.now(tz(td(hours=9)))
+    return {f"todos-{t:%Y%m%d}.{ext}" for t in (now - td(minutes=1), now, now + td(minutes=1))}
+
+
+def download(page: Page, testid: str):
+    with page.expect_download() as info:
+        page.get_by_test_id(testid).click()
+    dl = info.value
+    return dl.suggested_filename, FilePath(dl.path()).read_bytes()
+
+
+def test_export_links_are_download_links(page: Page, seed):
+    open_app(page)
+    for fmt in ("csv", "json"):
+        link = page.get_by_test_id(f"export-{fmt}")
+        expect(link).to_have_attribute("href", f"/todos/export?format={fmt}")
+        expect(link).to_have_attribute("download", "")
+
+
+def test_export_json_download(page: Page, seed):
+    seed(EXPORT_TODOS)
+    open_app(page)
+    name, data = download(page, "export-json")
+    assert name in kst_names("json")
+    assert "주간 보고" in data.decode("utf-8")                              # UTF-8, 한글 그대로
+    assert json_module.loads(data.decode("utf-8")) == page.request.get("/todos").json()
+    assert page.locator(ITEM).count() == 3                                 # 다운로드는 화면·데이터를 바꾸지 않는다
+
+
+def test_export_csv_download(page: Page, seed):
+    seed(EXPORT_TODOS)
+    open_app(page)
+    name, data = download(page, "export-csv")
+    assert name in kst_names("csv")
+    assert data.startswith(b"\xef\xbb\xbf")
+    rows = list(csv_module.reader(io_module.StringIO(data.decode("utf-8-sig"), newline="")))
+    assert rows[0][:3] == ["id", "title", "description"]
+    assert len(rows) == 1 + 3                                              # 행 수 = 항목 수
+    assert rows[1][1:3] == ["주간 보고, \"최종\"", "1행\n2행"]               # 쉼표·따옴표·줄바꿈 복원
+    assert (rows[1][6], rows[1][7], rows[1][8], rows[1][9]) == ("회사;보고", "true", "weekly", "1/2")
+    assert rows[2][1] == "'=SUM(1)"                                        # 수식 무력화
+
+
+def test_export_ignores_filters(page: Page, seed):
+    seed(EXPORT_TODOS)
+    open_app(page)
+    page.get_by_test_id("tag-filter").select_option("회사")
+    page.get_by_test_id("favorite-filter").click()
+    page.locator("#search").fill("보고")
+    expect(page.locator(ITEM)).to_have_count(1)
+    _, data = download(page, "export-csv")
+    assert len(list(csv_module.reader(io_module.StringIO(data.decode("utf-8-sig"), newline="")))) == 1 + 3
+    _, data = download(page, "export-json")
+    assert [t["title"] for t in json_module.loads(data)] == ["주간 보고, \"최종\"", "=SUM(1)", "숨겨질 항목"]
+    expect(page.locator(ITEM)).to_have_count(1)                            # 필터 상태는 그대로
