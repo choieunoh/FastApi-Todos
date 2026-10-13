@@ -342,17 +342,18 @@ def test_restore_expires_after_ttl(monkeypatch):
     assert main.RECENTLY_DELETED == {}
 
 
-def test_buffer_keeps_latest_50():
-    save_todos([TodoItem(id=i, title=f"t{i}") for i in range(1, 52)])
-    for i in range(1, 52):
+def test_buffer_keeps_latest_100():
+    assert main.UNDO_MAX == main.BULK_MAX == 100
+    save_todos([TodoItem(id=i, title=f"t{i}") for i in range(1, 102)])
+    for i in range(1, 102):
         delete(i)
-    assert len(main.RECENTLY_DELETED) == main.UNDO_MAX
+    assert len(main.RECENTLY_DELETED) == 100
     assert restore(1).status_code == 404                 # 가장 오래된 1건은 밀려난다
-    assert restore(*range(2, 52)).status_code == 200
-    assert len(client.get("/todos").json()) == 50
+    assert restore(*range(2, 102)).status_code == 200
+    assert len(client.get("/todos").json()) == 100
 
 
-@pytest.mark.parametrize("body", [{}, {"ids": []}, {"ids": ["a"]}, {"ids": list(range(51))}])
+@pytest.mark.parametrize("body", [{}, {"ids": []}, {"ids": ["a"]}, {"ids": list(range(1, 102))}])
 def test_restore_validation(body):
     assert client.post("/todos/restore", json=body).status_code == 422
 
@@ -363,3 +364,120 @@ def test_delete_status_unchanged():
     res = delete(todo_id)
     assert res.status_code == 204
     assert res.content == b""
+
+
+# ---------- 5.0.0 3단계: 일괄 작업 ----------
+
+def bulk(ids, action):
+    return client.post("/todos/bulk", json={"ids": ids, "action": action})
+
+
+def test_bulk_complete_sets_completed_at_only_on_transition():
+    done = create(title="이미 완료", completed=True).json()
+    todo = create(title="미완료").json()
+    res = bulk([done["id"], todo["id"]], "complete")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["deleted"] == []
+    by_id = {t["id"]: t for t in body["updated"]}
+    assert by_id[done["id"]]["completed_at"] == done["completed_at"]    # 이미 완료면 시각 유지
+    assert by_id[todo["id"]]["completed"] is True
+    assert by_id[todo["id"]]["completed_at"] is not None
+    assert all(t["completed"] for t in client.get("/todos").json())
+
+
+def test_bulk_uncomplete_clears_completed_at():
+    a = create(completed=True).json()["id"]
+    b = create().json()["id"]
+    body = bulk([a, b], "uncomplete").json()
+    assert [(t["id"], t["completed"], t["completed_at"]) for t in body["updated"]] == \
+        [(a, False, None), (b, False, None)]
+
+
+def test_bulk_keeps_other_fields():
+    created = create(title="그대로", priority="높음", tags=["t"], favorite=True, due_date="2026-10-20").json()
+    updated = bulk([created["id"]], "complete").json()["updated"][0]
+    for key in ("title", "priority", "tags", "favorite", "due_date", "created_at"):
+        assert updated[key] == created[key]
+
+
+def test_bulk_delete_then_restore_all():
+    for title in "ABCDE":
+        create(title=title)
+    res = bulk([4, 2, 2], "delete")                       # 중복은 한 번만
+    assert res.status_code == 200
+    assert res.json() == {"updated": [], "deleted": [4, 2]}
+    assert [t["title"] for t in client.get("/todos").json()] == ["A", "C", "E"]
+    assert restore(4, 2).status_code == 200
+    assert [t["title"] for t in client.get("/todos").json()] == list("ABCDE")
+
+
+def test_bulk_deleted_ids_not_reused():
+    create()
+    create()
+    bulk([1, 2], "delete")
+    assert create().json()["id"] == 3
+
+
+@pytest.mark.parametrize("action", ["complete", "uncomplete", "delete"])
+def test_bulk_missing_id_changes_nothing(action, isolated_file):
+    create(title="A")
+    create(title="B", completed=True)
+    before = isolated_file.read_bytes()
+    res = bulk([1, 2, 999], action)
+    assert res.status_code == 404
+    assert "999" in res.json()["detail"]
+    assert isolated_file.read_bytes() == before
+    assert main.RECENTLY_DELETED == {}
+
+
+@pytest.mark.parametrize("body", [
+    {"ids": [], "action": "complete"},
+    {"ids": [1], "action": "archive"},
+    {"ids": [1]},
+    {"action": "delete"},
+    {"ids": ["a"], "action": "delete"},
+    {"ids": list(range(1, 102)), "action": "complete"},
+])
+def test_bulk_validation(body):
+    create()
+    assert client.post("/todos/bulk", json=body).status_code == 422
+
+
+def test_bulk_accepts_100_ids():
+    save_todos([TodoItem(id=i, title=f"t{i}") for i in range(1, 101)])
+    res = bulk(list(range(1, 101)), "complete")
+    assert res.status_code == 200
+    assert len(res.json()["updated"]) == 100
+
+
+def test_bulk_delete_100_then_restore_all():
+    originals = [create(title=f"할 일 {i}", tags=[f"t{i % 3}"], favorite=i % 2 == 0, completed=i % 5 == 0).json()
+                 for i in range(1, 101)]
+    ids = [t["id"] for t in originals]
+    res = bulk(ids, "delete")
+    assert res.status_code == 200
+    assert res.json()["deleted"] == ids
+    assert client.get("/todos").json() == []
+    assert len(main.RECENTLY_DELETED) == 100
+
+    res = restore(*ids)                                   # 100건 모두 한 번에 복구
+    assert res.status_code == 200
+    assert res.json() == originals                        # 원래 id·시각·내용 그대로
+    assert client.get("/todos").json() == originals       # 원래 순서도 그대로
+    assert main.RECENTLY_DELETED == {}
+
+
+def test_restore_101_ids_is_422():
+    save_todos([TodoItem(id=i, title=f"t{i}") for i in range(1, 101)])
+    bulk(list(range(1, 101)), "delete")
+    assert restore(*range(1, 102)).status_code == 422
+    assert len(main.RECENTLY_DELETED) == 100              # 거부된 요청은 버퍼를 건드리지 않는다
+
+
+def test_next_bulk_delete_pushes_out_oldest():
+    save_todos([TodoItem(id=i, title=f"t{i}") for i in range(1, 106)])
+    bulk(list(range(1, 101)), "delete")
+    bulk(list(range(101, 106)), "delete")
+    assert restore(*range(1, 6)).status_code == 404       # 먼저 지운 5건은 밀려났다
+    assert restore(*range(6, 106)).status_code == 200

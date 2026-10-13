@@ -5,6 +5,7 @@ from playwright.sync_api import Page, expect
 
 TODAY = "2026-10-12"                                # 브라우저 시계를 이 날짜 정오로 고정한다
 ITEM = "[data-testid=todo-item]"
+DONE_BOX = "input[type=checkbox]:not([data-testid=bulk-select])"   # 완료 체크박스
 
 
 def todo(id: int, title: str, **fields) -> dict:
@@ -172,7 +173,7 @@ def test_b11_stats(page: Page, seed):
 def test_b12_stats_update_on_toggle(page: Page, seed):
     seed(FOUR)
     open_app(page)
-    item(page, "보통1").locator("input[type=checkbox]").check()
+    item(page, "보통1").locator(DONE_BOX).check()
     expect(page.get_by_test_id("stat-completed")).to_have_text("2")
     assert stats(page) == ("4", "2", "2", "1", "50%")
 
@@ -216,9 +217,9 @@ def test_b17_created_and_completed_dates(page: Page, seed):
     row = item(page, "시각 확인")
     expect(row.locator(".meta")).to_contain_text(re.compile(r"생성: \d{4}-\d{2}-\d{2}"))
     expect(row.locator(".meta")).not_to_contain_text("완료:")
-    row.locator("input[type=checkbox]").check()
+    row.locator(DONE_BOX).check()
     expect(row.locator(".meta")).to_contain_text(re.compile(r"완료: \d{4}-\d{2}-\d{2}"))
-    row.locator("input[type=checkbox]").uncheck()
+    row.locator(DONE_BOX).uncheck()
     expect(row.locator(".meta")).not_to_contain_text("완료:")
 
 
@@ -232,7 +233,7 @@ def test_b18_add_toggle_delete(page: Page, seed):
     row = item(page, "지울 항목")
     expect(row).to_have_count(1)
 
-    row.locator("input[type=checkbox]").check()
+    row.locator(DONE_BOX).check()
     expect(row.locator(".content > span").first).to_have_class("done")
 
     page.once("dialog", lambda d: d.dismiss())
@@ -358,7 +359,7 @@ def test_favorite_kept_after_edit_and_toggle(page: Page, seed):
     page.get_by_test_id("edit-save").click()
     expect(star(page, "수정 후")).to_have_text("★")
 
-    item(page, "수정 후").locator("input[type=checkbox]").check()
+    item(page, "수정 후").locator(DONE_BOX).check()
     expect(page.get_by_test_id("stat-completed")).to_have_text("1")
     page.reload()
     expect(star(page, "수정 후")).to_have_text("★")
@@ -437,3 +438,124 @@ def test_undo_failure_shows_error(page: Page, seed):
     expect(page.locator("#error")).to_be_visible()
     expect(page.locator("#error")).to_contain_text("실행 취소 실패")
     expect(page.locator(ITEM)).to_have_count(0)
+
+
+# ---------- 5.0.0 3단계: 일괄 작업 ----------
+
+def pick(page: Page, *titles_: str) -> None:
+    for title in titles_:
+        item(page, title).get_by_test_id("bulk-select").check()
+
+
+def bulk_count(page: Page):
+    return page.get_by_test_id("bulk-bar").locator("#bulk-count")
+
+
+def test_bulk_selection_count(page: Page, seed):
+    seed([todo(1, "A"), todo(2, "B"), todo(3, "C")])
+    open_app(page)
+    expect(bulk_count(page)).to_have_text("0개 선택")
+    for name in ("complete", "uncomplete", "delete"):
+        expect(page.get_by_test_id(f"bulk-{name}")).to_be_disabled()
+
+    pick(page, "A", "C")
+    expect(bulk_count(page)).to_have_text("2개 선택")
+    expect(item(page, "A")).to_have_class("selected")
+    expect(page.get_by_test_id("bulk-complete")).to_be_enabled()
+    expect(item(page, "A").locator(DONE_BOX)).not_to_be_checked()   # 선택은 완료와 별개
+
+    item(page, "A").get_by_test_id("bulk-select").uncheck()
+    expect(bulk_count(page)).to_have_text("1개 선택")
+
+
+def test_bulk_select_all_visible_only(page: Page, seed):
+    seed([todo(1, "A"), todo(2, "B", completed=True), todo(3, "C")])
+    open_app(page)
+    page.locator("[data-filter=active]").click()
+    select_all = page.get_by_test_id("bulk-select-all")
+    select_all.click()
+    expect(bulk_count(page)).to_have_text("2개 선택")
+    expect(select_all).to_have_text("선택 해제")
+
+    page.locator("[data-filter=all]").click()                       # 가려져 있던 B 는 선택되지 않았다
+    expect(item(page, "B").get_by_test_id("bulk-select")).not_to_be_checked()
+    expect(bulk_count(page)).to_have_text("2개 선택")
+    expect(select_all).to_have_text("보이는 항목 전체 선택")
+
+    page.locator("[data-filter=active]").click()
+    select_all.click()                                               # 모두 골라져 있으면 해제
+    expect(bulk_count(page)).to_have_text("0개 선택")
+
+
+def test_bulk_filter_change_drops_hidden_selection(page: Page, seed):
+    seed([todo(1, "보고서", tags=["학교"]), todo(2, "운동", completed=True), todo(3, "발표", tags=["학교"])])
+    open_app(page)
+    pick(page, "보고서", "운동", "발표")
+    page.locator("[data-filter=active]").click()
+    expect(bulk_count(page)).to_have_text("2개 선택")
+    page.locator("#search").fill("보고")
+    expect(bulk_count(page)).to_have_text("1개 선택")
+    page.locator("#search").fill("")
+    expect(item(page, "발표").get_by_test_id("bulk-select")).not_to_be_checked()
+
+
+def test_bulk_complete_and_uncomplete_update_stats(page: Page, seed):
+    seed([todo(1, "사과", favorite=True), todo(2, "포도"), todo(3, "귤", completed=True), todo(4, "자두", due_date="2026-10-01")])
+    open_app(page)
+    assert stats(page) == ("4", "1", "3", "1", "25%")
+
+    pick(page, "사과", "귤", "자두")
+    page.get_by_test_id("bulk-complete").click()
+    expect(page.get_by_test_id("stat-completed")).to_have_text("3")
+    assert stats(page) == ("4", "3", "1", "0", "75%")
+    expect(bulk_count(page)).to_have_text("0개 선택")
+    expect(item(page, "사과").locator(DONE_BOX)).to_be_checked()
+    expect(item(page, "사과").locator(".meta")).to_contain_text("완료:")
+    expect(star(page, "사과")).to_have_text("★")                       # 다른 필드는 그대로
+
+    pick(page, "사과", "포도")
+    page.get_by_test_id("bulk-uncomplete").click()
+    expect(page.get_by_test_id("stat-completed")).to_have_text("2")
+    assert stats(page) == ("4", "2", "2", "0", "50%")
+    expect(item(page, "사과").locator(".meta")).not_to_contain_text("완료:")
+    page.reload()
+    assert stats(page) == ("4", "2", "2", "0", "50%")
+
+
+def test_bulk_delete_confirm_and_undo(page: Page, seed):
+    seed([todo(1, "사과"), todo(2, "포도", favorite=True), todo(3, "귤"), todo(4, "자두", completed=True)])
+    open_app(page)
+    pick(page, "포도", "자두")
+
+    page.once("dialog", lambda d: d.dismiss())                       # 취소하면 아무 일도 없다
+    page.get_by_test_id("bulk-delete").click()
+    expect(page.locator(ITEM)).to_have_count(4)
+    expect(page.get_by_test_id("undo-toast")).to_be_hidden()
+    expect(bulk_count(page)).to_have_text("2개 선택")
+
+    messages = []
+    page.once("dialog", lambda d: (messages.append(d.message), d.accept()))
+    page.get_by_test_id("bulk-delete").click()
+    expect(page.locator(ITEM)).to_have_count(2)
+    assert messages == ["선택한 2개를 삭제할까요?"]
+    assert titles(page) == ["사과", "귤"]
+    assert stats(page) == ("2", "0", "2", "0", "0%")
+    expect(page.get_by_test_id("undo-toast")).to_contain_text("2개 삭제됨")
+    expect(bulk_count(page)).to_have_text("0개 선택")
+
+    page.get_by_test_id("undo-button").click()
+    expect(page.locator(ITEM)).to_have_count(4)
+    assert titles(page) == ["사과", "포도", "귤", "자두"]
+    assert stats(page) == ("4", "1", "3", "0", "25%")
+    expect(star(page, "포도")).to_have_text("★")
+
+
+def test_bulk_failure_shows_error_and_keeps_selection(page: Page, seed):
+    seed([todo(1, "A"), todo(2, "B")])
+    open_app(page)
+    page.route("**/todos/bulk", lambda route: route.fulfill(status=404, body='{"detail":"없는 항목입니다: [2]"}'))
+    pick(page, "A", "B")
+    page.get_by_test_id("bulk-complete").click()
+    expect(page.locator("#error")).to_contain_text("일괄 완료 실패")
+    expect(bulk_count(page)).to_have_text("2개 선택")
+    assert stats(page) == ("2", "0", "2", "0", "0%")
