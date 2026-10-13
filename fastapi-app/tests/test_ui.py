@@ -362,3 +362,78 @@ def test_favorite_kept_after_edit_and_toggle(page: Page, seed):
     expect(page.get_by_test_id("stat-completed")).to_have_text("1")
     page.reload()
     expect(star(page, "수정 후")).to_have_text("★")
+
+
+# ---------- 5.0.0 2단계: 삭제 실행 취소 ----------
+
+def delete_item(page: Page, title: str, accept: bool = True) -> None:
+    page.once("dialog", lambda d: d.accept() if accept else d.dismiss())
+    item(page, title).get_by_role("button", name="Delete").click()
+
+
+def test_undo_restores_deleted_item(page: Page, seed):
+    seed([todo(1, "첫째"), todo(2, "지울 항목", favorite=True, completed=True, tags=["t"]), todo(3, "셋째")])
+    open_app(page)
+    toast = page.get_by_test_id("undo-toast")
+    expect(toast).to_be_hidden()
+
+    delete_item(page, "지울 항목")
+    expect(toast).to_be_visible()
+    expect(toast).to_contain_text("1개 삭제됨")
+    assert titles(page) == ["첫째", "셋째"]
+    assert stats(page) == ("2", "0", "2", "0", "0%")
+
+    page.get_by_test_id("undo-button").click()
+    expect(toast).to_be_hidden()
+    expect(page.locator(ITEM)).to_have_count(3)
+    assert titles(page) == ["첫째", "지울 항목", "셋째"]          # 원래 자리로 돌아온다
+    assert stats(page) == ("3", "1", "2", "0", "33%")
+    expect(star(page, "지울 항목")).to_have_text("★")
+    expect(item(page, "지울 항목").get_by_test_id("todo-tag")).to_have_text(["#t"])
+    page.reload()
+    assert titles(page) == ["첫째", "지울 항목", "셋째"]
+
+
+def test_no_toast_when_confirm_dismissed(page: Page, seed):
+    seed([todo(1, "남길 항목")])
+    open_app(page)
+    delete_item(page, "남길 항목", accept=False)
+    expect(page.locator(ITEM)).to_have_count(1)
+    expect(page.get_by_test_id("undo-toast")).to_be_hidden()
+
+
+def test_toast_hides_after_5_seconds(page: Page, seed):
+    seed([todo(1, "A"), todo(2, "B")])
+    open_app(page)
+    delete_item(page, "A")
+    toast = page.get_by_test_id("undo-toast")
+    expect(toast).to_be_visible()
+    page.wait_for_timeout(4000)
+    expect(toast).to_be_visible()                                 # 5초 전에는 보인다
+    expect(toast).to_be_hidden(timeout=2500)                      # 5초가 지나면 사라진다
+
+
+def test_new_delete_replaces_toast(page: Page, seed):
+    seed([todo(1, "A"), todo(2, "B"), todo(3, "C")])
+    open_app(page)
+    delete_item(page, "A")
+    expect(page.locator(ITEM)).to_have_count(2)
+    page.wait_for_timeout(3000)
+    delete_item(page, "B")
+    expect(page.locator(ITEM)).to_have_count(1)
+    page.wait_for_timeout(3000)                                   # 첫 삭제로부터는 5초가 지났다
+    expect(page.get_by_test_id("undo-toast")).to_be_visible()     # 새 삭제로 시간이 다시 잰다
+    page.get_by_test_id("undo-button").click()
+    expect(page.locator(ITEM)).to_have_count(2)
+    assert titles(page) == ["B", "C"]                             # 마지막 삭제만 되돌린다
+
+
+def test_undo_failure_shows_error(page: Page, seed):
+    seed([todo(1, "A")])
+    open_app(page)
+    page.route("**/todos/restore", lambda route: route.fulfill(status=404, body='{"detail":"복구할 수 없는 항목입니다"}'))
+    delete_item(page, "A")
+    page.get_by_test_id("undo-button").click()
+    expect(page.locator("#error")).to_be_visible()
+    expect(page.locator("#error")).to_contain_text("실행 취소 실패")
+    expect(page.locator(ITEM)).to_have_count(0)

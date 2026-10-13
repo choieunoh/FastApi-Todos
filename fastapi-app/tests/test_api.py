@@ -15,6 +15,7 @@ def isolated_file(tmp_path, monkeypatch):
     # 실제 todo.json 대신 테스트마다 새 임시 파일 사용 (본인 데이터 보호 + 테스트 간 격리)
     path = tmp_path / "todo.json"
     monkeypatch.setattr(main, "TODO_FILE", path)
+    monkeypatch.setattr(main, "RECENTLY_DELETED", {})   # 삭제 복구 버퍼도 테스트마다 비운다
     save_todos([])
     return path
 
@@ -252,3 +253,113 @@ def test_v4_data_without_favorite(isolated_file):
     assert res.status_code == 200
     assert res.json()[0]["favorite"] is False
     assert put(1, title="v4", tags=["t"], favorite=True).json()["created_at"].startswith("2026-10-01")
+
+
+# ---------- 5.0.0 2단계: 삭제 실행 취소 ----------
+
+def restore(*ids):
+    return client.post("/todos/restore", json={"ids": list(ids)})
+
+
+def delete(todo_id: int):
+    return client.delete(f"/todos/{todo_id}")
+
+
+def test_restore_keeps_id_created_at_and_content():
+    create(title="앞")
+    created = create(title="복구 대상", description="설명", priority="높음", due_date="2026-10-20",
+                     tags=["a", "b"], completed=True, favorite=True).json()
+    create(title="뒤")
+    assert delete(created["id"]).status_code == 204
+    assert [t["title"] for t in client.get("/todos").json()] == ["앞", "뒤"]
+
+    res = restore(created["id"])
+    assert res.status_code == 200
+    assert res.json() == [created]                      # id, created_at, completed_at, 내용 모두 그대로
+    assert [t["title"] for t in client.get("/todos").json()] == ["앞", "복구 대상", "뒤"]
+
+
+def test_restore_twice_is_404():
+    todo_id = create().json()["id"]
+    delete(todo_id)
+    assert restore(todo_id).status_code == 200
+    assert restore(todo_id).status_code == 404
+
+
+def test_restore_unknown_id_is_404():
+    assert restore(999).status_code == 404
+    todo_id = create().json()["id"]                     # 지우지 않은 항목도 복구 대상이 아니다
+    assert restore(todo_id).status_code == 404
+
+
+def test_restore_is_all_or_nothing():
+    todo_id = create().json()["id"]
+    delete(todo_id)
+    assert restore(todo_id, 999).status_code == 404
+    assert client.get("/todos").json() == []            # 하나도 복구되지 않는다
+    assert restore(todo_id).status_code == 200          # 버퍼에도 그대로 남아 있다
+
+
+def test_restore_many_in_original_order():
+    for title in "ABCDE":
+        create(title=title)
+    for todo_id in (1, 5, 3):                           # 여러 자리에서 차례로 지운다
+        delete(todo_id)
+    res = restore(3, 1, 3, 5)                           # 중복과 순서는 상관없다
+    assert [t["id"] for t in res.json()] == [3, 1, 5]
+    assert [t["title"] for t in client.get("/todos").json()] == list("ABCDE")
+
+
+def test_restore_after_other_changes():
+    for title in "ABC":
+        create(title=title)
+    delete(2)
+    create(title="D")
+    delete(1)
+    restore(2)
+    assert [t["title"] for t in client.get("/todos").json()] == ["C", "B", "D"]
+
+
+def test_new_id_skips_deleted_max_id():
+    create()
+    deleted_id = create().json()["id"]
+    delete(deleted_id)
+    new_id = create().json()["id"]
+    assert new_id == deleted_id + 1
+    assert restore(deleted_id).status_code == 200
+    assert sorted(t["id"] for t in client.get("/todos").json()) == [1, deleted_id, new_id]
+
+
+def test_restore_expires_after_ttl(monkeypatch):
+    first, second = create().json()["id"], create().json()["id"]
+    delete(first)
+    delete(second)
+    start = main.now()
+    monkeypatch.setattr(main, "now", lambda: start + main.UNDO_TTL - main.timedelta(seconds=1))
+    assert restore(second).status_code == 200            # 30초 안이면 복구된다
+    monkeypatch.setattr(main, "now", lambda: start + main.UNDO_TTL + main.timedelta(seconds=1))
+    assert restore(first).status_code == 404             # 30초가 지나면 404
+    assert main.RECENTLY_DELETED == {}
+
+
+def test_buffer_keeps_latest_50():
+    save_todos([TodoItem(id=i, title=f"t{i}") for i in range(1, 52)])
+    for i in range(1, 52):
+        delete(i)
+    assert len(main.RECENTLY_DELETED) == main.UNDO_MAX
+    assert restore(1).status_code == 404                 # 가장 오래된 1건은 밀려난다
+    assert restore(*range(2, 52)).status_code == 200
+    assert len(client.get("/todos").json()) == 50
+
+
+@pytest.mark.parametrize("body", [{}, {"ids": []}, {"ids": ["a"]}, {"ids": list(range(51))}])
+def test_restore_validation(body):
+    assert client.post("/todos/restore", json=body).status_code == 422
+
+
+def test_delete_status_unchanged():
+    assert delete(1).status_code == 404
+    todo_id = create().json()["id"]
+    res = delete(todo_id)
+    assert res.status_code == 204
+    assert res.content == b""
