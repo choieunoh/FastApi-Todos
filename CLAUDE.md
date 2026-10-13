@@ -220,6 +220,12 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 서버 변경 없이 클라이언트에서 `allTodos`로 그린다.
 - [목록]/[캘린더] 보기 전환, 월 그리드(일요일 시작), [이전]/[다음]/[오늘], 날짜 칸에 그날 마감 항목(최대 3개 + `+N`). 오늘 칸과 기한 초과를 강조한다.
 - 검색·상태·태그·즐겨찾기 필터를 그대로 적용한다. 날짜를 누르면 그날 항목 목록을 보여준다.
+- 처음 열면 이번 달(브라우저 로컬 날짜)이다. 월 이동은 `new Date(year, month ± 1, 1)`로 연말·윤년을 처리한다. 다른 달로 가면 고른 날짜는 풀린다.
+- 그리드 앞뒤의 다른 달 칸은 비워 둔다. `calendar-day` 칸은 그 달 날짜에만 있다.
+- 칩(`calendar-chip`): 제목 앞에 ★(즐겨찾기)·🔁(반복), 완료는 취소선, 기한 초과는 빨간색, 우선순위 높음은 굵게. 칸 안 순서는 지금 고른 정렬을 따른다. 칩을 눌러도 그 날짜가 골라진다.
+- 그날 목록은 목록 보기와 **같은 항목**(완료 체크, ☆, Edit, Delete·실행 취소, 하위 작업, 선택 체크박스)을 재사용한다. 날짜를 고르기 전에는 비어 있고 안내 문구를 보여준다. 캘린더 전용 추가·수정 기능은 없다.
+- 일괄 작업의 '보이는 항목'은 캘린더 보기에서 그날 목록이다. 보기를 바꾸거나 날짜를 바꿔 안 보이게 된 항목은 선택에서 빠진다.
+- 보기 상태(목록/캘린더, 보던 달)는 새로고침하면 목록 보기로 돌아간다.
 
 ## Out of Scope
 - DB 도입 (SQLite 등), 사용자 인증
@@ -256,7 +262,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - 우선순위·반복 종류·클라이언트 필드 목록 같은 상수는 한 곳에만 정의한다.
 - **테스트용 선택자**: UI 테스트 대상 요소에는 `data-testid`를 붙인다.
   - v4: `todo-item`, `todo-tag`, `tag-filter`, `edit-form`, `edit-save`, `edit-cancel`, `stat-total`, `stat-completed`, `stat-active`, `stat-overdue`, `stat-rate`, `dday`
-  - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-toggle`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `template-load`, `template-edit`, `template-delete`, `template-name`, `template-save`, `template-edit-form`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`
+  - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-toggle`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `template-load`, `template-edit`, `template-delete`, `template-name`, `template-save`, `template-edit-form`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`, `calendar-chip`
 - **커밋**: Conventional Commits 형식이다 (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
   - 기능 커밋 예: `feat: add favorites for Version 5.0.0`
 
@@ -301,7 +307,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - [x] 7-2. UI: 버튼 클릭 시 다운로드되는 파일명과 내용이 맞다 (`expect_download`).
 
 ### 8. 캘린더 뷰
-- [ ] 8. UI (시계 고정): 이번 달 그리드와 오늘 강조, 마감 항목이 해당 `calendar-day[data-date]`에 표시, 이전/다음 달 이동, 마감일 없는 항목 미표시, 필터 반영, 날짜 클릭 시 그날 목록, 목록 보기로 돌아오면 원래 화면, 통계 불변.
+- [x] 8. UI (시계 고정): 이번 달 그리드와 오늘 강조, 마감 항목이 해당 `calendar-day[data-date]`에 표시, 이전/다음 달 이동, 마감일 없는 항목 미표시, 필터 반영, 날짜 클릭 시 그날 목록, 목록 보기로 돌아오면 원래 화면, 통계 불변.
 
 ## 회귀 기준 (v4.0.0) — 5.0.0의 모든 단계에서 계속 통과해야 한다
 
