@@ -253,8 +253,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - [x] 1-2. UI: ☆ 클릭 → ★, 새로고침 후에도 유지. 즐겨찾기 필터는 검색·상태·태그와 AND. Edit → 저장해도 `favorite`이 유지된다.
 
 ### 2. 삭제 실행 취소
-- [ ] 2-1. API: DELETE → restore 하면 같은 id·`created_at`·내용이 돌아온다. 두 번 restore하면 404. 없던 id는 404. 최대 id를 지운 뒤 POST한 새 id는 지운 id와 다르다. 30초가 지나면 404.
-- [ ] 2-2. UI: confirm 수락 → 토스트 → [실행 취소] → 항목과 통계가 복구된다. confirm 취소 시 토스트 없음. 5초 뒤 토스트가 사라진다.
+- [x] 2-1. API: DELETE → restore 하면 같은 id·`created_at`·내용이 돌아온다. 두 번 restore하면 404. 없던 id는 404. 최대 id를 지운 뒤 POST한 새 id는 지운 id와 다르다. 30초가 지나면 404.
+- [x] 2-2. UI: confirm 수락 → 토스트 → [실행 취소] → 항목과 통계가 복구된다. confirm 취소 시 토스트 없음. 5초 뒤 토스트가 사라진다.
 
 ### 3. 일괄 작업
 - [ ] 3-1. API: complete/uncomplete가 시각 규칙(A14~A16)을 지킨다. delete 후 restore로 한 번에 복구된다. 없는 id가 섞이면 404이고 파일은 그대로다. 빈 ids, 잘못된 action → 422.
