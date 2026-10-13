@@ -9,3 +9,6 @@ coverage.xml
 .coverage
 report.html
 test-results/
+
+# 사용자 데이터 — 작업 템플릿은 커밋하지 않는다 (경로는 TEMPLATE_FILE 로 바꿀 수 있다)
+fastapi-app/task_templates.json
