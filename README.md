@@ -20,7 +20,8 @@ FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 데이터는 JSON 파�
 | 4 | 하위 할 일 (펼치기/접기, 추가·수정·완료·삭제(확인창), 진행률 `1/2 (50%)`) | 완료 |
 | 5 | 반복 일정 (매일·매주·매월, 완료하면 다음 일정 1회 생성, `🔁` 배지) | 완료 |
 | 6 | 작업 템플릿 (현재 폼을 템플릿으로 저장, 불러오기로 추가 폼 채우기, 인라인 수정·삭제) | 완료 |
-| 7~8 | 내보내기, 캘린더 | 예정 |
+| 7 | 데이터 내보내기 (CSV·JSON 다운로드, 전체 목록) | 완료 |
+| 8 | 캘린더 | 예정 |
 
 ## 실행
 
@@ -52,6 +53,8 @@ http://localhost:8000 에서 열립니다. 데이터 파일 위치는 환경변�
 | POST | `/todos/{id}/subtasks` | `{"title": "..."}` — 하위 할 일 추가 (201, 갱신된 할 일). 할 일당 20개까지 |
 | PUT | `/todos/{id}/subtasks/{sid}` | `{"title": "...", "completed": true}` — 둘 다 필수 (200, 갱신된 할 일) |
 | DELETE | `/todos/{id}/subtasks/{sid}` | 하위 할 일 삭제 (204). 없는 할 일·하위 할 일은 404 |
+| GET | `/todos/export?format=json` | 전체 목록을 JSON 파일로 다운로드 (`todos-YYYYMMDD.json`, 날짜는 한국 시간) |
+| GET | `/todos/export?format=csv` | 전체 목록을 CSV 파일로 다운로드 (`todos-YYYYMMDD.csv`, UTF-8 BOM). `format`이 없거나 다른 값이면 422 |
 | GET | `/task-templates` | 템플릿 목록 |
 | POST | `/task-templates` | `{"name", "title", "description", "priority", "tags", "recurrence", "subtasks": ["..."]}` — 템플릿 생성 (201). 이름이 겹치면 409 |
 | PUT | `/task-templates/{id}` | 템플릿 전체 수정 (200, 없으면 404, 이름이 겹치면 409) |
@@ -59,6 +62,8 @@ http://localhost:8000 에서 열립니다. 데이터 파일 위치는 환경변�
 | GET | `/` | 화면 |
 
 반복 일정은 `recurrence`(`none`·`daily`·`weekly`·`monthly`)로 정하며, 반복하려면 `due_date`가 필요합니다. 반복 항목이 미완료에서 완료로 바뀌면(PUT, 일괄 완료, `completed: true`로 생성) 직전 마감일 + 1주기를 마감일로 하는 다음 일정이 한 번 만들어집니다. 매월 반복에서 없는 날짜는 그 달 말일로 당깁니다(1/31 → 2/28).
+
+CSV 컬럼은 `id,title,description,completed,priority,due_date,tags,favorite,recurrence,subtasks,created_at,completed_at`입니다. 태그는 `;`로 잇고, 하위 작업은 `완료/전체`(예: `1/2`)로 적습니다. `= + - @`로 시작하는 값은 엑셀 수식으로 실행되지 않도록 앞에 `'`를 붙입니다.
 
 서버를 띄운 뒤 http://localhost:8000/docs 에서 요청·응답 스키마를 볼 수 있습니다.
 

@@ -209,6 +209,12 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - `GET /todos/export?format=json|csv`, `Content-Disposition: attachment; filename=todos-YYYYMMDD.{json|csv}`. 다른 format은 422.
 - JSON은 `GET /todos`와 같은 내용. CSV는 stdlib `csv`, UTF-8 BOM, 고정 헤더, tags는 `;`로 연결, subtasks는 `완료/전체`. `= + - @`로 시작하는 값은 앞에 `'`를 붙인다.
 - 항상 **전체 목록**을 내보낸다. UI는 다운로드 링크 2개 (`<a download>`, `api()`를 거치지 않는 유일한 예외).
+- `format`은 필수다. 없거나 `json`·`csv`(소문자)가 아니면 422.
+- 파일명 날짜는 **한국 시간(UTC+9 고정 오프셋)** 기준이다(tzdata 의존성 없이 계산, 서버 시간대 설정과 무관).
+- CSV 헤더는 영문 필드명 `id,title,description,completed,priority,due_date,tags,favorite,recurrence,subtasks,created_at,completed_at` 순서로 고정한다. 서버 내부용 `next_spawned`는 CSV에서 뺀다(JSON에는 그대로 있다).
+- CSV 값은 JSON과 같은 표기다: `true`/`false`, `daily` 등, ISO 시각, 없는 값은 빈 칸. 쉼표·따옴표·줄바꿈은 `csv` 모듈이 따옴표로 감싼다.
+- 수식 방지 `'`는 CSV에만 붙이고 JSON 값은 바꾸지 않는다.
+- 읽기 전용이다: `todo.json`, 템플릿 파일, 삭제 복구 버퍼를 바꾸지 않는다.
 
 ### 18. 캘린더 뷰 (8단계)
 - 서버 변경 없이 클라이언트에서 `allTodos`로 그린다.
@@ -291,8 +297,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - [x] 6-2. UI: 현재 폼 → 템플릿 저장 → select에 표시, 불러오기 → 추가 폼과 반복 select가 채워지고 추가하면 하위 할 일까지 생성된다. 수정·삭제(confirm) 동작, `prompt()` 없음.
 
 ### 7. 데이터 내보내기
-- [ ] 7-1. API: JSON은 `GET /todos`와 같고 파일명이 `.json`. CSV는 BOM, 고정 헤더, 행 수 = 항목 수, 한글·쉼표·줄바꿈 값이 `csv.reader`로 복원된다. `=SUM(1)` 제목은 `'`로 무력화된다. `format=xml` → 422.
-- [ ] 7-2. UI: 버튼 클릭 시 다운로드되는 파일명과 내용이 맞다 (`expect_download`).
+- [x] 7-1. API: JSON은 `GET /todos`와 같고 파일명이 `.json`. CSV는 BOM, 고정 헤더, 행 수 = 항목 수, 한글·쉼표·줄바꿈 값이 `csv.reader`로 복원된다. `=SUM(1)` 제목은 `'`로 무력화된다. `format=xml` → 422.
+- [x] 7-2. UI: 버튼 클릭 시 다운로드되는 파일명과 내용이 맞다 (`expect_download`).
 
 ### 8. 캘린더 뷰
 - [ ] 8. UI (시계 고정): 이번 달 그리드와 오늘 강조, 마감 항목이 해당 `calendar-day[data-date]`에 표시, 이전/다음 달 이동, 마감일 없는 항목 미표시, 필터 반영, 날짜 클릭 시 그날 목록, 목록 보기로 돌아오면 원래 화면, 통계 불변.
