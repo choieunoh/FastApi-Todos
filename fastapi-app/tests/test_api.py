@@ -1026,7 +1026,10 @@ def test_export_csv_columns_and_values():
     assert first == [str(todos[0]["id"]), "주간 보고, \"최종\"", "1행\n2행, 쉼표", "false", "높음", "2026-10-20",
                      "회사;보고", "true", "weekly", "1/2", todos[0]["created_at"], ""]
     assert first[1:3] == [todos[0]["title"], todos[0]["description"]]   # 쉼표·따옴표·줄바꿈 복원
-    assert second[3] == "true" and second[11] == todos[1]["completed_at"] and second[5] == "" and second[9] == "0/0"
+    assert second[3] == "true"
+    assert second[11] == todos[1]["completed_at"]
+    assert second[5] == ""
+    assert second[9] == "0/0"
 
 
 def test_export_csv_row_count_matches_items():
