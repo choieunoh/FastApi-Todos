@@ -1,6 +1,12 @@
-import requests
+import os
 
-BASE_URL = "http://163.239.77.78:5014"
+import pytest
+
+requests = pytest.importorskip("requests")   # requirements-dev.txt 에 있다
+
+pytestmark = pytest.mark.integration          # 기본 pytest 실행에서는 제외된다
+
+BASE_URL = os.environ.get("INTEGRATION_BASE_URL", "http://163.239.77.78:5014")
 
 
 def test_todo_integration():

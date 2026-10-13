@@ -167,6 +167,9 @@
         const DEFAULT_PRIORITY = "보통";
         const PRIORITY_ORDER = Object.fromEntries(PRIORITIES.map((p, i) => [p, i]));
 
+        // PUT 은 전체 교체이므로 클라이언트가 정하는 필드는 여기 한 곳에서만 나열한다
+        const TODO_FIELDS = ["title", "description", "completed", "priority", "due_date", "tags"];
+
         let allTodos = [];
         let currentFilter = "all";
         let editingId = null;                    // 수정 폼이 열린 항목 (한 번에 하나)
@@ -212,6 +215,12 @@
         }
 
         const todayStr = () => ymd(new Date());
+
+        // 기존 값에 바꿀 값만 덮어써서 PUT 본문을 만든다 (빠진 필드가 기본값으로 지워지지 않게)
+        function toPayload(todo, overrides = {}) {
+          const merged = { ...todo, ...overrides };
+          return Object.fromEntries(TODO_FIELDS.map((key) => [key, merged[key]]));
+        }
 
         const parseTags = (text) => text.split(",").map((t) => t.trim()).filter(Boolean);
 
@@ -311,7 +320,10 @@
           });
         });
 
-        const save = (id, todo) => run("수정", async () => { await api(`/todos/${id}`, "PUT", todo); await load(); });
+        const save = (todo, overrides) => run("수정", async () => {
+          await api(`/todos/${todo.id}`, "PUT", toPayload(todo, overrides));
+          await load();
+        });
 
         function render(todos, today) {
           listEl.replaceChildren(...todos.map((todo) =>
@@ -322,7 +334,7 @@
           const check = el("input", {
             type: "checkbox",
             checked: todo.completed,
-            onchange: () => save(todo.id, { ...todo, completed: check.checked }),
+            onchange: () => save(todo, { completed: check.checked }),
           });
 
           const overdue = isOverdue(todo, today);
@@ -386,14 +398,13 @@
           form.onsubmit = (event) => {
             event.preventDefault();
             run("수정", async () => {
-              await api(`/todos/${todo.id}`, "PUT", {
+              await api(`/todos/${todo.id}`, "PUT", toPayload(todo, {
                 title: title.value.trim(),
                 description: description.value.trim(),
-                completed: todo.completed,
                 priority: priority.value,
                 due_date: dueDate.value,
                 tags: parseTags(tags.value),
-              });
+              }));
               editingId = null;
               await load();
             });

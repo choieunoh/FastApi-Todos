@@ -1,0 +1,8 @@
+# 테스트 전용 의존성 — Docker 이미지에는 들어가지 않는다 (.dockerignore)
+-r requirements.txt
+pytest>=9.0.3             # CVE-2025-71176(임시 디렉터리) 패치 버전
+pytest-cov>=7.1.0
+pytest-html>=4.2.0
+httpx2>=2.13.1            # FastAPI TestClient용 HTTP 클라이언트 (starlette 1.7은 httpx2를 먼저 쓴다)
+requests>=2.32.0          # 배포 서버 통합 테스트 (pytest -m integration)
+pytest-playwright>=0.10.0 # UI 테스트 — 설치 후 `playwright install chromium`
