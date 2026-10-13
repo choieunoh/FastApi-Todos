@@ -2,5 +2,8 @@
 minversion = "9.0"
 testpaths = ["tests"]
 pythonpath = ["."]            # sys.path.insert(...) 대신: main.py가 있는 폴더를 import 경로에 추가
-addopts = ["-ra"]
+addopts = ["-ra", "-m", "not integration"]   # 배포 서버 테스트는 `pytest -m integration`으로 따로 실행
+markers = [
+    "integration: 배포된 서버(INTEGRATION_BASE_URL)를 대상으로 하는 통합 테스트",
+]
 # filterwarnings = ["error"]  # (선택) 경고를 에러로 처리 = pytest -W error

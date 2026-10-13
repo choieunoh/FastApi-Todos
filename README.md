@@ -1,0 +1,95 @@
+# FastAPI To-Do List
+
+FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 데이터는 JSON 파일에 저장합니다.
+**5.0.0**을 단계별로 개발하고 있습니다 (화면 표시는 `Version 5.0.0`). 개발 명세는 [CLAUDE.md](CLAUDE.md)에 있습니다.
+
+## 기능 (4.0.0)
+- 할 일 추가·수정·삭제, 완료 체크
+- 제목·설명 검색, 상태 필터(전체/진행 중/완료), 태그 필터
+- 우선순위·마감일, 기본순/우선순위순/마감일순 정렬
+- 태그 칩, 인라인 수정 폼, 생성/완료 날짜, D-day, 기한 초과 표시
+- 진행률 통계(전체/완료/진행 중/기한 초과/완료율)
+
+## 5.0.0 진행 상황
+| 단계 | 기능 | 상태 |
+|---|---|---|
+| 0 | 기반 정비 (명세, 의존성 분리, API·UI 테스트) | 완료 |
+| 1 | 즐겨찾기 (☆/★ 토글, `★ 즐겨찾기만` 필터) | 완료 |
+| 2 | 삭제 실행 취소 (삭제 후 5초 토스트, 서버는 30초·최대 100건 보관) | 완료 |
+| 3 | 일괄 작업 (선택 체크박스, 보이는 항목 전체 선택, 일괄 완료·미완료·삭제) | 완료 |
+| 4 | 하위 할 일 (펼치기/접기, 추가·수정·완료·삭제(확인창), 진행률 `1/2 (50%)`) | 완료 |
+| 5 | 반복 일정 (매일·매주·매월, 완료하면 다음 일정 1회 생성, `🔁` 배지) | 완료 |
+| 6 | 작업 템플릿 (현재 폼을 템플릿으로 저장, 불러오기로 추가 폼 채우기, 인라인 수정·삭제) | 완료 |
+| 7 | 데이터 내보내기 (CSV·JSON 다운로드, 전체 목록) | 완료 |
+| 8 | 캘린더 보기 (월 그리드, 이전·다음·오늘, 날짜별 항목, 필터 적용) | 완료 |
+
+## 실행
+
+### Docker
+```bash
+docker compose up --build fastapi-app
+```
+http://localhost:5004 에서 열립니다.
+
+> **주의**: 작업 템플릿(`task_templates.json`)은 컨테이너 안에만 저장됩니다. 볼륨을 설정하지 않았으므로 컨테이너를 다시 만들면(`docker compose up --build` 등) 저장한 템플릿이 사라집니다. 데이터 보존은 이후 배포 설정 단계에서 다룰 예정입니다.
+
+### 로컬
+```bash
+cd fastapi-app
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
+http://localhost:8000 에서 열립니다. 데이터 파일 위치는 환경변수 `TODO_FILE`로 바꿀 수 있습니다 (기본값 `fastapi-app/todo.json`). 작업 템플릿은 `TEMPLATE_FILE`(기본값 `fastapi-app/task_templates.json`)에 저장되며, 처음 템플릿을 저장할 때 만들어집니다. 이 파일은 사용자 데이터라 `.gitignore`에 들어 있어 Git에 커밋되지 않습니다.
+
+## API
+| 메서드 | 경로 | 동작 |
+|---|---|---|
+| GET | `/todos` | 전체 목록 |
+| POST | `/todos` | 생성 (201) |
+| PUT | `/todos/{id}` | 전체 수정 (없으면 404). 즐겨찾기 등록·해제도 `favorite` 필드로 합니다 |
+| DELETE | `/todos/{id}` | 삭제 (204, 없으면 404) |
+| POST | `/todos/bulk` | `{"ids": [1, 2], "action": "complete" \| "uncomplete" \| "delete"}` — 1~100건 일괄 처리 (200, `{"updated": [...], "deleted": [...]}`). 없는 id가 하나라도 있으면 404이고 아무것도 바꾸지 않음 |
+| POST | `/todos/restore` | `{"ids": [1, 2]}` (1~100건) — 30초 안에 지운 항목을 원래 id·생성 시각·자리로 복구 (200). 복구할 수 없는 id가 하나라도 있으면 404이고 아무것도 복구하지 않음 |
+| POST | `/todos/{id}/subtasks` | `{"title": "..."}` — 하위 할 일 추가 (201, 갱신된 할 일). 할 일당 20개까지 |
+| PUT | `/todos/{id}/subtasks/{sid}` | `{"title": "...", "completed": true}` — 둘 다 필수 (200, 갱신된 할 일) |
+| DELETE | `/todos/{id}/subtasks/{sid}` | 하위 할 일 삭제 (204). 없는 할 일·하위 할 일은 404 |
+| GET | `/todos/export?format=json` | 전체 목록을 JSON 파일로 다운로드 (`todos-YYYYMMDD.json`, 날짜는 한국 시간) |
+| GET | `/todos/export?format=csv` | 전체 목록을 CSV 파일로 다운로드 (`todos-YYYYMMDD.csv`, UTF-8 BOM). `format`이 없거나 다른 값이면 422 |
+| GET | `/task-templates` | 템플릿 목록 |
+| POST | `/task-templates` | `{"name", "title", "description", "priority", "tags", "recurrence", "subtasks": ["..."]}` — 템플릿 생성 (201). 이름이 겹치면 409 |
+| PUT | `/task-templates/{id}` | 템플릿 전체 수정 (200, 없으면 404, 이름이 겹치면 409) |
+| DELETE | `/task-templates/{id}` | 템플릿 삭제 (204, 없으면 404) |
+| GET | `/` | 화면 |
+
+반복 일정은 `recurrence`(`none`·`daily`·`weekly`·`monthly`)로 정하며, 반복하려면 `due_date`가 필요합니다. 반복 항목이 미완료에서 완료로 바뀌면(PUT, 일괄 완료, `completed: true`로 생성) 직전 마감일 + 1주기를 마감일로 하는 다음 일정이 한 번 만들어집니다. 매월 반복에서 없는 날짜는 그 달 말일로 당깁니다(1/31 → 2/28).
+
+CSV 컬럼은 `id,title,description,completed,priority,due_date,tags,favorite,recurrence,subtasks,created_at,completed_at`입니다. 태그는 `;`로 잇고, 하위 작업은 `완료/전체`(예: `1/2`)로 적습니다. `= + - @`로 시작하는 값은 엑셀 수식으로 실행되지 않도록 앞에 `'`를 붙입니다.
+
+서버를 띄운 뒤 http://localhost:8000/docs 에서 요청·응답 스키마를 볼 수 있습니다.
+
+## 테스트
+```bash
+cd fastapi-app
+pip install -r requirements-dev.txt
+playwright install chromium        # UI 테스트용 브라우저 (처음 한 번)
+
+pytest                             # API + UI 테스트 (실제 todo.json은 건드리지 않음)
+pytest tests/test_api.py           # API만
+pytest tests/test_ui.py --headed   # UI를 브라우저 창으로 보면서 실행
+pytest -m integration              # 배포 서버 대상 통합 테스트
+                                   # 대상 주소: INTEGRATION_BASE_URL (기본 http://163.239.77.78:5014)
+```
+- API 테스트는 FastAPI `TestClient`로, 테스트마다 임시 `todo.json`을 씁니다.
+- UI 테스트는 `tests/conftest.py`가 임시 데이터 파일로 uvicorn을 따로 띄우고 Playwright로 확인합니다.
+- `tests/`와 `requirements-dev.txt`는 Docker 이미지에 들어가지 않습니다.
+
+## 구조
+```
+fastapi-app/
+├── main.py               # API, 모델, 저장 로직
+├── templates/index.html  # 화면 (HTML + CSS + JS 한 파일)
+├── todo.json             # 데이터
+├── requirements.txt      # 런타임 의존성
+├── requirements-dev.txt  # 테스트 의존성
+└── tests/                # pytest (API, UI, 통합)
+```

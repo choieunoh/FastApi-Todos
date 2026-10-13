@@ -8,6 +8,15 @@
         body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
         form { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
         input[type="text"] { flex: 1 1 12rem; padding: .5rem; }
+        textarea { flex: 1 1 100%; min-height: 3.2rem; padding: .5rem; font: inherit; }
+        .template-panel {
+          padding: .6rem .8rem;
+          margin-bottom: 1rem;
+          border: 1px dashed #c8d6f0;
+          border-radius: 6px;
+        }
+        .template-row { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-bottom: .4rem; }
+        .template-row:last-child { margin-bottom: 0; }
         ul { list-style: none; padding: 0; }
         li { display: flex; align-items: center; gap: .5rem; padding: .4rem 0; border-bottom: 1px solid #e5e5e5; }
         .content { flex: 1; display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
@@ -55,6 +64,56 @@
           padding: .4rem;
         }
 
+        .view-toggle { display: flex; gap: .5rem; margin-top: .8rem; }
+        .view-toggle button { padding: .4rem .8rem; cursor: pointer; }
+        .view-toggle button.active { color: #fff; background: #333; border-color: #333; }
+
+        .calendar { margin-bottom: 1rem; }
+        .calendar[hidden] { display: none; }
+        .calendar-nav { display: flex; align-items: center; gap: .5rem; margin-bottom: .5rem; }
+        .calendar-nav strong { flex: 1; text-align: center; }
+        .calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 2px; }
+        .calendar-weekday { padding: .2rem 0; font-size: .8rem; text-align: center; color: #666; }
+        .calendar-day {
+          display: flex;
+          flex-direction: column;
+          align-items: stretch;
+          gap: .1rem;
+          min-height: 4.5rem;
+          padding: .2rem;
+          overflow: hidden;
+          font: inherit;
+          text-align: left;
+          background: #fff;
+          border: 1px solid #e5e5e5;
+          cursor: pointer;
+        }
+        .calendar-day.today { border-color: #2a4a8a; box-shadow: inset 0 0 0 1px #2a4a8a; }
+        .calendar-day.today .calendar-date { color: #2a4a8a; font-weight: bold; }
+        .calendar-day.selected { background: #f3f7ff; }
+        .calendar-date { font-size: .8rem; }
+        .calendar-chip {
+          overflow: hidden;
+          font-size: .72rem;
+          white-space: nowrap;
+          text-overflow: ellipsis;
+          color: #333;
+        }
+        .calendar-chip.high { font-weight: bold; }
+        .calendar-chip.done { color: #888; text-decoration: line-through; }
+        .calendar-chip.overdue { color: #b00020; }
+        .calendar-more { font-size: .72rem; color: #666; }
+        .calendar-selected { margin: .5rem 0 0; font-size: .9rem; color: #555; }
+
+        .export-links { display: flex; align-items: center; gap: .5rem; margin-top: .8rem; font-size: .9rem; }
+        .export-links a {
+          padding: .3rem .7rem;
+          color: #2a4a8a;
+          text-decoration: none;
+          border: 1px solid #c8d6f0;
+          border-radius: 4px;
+        }
+
         .overdue {
           color: #b00020;
           font-weight: bold;
@@ -85,14 +144,72 @@
         .meta { display: flex; flex-wrap: wrap; gap: .6rem; font-size: .8rem; color: #777; }
         .meta:empty { display: none; }
         .dday { font-weight: bold; color: #2a4a8a; }
+        .recurrence { font-weight: bold; color: #6a4c93; }
         .dday.overdue { color: #b00020; }
 
         .edit-form { flex: 1; margin: 0; }
+
+        .bulk-bar {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: .5rem;
+          padding: .4rem .6rem;
+          margin-bottom: .5rem;
+          border: 1px solid #e5e5e5;
+          border-radius: 6px;
+        }
+        .bulk-bar #bulk-count { margin-right: auto; font-size: .9rem; color: #555; }
+        li.selected { background: #f3f7ff; }
+
+        .undo-toast {
+          position: fixed;
+          left: 50%;
+          bottom: 1.5rem;
+          transform: translateX(-50%);
+          display: flex;
+          align-items: center;
+          gap: .8rem;
+          padding: .6rem 1rem;
+          color: #fff;
+          background: #333;
+          border-radius: 6px;
+          box-shadow: 0 2px 8px rgba(0, 0, 0, .25);
+        }
+        .undo-toast[hidden] { display: none; }
+        .undo-toast button {
+          color: #ffd54f;
+          font-weight: bold;
+          background: none;
+          border: none;
+          cursor: pointer;
+        }
+
+        .subtask-head { display: flex; align-items: center; gap: .6rem; font-size: .85rem; }
+        .subtask-toggle { padding: 0; color: #2a4a8a; background: none; border: none; cursor: pointer; }
+        .subtask-progress { display: inline-flex; align-items: center; gap: .3rem; color: #555; }
+        .subtask-progress progress { width: 5rem; height: .6rem; }
+        .subtasks { margin-top: .2rem; padding-left: .6rem; border-left: 2px solid #e5e5e5; }
+        .subtasks ul { margin: 0; }
+        .subtasks li { padding: .15rem 0; border-bottom: none; font-size: .9rem; }
+        .subtasks li span { flex: 1; min-width: 0; }
+        .subtasks form { margin: .2rem 0 0; }
+        .subtasks input[type="text"] { flex: 1 1 8rem; padding: .25rem; }
+
+        .favorite {
+          padding: 0 .2rem;
+          font-size: 1.2rem;
+          line-height: 1;
+          color: #c9a400;
+          background: none;
+          border: none;
+          cursor: pointer;
+        }
      </style>
 </head>
 <body>
     <h1>To-Do List</h1>
-    <p class="version">Version 4.0.0</p>
+    <p class="version">Version 5.0.0</p>
     <form id="todo-form">
       <input
         type="text"
@@ -115,14 +232,38 @@
         aria-label="마감일"
       >
 
+      <select id="recurrence" aria-label="반복"></select>
+
       <input
         type="text"
         id="tags"
         placeholder="태그 (쉼표로 구분, 예: 학교, 과제)"
       >
 
+      <textarea
+        id="subtasks"
+        aria-label="하위 작업"
+        placeholder="하위 작업 (한 줄에 하나)"
+      ></textarea>
+
       <button type="submit">Add To-Do</button>
     </form>
+    <section class="template-panel" data-testid="template-panel" aria-label="작업 템플릿">
+      <div class="template-row">
+        <label for="template-select">템플릿:</label>
+        <select id="template-select" data-testid="template-select">
+          <option value="">템플릿 선택</option>
+        </select>
+        <button type="button" id="template-load" data-testid="template-load" disabled>불러오기</button>
+        <button type="button" id="template-edit" data-testid="template-edit" disabled>수정</button>
+        <button type="button" id="template-delete" data-testid="template-delete" disabled>삭제</button>
+      </div>
+      <div class="template-row">
+        <input type="text" id="template-name" data-testid="template-name" placeholder="템플릿 이름" aria-label="새 템플릿 이름">
+        <button type="button" id="template-save" data-testid="template-save">현재 폼을 템플릿으로 저장</button>
+      </div>
+      <div id="template-editor"></div>
+    </section>
     <div class="stats" aria-label="진행률 통계">
       <span>전체 <strong id="stat-total" data-testid="stat-total">0</strong></span>
       <span>완료 <strong id="stat-completed" data-testid="stat-completed">0</strong></span>
@@ -140,6 +281,7 @@
         <button type="button" data-filter="all">전체</button>
         <button type="button" data-filter="active">진행 중</button>
         <button type="button" data-filter="completed">완료</button>
+        <button type="button" id="favorite-filter" data-testid="favorite-filter" aria-pressed="false">★ 즐겨찾기만</button>
       </div>
       <div class="sort-controls">
         <label for="sort">정렬:</label>
@@ -153,22 +295,78 @@
           <option value="">전체 태그</option>
         </select>
       </div>
+      <!-- 내보내기는 파일 다운로드라 api() 를 거치지 않는 유일한 예외 — 필터와 상관없이 전체 목록 -->
+      <div class="export-links">
+        <span>내보내기:</span>
+        <a href="/todos/export?format=csv" download data-testid="export-csv">CSV 내보내기</a>
+        <a href="/todos/export?format=json" download data-testid="export-json">JSON 내보내기</a>
+      </div>
+      <div class="view-toggle" data-testid="view-toggle" role="group" aria-label="보기">
+        <button type="button" data-view="list">목록</button>
+        <button type="button" data-view="calendar">캘린더</button>
+      </div>
+    </div>
+    <section id="calendar" class="calendar" data-testid="calendar" aria-label="캘린더" hidden>
+      <div class="calendar-nav">
+        <button type="button" id="calendar-prev">이전</button>
+        <strong id="calendar-title" aria-live="polite"></strong>
+        <button type="button" id="calendar-next">다음</button>
+        <button type="button" id="calendar-today">오늘</button>
+      </div>
+      <div class="calendar-grid" id="calendar-grid"></div>
+      <p class="calendar-selected" id="calendar-selected"></p>
+    </section>
+    <div class="bulk-bar" data-testid="bulk-bar" aria-label="일괄 작업">
+      <span id="bulk-count" aria-live="polite">0개 선택</span>
+      <button type="button" id="bulk-select-all" data-testid="bulk-select-all">보이는 항목 전체 선택</button>
+      <button type="button" id="bulk-complete" data-testid="bulk-complete" disabled>완료</button>
+      <button type="button" id="bulk-uncomplete" data-testid="bulk-uncomplete" disabled>미완료</button>
+      <button type="button" id="bulk-delete" data-testid="bulk-delete" disabled>삭제</button>
     </div>
     <p id="error" role="alert" hidden></p>
     <ul id="todo-list"></ul>
+    <div id="undo-toast" class="undo-toast" data-testid="undo-toast" role="status" hidden>
+      <span id="undo-message"></span>
+      <button type="button" id="undo-button" data-testid="undo-button">실행 취소</button>
+    </div>
     <script>
         const $ = (id) => document.getElementById(id);
         const listEl = $("todo-list"), errorEl = $("error");
         const searchEl = $("search"), sortEl = $("sort"), tagFilterEl = $("tag-filter");
         const filterButtons = document.querySelectorAll("[data-filter]");
+        const favoriteFilterEl = $("favorite-filter");
 
         // 우선순위는 여기 한 곳에서만 정의한다
         const PRIORITIES = ["높음", "보통", "낮음"];
         const DEFAULT_PRIORITY = "보통";
+
+        // 반복 주기와 표시 이름도 여기 한 곳에서만 정의한다 (서버 Recurrence 와 같은 값)
+        const RECURRENCES = { none: "반복 없음", daily: "매일", weekly: "매주", monthly: "매월" };
+        const DEFAULT_RECURRENCE = "none";
         const PRIORITY_ORDER = Object.fromEntries(PRIORITIES.map((p, i) => [p, i]));
+
+        // PUT 은 전체 교체이므로 클라이언트가 정하는 필드는 여기 한 곳에서만 나열한다
+        const TODO_FIELDS = ["title", "description", "completed", "priority", "due_date", "tags", "favorite", "recurrence"];
 
         let allTodos = [];
         let currentFilter = "all";
+
+        let currentView = "list";                // "list" | "calendar"
+        let calendarMonth = null;                // 캘린더에 보이는 달 { year, month(0~11) } — 처음 열 때 이번 달
+        let selectedDate = null;                 // 캘린더에서 고른 날짜 (YYYY-MM-DD)
+        const CALENDAR_CHIPS = 3;                // 날짜 칸에 보여줄 최대 항목 수 (나머지는 +N)
+        const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"];
+        let favoriteOnly = false;                // 즐겨찾기만 보기 (다른 필터와 AND)
+
+        const UNDO_MS = 5000;                    // 실행 취소 토스트를 보여주는 시간 (서버 보관은 30초)
+        let undoIds = [];                        // 마지막 삭제에서 지운 id들
+        let undoTimer = null;
+
+        const selectedIds = new Set();           // 일괄 작업 대상 (지금 보이는 항목만 남긴다)
+        let visibleIds = [];
+
+        const expandedSubtasks = new Set();      // 하위 목록을 펼친 할 일 (새로고침하면 다시 접힌다)
+        let editingSubtask = null;               // 제목을 고치는 하위 할 일 { todoId, id } — 한 번에 하나
         let editingId = null;                    // 수정 폼이 열린 항목 (한 번에 하나)
 
         // 모든 요청을 한 곳에서 처리하고, 실패는 조용히 넘기지 않는다
@@ -199,10 +397,14 @@
           return el("button", { type: "button", textContent: label, onclick });
         }
 
-        function priorityOptions(select, selected) {
-          select.replaceChildren(...PRIORITIES.map((p) =>
-            el("option", { value: p, textContent: p, defaultSelected: p === selected, selected: p === selected })));
+        // [값, 표시 이름] 목록으로 select 를 채운다 (form.reset() 이 기본값으로 돌아가도록 defaultSelected 도 둔다)
+        function fillOptions(select, entries, selected) {
+          select.replaceChildren(...entries.map(([value, label]) =>
+            el("option", { value, textContent: label, defaultSelected: value === selected, selected: value === selected })));
         }
+
+        const priorityOptions = (select, selected) => fillOptions(select, PRIORITIES.map((p) => [p, p]), selected);
+        const recurrenceOptions = (select, selected) => fillOptions(select, Object.entries(RECURRENCES), selected);
 
         // 날짜는 모두 브라우저 로컬 기준 YYYY-MM-DD 로 다룬다
         function ymd(d) {
@@ -213,7 +415,16 @@
 
         const todayStr = () => ymd(new Date());
 
+        // 기존 값에 바꿀 값만 덮어써서 PUT 본문을 만든다 (빠진 필드가 기본값으로 지워지지 않게)
+        function toPayload(todo, overrides = {}) {
+          const merged = { ...todo, ...overrides };
+          return Object.fromEntries(TODO_FIELDS.map((key) => [key, merged[key]]));
+        }
+
         const parseTags = (text) => text.split(",").map((t) => t.trim()).filter(Boolean);
+
+        // 한 줄에 하나씩 적은 하위 작업 제목 (빈 줄은 건너뛴다)
+        const parseLines = (text) => text.split("\n").map((t) => t.trim()).filter(Boolean);
 
         const isOverdue = (todo, today) =>
           Boolean(todo.due_date) && todo.due_date < today && !todo.completed;
@@ -259,7 +470,9 @@
 
             const matchesTag = !tag || todo.tags.includes(tag);
 
-            return matchesSearch && matchesFilter && matchesTag;
+            const matchesFavorite = !favoriteOnly || todo.favorite;
+
+            return matchesSearch && matchesFilter && matchesTag && matchesFavorite;
           });
 
           // 정렬
@@ -283,11 +496,122 @@
             btn.classList.toggle("active", active);
             btn.setAttribute("aria-pressed", active);
           });
+          favoriteFilterEl.classList.toggle("active", favoriteOnly);
+          favoriteFilterEl.setAttribute("aria-pressed", favoriteOnly);
+
+          // 캘린더 보기에서는 고른 날짜의 항목만 목록에 보인다 (일괄 작업도 이 목록 기준)
+          const visible = currentView === "list" ? filtered
+            : filtered.filter((todo) => selectedDate && todo.due_date === selectedDate);
+
+          // 필터로 가려진 항목은 선택에서 뺀다
+          visibleIds = visible.map((todo) => todo.id);
+          for (const id of [...selectedIds]) if (!visibleIds.includes(id)) selectedIds.delete(id);
 
           const today = todayStr();
           renderStats(today);
-          render(filtered, today);
+          renderViewToggle();
+          renderCalendar(filtered, today);
+          render(visible, today);
+          renderBulkBar();
         }
+
+        function renderBulkBar() {
+          const count = selectedIds.size;
+          const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
+          $("bulk-count").textContent = `${count}개 선택`;
+          $("bulk-select-all").textContent = allSelected ? "선택 해제" : "보이는 항목 전체 선택";
+          $("bulk-select-all").disabled = visibleIds.length === 0;
+          for (const id of ["bulk-complete", "bulk-uncomplete", "bulk-delete"]) $(id).disabled = count === 0;
+        }
+
+        // ---------- 캘린더 — 서버 변경 없이 필터를 거친 목록을 마감일별로 그린다 ----------
+        function renderViewToggle() {
+          document.querySelectorAll("[data-view]").forEach((btn) => {
+            const active = btn.dataset.view === currentView;
+            btn.classList.toggle("active", active);
+            btn.setAttribute("aria-pressed", active);
+          });
+          $("calendar").hidden = currentView !== "calendar";
+        }
+
+        function setCalendarMonth(year, month) {
+          const first = new Date(year, month, 1);  // 13월·0월은 Date 가 연도를 넘겨 맞춘다
+          calendarMonth = { year: first.getFullYear(), month: first.getMonth() };
+          selectedDate = null;                     // 다른 달로 가면 고른 날짜는 풀린다
+          applyFilters();
+        }
+
+        function calendarChip(todo, today) {
+          const marks = `${todo.favorite ? "★" : ""}${todo.recurrence && todo.recurrence !== DEFAULT_RECURRENCE ? "🔁" : ""}`;
+          const classes = ["calendar-chip"];
+          if (todo.completed) classes.push("done");
+          else if (isOverdue(todo, today)) classes.push("overdue");
+          if (todo.priority === PRIORITIES[0]) classes.push("high");
+          const chip = el("span", { className: classes.join(" "), textContent: marks ? `${marks} ${todo.title}` : todo.title });
+          chip.dataset.testid = "calendar-chip";
+          chip.title = todo.title;
+          return chip;
+        }
+
+        function renderCalendar(filtered, today) {
+          if (currentView !== "calendar") return;
+          if (!calendarMonth) {
+            const now = new Date();
+            calendarMonth = { year: now.getFullYear(), month: now.getMonth() };
+          }
+          const { year, month } = calendarMonth;
+          $("calendar-title").textContent = `${year}년 ${month + 1}월`;
+
+          const byDate = new Map();                // 필터를 거친 순서(정렬 반영) 그대로 날짜별로 모은다
+          for (const todo of filtered) {
+            if (!todo.due_date) continue;          // 마감일 없는 항목은 캘린더에 없다
+            if (!byDate.has(todo.due_date)) byDate.set(todo.due_date, []);
+            byDate.get(todo.due_date).push(todo);
+          }
+
+          const cells = WEEKDAYS.map((name) => el("div", { className: "calendar-weekday", textContent: name }));
+          const leading = new Date(year, month, 1).getDay();          // 일요일 시작
+          const days = new Date(year, month + 1, 0).getDate();        // 그 달 마지막 날 (윤년 2월 포함)
+          for (let i = 0; i < leading; i++) cells.push(el("div"));    // 다른 달 칸은 비워 둔다
+          for (let day = 1; day <= days; day++) {
+            const date = ymd(new Date(year, month, day));
+            const todos = byDate.get(date) || [];
+            const cell = el("button", { type: "button", className: "calendar-day" });
+            cell.dataset.testid = "calendar-day";
+            cell.dataset.date = date;
+            if (date === today) {
+              cell.classList.add("today");
+              cell.setAttribute("aria-current", "date");
+            }
+            if (date === selectedDate) cell.classList.add("selected");
+            cell.setAttribute("aria-pressed", date === selectedDate);
+            cell.append(el("span", { className: "calendar-date", textContent: day }),
+              ...todos.slice(0, CALENDAR_CHIPS).map((todo) => calendarChip(todo, today)));
+            if (todos.length > CALENDAR_CHIPS) {
+              cell.append(el("span", { className: "calendar-more", textContent: `+${todos.length - CALENDAR_CHIPS}` }));
+            }
+            cell.onclick = () => { selectedDate = date; applyFilters(); };
+            cells.push(cell);
+          }
+          $("calendar-grid").replaceChildren(...cells);
+
+          const count = selectedDate ? (byDate.get(selectedDate) || []).length : 0;
+          $("calendar-selected").textContent = !selectedDate ? "날짜를 누르면 그날 마감인 할 일을 볼 수 있습니다."
+            : count ? `${selectedDate} 마감 ${count}개` : `${selectedDate}에 마감인 할 일이 없습니다.`;
+        }
+
+        document.querySelectorAll("[data-view]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            currentView = btn.dataset.view;
+            applyFilters();
+          });
+        });
+        $("calendar-prev").onclick = () => setCalendarMonth(calendarMonth.year, calendarMonth.month - 1);
+        $("calendar-next").onclick = () => setCalendarMonth(calendarMonth.year, calendarMonth.month + 1);
+        $("calendar-today").onclick = () => {
+          const now = new Date();
+          setCalendarMonth(now.getFullYear(), now.getMonth());
+        };
 
         // 통계는 필터와 상관없이 전체 목록 기준
         function renderStats(today) {
@@ -310,8 +634,15 @@
             applyFilters();
           });
         });
+        favoriteFilterEl.addEventListener("click", () => {
+          favoriteOnly = !favoriteOnly;
+          applyFilters();
+        });
 
-        const save = (id, todo) => run("수정", async () => { await api(`/todos/${id}`, "PUT", todo); await load(); });
+        const save = (todo, overrides) => run("수정", async () => {
+          await api(`/todos/${todo.id}`, "PUT", toPayload(todo, overrides));
+          await load();
+        });
 
         function render(todos, today) {
           listEl.replaceChildren(...todos.map((todo) =>
@@ -319,11 +650,33 @@
         }
 
         function renderItem(todo, today) {
+          const li = el("li", { className: selectedIds.has(todo.id) ? "selected" : "" });
+
+          const pick = el("input", {
+            type: "checkbox",
+            checked: selectedIds.has(todo.id),
+            onchange: () => {
+              if (pick.checked) selectedIds.add(todo.id); else selectedIds.delete(todo.id);
+              li.classList.toggle("selected", pick.checked);
+              renderBulkBar();
+            },
+          });
+          pick.dataset.testid = "bulk-select";
+          pick.setAttribute("aria-label", `${todo.title} 선택`);
+
           const check = el("input", {
             type: "checkbox",
             checked: todo.completed,
-            onchange: () => save(todo.id, { ...todo, completed: check.checked }),
+            onchange: () => save(todo, { completed: check.checked }),
           });
+          check.className = "todo-check";
+          check.setAttribute("aria-label", `${todo.title} 완료`);
+
+          const star = button(todo.favorite ? "★" : "☆", () => save(todo, { favorite: !todo.favorite }));
+          star.className = "favorite";
+          star.dataset.testid = "favorite-toggle";
+          star.setAttribute("aria-label", todo.favorite ? "즐겨찾기 해제" : "즐겨찾기 등록");
+          star.setAttribute("aria-pressed", todo.favorite);
 
           const overdue = isOverdue(todo, today);
           const text = el("span", {
@@ -344,6 +697,11 @@
           }));
 
           const meta = el("div", { className: "meta" });
+          if (todo.recurrence && todo.recurrence !== DEFAULT_RECURRENCE) {
+            const badge = el("span", { className: "recurrence", textContent: `🔁 ${RECURRENCES[todo.recurrence]}` });
+            badge.dataset.testid = "recurrence-badge";
+            meta.append(badge);
+          }
           if (todo.due_date && !todo.completed) {
             const dday = el("span", { className: overdue ? "dday overdue" : "dday", textContent: ddayLabel(todo.due_date, today) });
             dday.dataset.testid = "dday";
@@ -353,11 +711,111 @@
           if (todo.completed && todo.completed_at) meta.append(el("span", { textContent: `완료: ${ymd(new Date(todo.completed_at))}` }));
 
           const content = el("div", { className: "content" });
-          content.append(text, tags, meta);
+          content.append(text, tags, meta, renderSubtasks(todo));
 
-          const li = el("li");
           li.dataset.testid = "todo-item";
-          li.append(check, content, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
+          li.append(pick, check, star, content, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
+          return li;
+        }
+
+        // 하위 할 일 — 상위 completed 와 연동하지 않고 진행률만 보여준다
+        const subtaskUrl = (todoId, id) => `/todos/${todoId}/subtasks${id ? `/${id}` : ""}`;
+
+        function subtaskJob(what, job) {
+          return run(what, async () => { await job(); await load(); });
+        }
+
+        function renderSubtasks(todo) {
+          const total = todo.subtasks.length;
+          const done = todo.subtasks.filter((s) => s.completed).length;
+          const expanded = expandedSubtasks.has(todo.id);
+
+          const toggle = button(`${expanded ? "▾" : "▸"} 하위 작업 (${total})`, () => {
+            if (expanded) expandedSubtasks.delete(todo.id); else expandedSubtasks.add(todo.id);
+            applyFilters();
+          });
+          toggle.className = "subtask-toggle";
+          toggle.dataset.testid = "subtask-toggle";
+          toggle.setAttribute("aria-expanded", expanded);
+
+          const head = el("div", { className: "subtask-head" });
+          head.append(toggle);
+          if (total) {                           // 하위가 없으면 진행률을 숨긴다
+            const progress = el("span", { className: "subtask-progress" });
+            progress.dataset.testid = "subtask-progress";
+            progress.append(el("progress", { max: total, value: done }),
+              `${done}/${total} (${Math.round(done / total * 100)}%)`);
+            head.append(progress);
+          }
+
+          const wrap = el("div");
+          wrap.append(head);
+          if (!expanded) return wrap;
+
+          const list = el("div", { className: "subtasks" });
+          list.dataset.testid = "subtask-list";
+          const ul = el("ul");
+          ul.append(...todo.subtasks.map((subtask) => renderSubtask(todo, subtask)));
+
+          const input = el("input", { type: "text", placeholder: "하위 작업 추가" });
+          input.dataset.testid = "subtask-add";
+          input.dataset.todoId = todo.id;
+          input.setAttribute("aria-label", `${todo.title} 하위 작업 추가`);
+          const form = el("form");
+          form.append(input, el("button", { type: "submit", textContent: "추가" }));
+          form.onsubmit = (event) => {
+            event.preventDefault();
+            subtaskJob("하위 작업 추가", async () => {
+              await api(subtaskUrl(todo.id), "POST", { title: input.value.trim() });
+            }).then(() => listEl.querySelector(`[data-testid=subtask-add][data-todo-id="${todo.id}"]`)?.focus());
+          };
+
+          list.append(ul, form);
+          wrap.append(list);
+          return wrap;
+        }
+
+        function renderSubtask(todo, subtask) {
+          const li = el("li");
+          li.dataset.testid = "subtask-item";
+          const url = subtaskUrl(todo.id, subtask.id);
+
+          if (editingSubtask?.todoId === todo.id && editingSubtask.id === subtask.id) {
+            const input = el("input", { type: "text", value: subtask.title });
+            input.setAttribute("aria-label", "하위 작업 제목");
+            const cancel = () => { editingSubtask = null; applyFilters(); };
+            const submit = () => subtaskJob("하위 작업 수정", async () => {
+              await api(url, "PUT", { title: input.value.trim(), completed: subtask.completed });
+              editingSubtask = null;
+            });
+            input.onkeydown = (event) => {
+              if (event.key === "Enter") submit();
+              if (event.key === "Escape") cancel();
+            };
+            li.append(input, button("저장", submit), button("취소", cancel));
+            return li;
+          }
+
+          const box = el("input", {
+            type: "checkbox",
+            checked: subtask.completed,
+            onchange: () => subtaskJob("하위 작업 수정", () =>
+              api(url, "PUT", { title: subtask.title, completed: box.checked })),
+          });
+          box.setAttribute("aria-label", `${subtask.title} 완료`);
+          const title = el("span", { textContent: subtask.title, className: subtask.completed ? "done" : "" });
+          const editBtn = button("수정", () => {
+            editingSubtask = { todoId: todo.id, id: subtask.id };
+            applyFilters();
+            listEl.querySelector("[aria-label='하위 작업 제목']")?.focus();
+          });
+          const deleteBtn = button("삭제", () => {
+            if (!confirm("정말 삭제할까요?")) return;   // 상위 할 일 삭제와 같은 확인 (하위는 실행 취소가 없다)
+            subtaskJob("하위 작업 삭제", () => api(url, "DELETE"));
+          });
+          editBtn.setAttribute("aria-label", `${subtask.title} 수정`);
+          deleteBtn.setAttribute("aria-label", `${subtask.title} 삭제`);
+          li.append(box, title, editBtn, deleteBtn);
           return li;
         }
 
@@ -368,11 +826,14 @@
           const priority = el("select");
           priorityOptions(priority, todo.priority || DEFAULT_PRIORITY);
           const dueDate = el("input", { type: "date", value: todo.due_date || "" });
+          const recurrence = el("select");
+          recurrenceOptions(recurrence, todo.recurrence || DEFAULT_RECURRENCE);
           const tags = el("input", { type: "text", value: todo.tags.join(", "), placeholder: "태그 (쉼표로 구분)" });
           title.setAttribute("aria-label", "제목");
           description.setAttribute("aria-label", "설명");
           priority.setAttribute("aria-label", "우선순위");
           dueDate.setAttribute("aria-label", "마감일");
+          recurrence.setAttribute("aria-label", "반복");
           tags.setAttribute("aria-label", "태그");
 
           const saveBtn = el("button", { type: "submit", textContent: "저장" });
@@ -382,18 +843,18 @@
 
           const form = el("form", { className: "edit-form" });
           form.dataset.testid = "edit-form";
-          form.append(title, description, priority, dueDate, tags, saveBtn, cancelBtn);
+          form.append(title, description, priority, dueDate, recurrence, tags, saveBtn, cancelBtn);
           form.onsubmit = (event) => {
             event.preventDefault();
             run("수정", async () => {
-              await api(`/todos/${todo.id}`, "PUT", {
+              await api(`/todos/${todo.id}`, "PUT", toPayload(todo, {
                 title: title.value.trim(),
                 description: description.value.trim(),
-                completed: todo.completed,
                 priority: priority.value,
                 due_date: dueDate.value,
+                recurrence: recurrence.value,
                 tags: parseTags(tags.value),
-              });
+              }));
               editingId = null;
               await load();
             });
@@ -413,29 +874,201 @@
 
         function remove(id) {
           if (!confirm("정말 삭제할까요?")) return;
-          run("삭제", async () => { await api(`/todos/${id}`, "DELETE"); await load(); });
+          run("삭제", async () => {
+            await api(`/todos/${id}`, "DELETE");
+            showUndo([id]);
+            await load();
+          });
         }
 
+        // 일괄 작업 — 삭제는 단건과 같이 confirm 후 실행 취소 토스트를 띄운다
+        const BULK_LABELS = { complete: "일괄 완료", uncomplete: "일괄 미완료", delete: "일괄 삭제" };
+
+        function bulk(action) {
+          const ids = [...selectedIds];
+          if (!ids.length) return;
+          if (action === "delete" && !confirm(`선택한 ${ids.length}개를 삭제할까요?`)) return;
+          run(BULK_LABELS[action], async () => {
+            const result = await api("/todos/bulk", "POST", { ids, action });
+            selectedIds.clear();
+            if (result.deleted.length) showUndo(result.deleted);
+            await load();
+          });
+        }
+
+        $("bulk-complete").onclick = () => bulk("complete");
+        $("bulk-uncomplete").onclick = () => bulk("uncomplete");
+        $("bulk-delete").onclick = () => bulk("delete");
+        $("bulk-select-all").onclick = () => {
+          const allSelected = visibleIds.every((id) => selectedIds.has(id));
+          for (const id of visibleIds) if (allSelected) selectedIds.delete(id); else selectedIds.add(id);
+          applyFilters();
+        };
+
+        // 삭제 직후 실행 취소 토스트 — 새 삭제가 일어나면 내용을 바꾸고 시간을 다시 잰다
+        function showUndo(ids) {
+          undoIds = ids;
+          $("undo-message").textContent = `${ids.length}개 삭제됨`;
+          $("undo-toast").hidden = false;
+          clearTimeout(undoTimer);
+          undoTimer = setTimeout(hideUndo, UNDO_MS);
+        }
+
+        function hideUndo() {
+          clearTimeout(undoTimer);
+          $("undo-toast").hidden = true;
+          undoIds = [];
+        }
+
+        $("undo-button").onclick = () => {
+          const ids = undoIds;
+          hideUndo();
+          run("실행 취소", async () => {
+            await api("/todos/restore", "POST", { ids });
+            await load();
+          });
+        };
+
         priorityOptions($("priority"), DEFAULT_PRIORITY);
+        recurrenceOptions($("recurrence"), DEFAULT_RECURRENCE);
 
         $("todo-form").onsubmit = (event) => {
           event.preventDefault();
 
           run("추가", async () => {
-            await api("/todos", "POST", {
+            const todo = await api("/todos", "POST", {
               title: $("title").value.trim(),
               description: $("description").value.trim(),
               priority: $("priority").value,
               due_date: $("due-date").value,
+              recurrence: $("recurrence").value,
               tags: parseTags($("tags").value),
             });
 
-            event.target.reset();
-            await load();
+            try {                                // 하위 작업은 할 일을 만든 뒤 차례로 추가한다
+              for (const title of parseLines($("subtasks").value)) {
+                await api(`/todos/${todo.id}/subtasks`, "POST", { title });
+              }
+            } finally {                          // 할 일은 이미 생겼으니 폼을 비워 중복 추가를 막는다
+              event.target.reset();
+              await load();
+            }
+          });
+        };
+
+        // ---------- 작업 템플릿 — 불러오면 추가 폼을 채우고, 생성은 위 추가 흐름을 그대로 쓴다 ----------
+        const templateSelectEl = $("template-select");
+        let templates = [];
+        let editingTemplateId = null;            // 인라인 수정 중인 템플릿 (한 번에 하나)
+
+        const selectedTemplate = () => templates.find((t) => String(t.id) === templateSelectEl.value);
+
+        // 추가 폼의 지금 값 → 템플릿 내용 (마감일은 템플릿에 넣지 않는다)
+        const formTemplateFields = () => ({
+          title: $("title").value.trim(),
+          description: $("description").value.trim(),
+          priority: $("priority").value,
+          recurrence: $("recurrence").value,
+          tags: parseTags($("tags").value),
+          subtasks: parseLines($("subtasks").value),
+        });
+
+        async function fetchTemplates(selectId = templateSelectEl.value) {
+          templates = await api("/task-templates");
+          templateSelectEl.replaceChildren(
+            el("option", { value: "", textContent: "템플릿 선택" }),
+            ...templates.map((t) => el("option", { value: t.id, textContent: t.name })),
+          );
+          templateSelectEl.value = templates.some((t) => String(t.id) === String(selectId)) ? selectId : "";
+          if (!templates.some((t) => t.id === editingTemplateId)) editingTemplateId = null;
+          renderTemplatePanel();
+        }
+
+        function renderTemplatePanel() {
+          const template = selectedTemplate();
+          for (const id of ["template-load", "template-edit", "template-delete"]) $(id).disabled = !template;
+          $("template-editor").replaceChildren(...(template && template.id === editingTemplateId
+            ? [renderTemplateEditor(template)] : []));
+        }
+
+        function renderTemplateEditor(template) {
+          const field = (tag, label, props) => {
+            const input = el(tag, props);
+            input.setAttribute("aria-label", label);
+            return input;
+          };
+          const name = field("input", "템플릿 이름", { type: "text", value: template.name });
+          const title = field("input", "제목", { type: "text", value: template.title });
+          const description = field("input", "설명", { type: "text", value: template.description });
+          const priority = field("select", "우선순위");
+          priorityOptions(priority, template.priority);
+          const recurrence = field("select", "반복");
+          recurrenceOptions(recurrence, template.recurrence);
+          const tags = field("input", "태그", { type: "text", value: template.tags.join(", ") });
+          const subtasks = field("textarea", "하위 작업", { value: template.subtasks.join("\n") });
+
+          const form = el("form");
+          form.dataset.testid = "template-edit-form";
+          form.append(name, title, description, priority, recurrence, tags, subtasks,
+            el("button", { type: "submit", textContent: "저장" }),
+            button("취소", () => { editingTemplateId = null; renderTemplatePanel(); }));
+          form.onsubmit = (event) => {
+            event.preventDefault();
+            run("템플릿 수정", async () => {   // 실패하면 폼을 그대로 두고 오류만 띄운다
+              await api(`/task-templates/${template.id}`, "PUT", {
+                name: name.value.trim(),
+                title: title.value.trim(),
+                description: description.value.trim(),
+                priority: priority.value,
+                recurrence: recurrence.value,
+                tags: parseTags(tags.value),
+                subtasks: parseLines(subtasks.value),
+              });
+              editingTemplateId = null;
+              await fetchTemplates();
+            });
+          };
+          return form;
+        }
+
+        templateSelectEl.onchange = () => { editingTemplateId = null; renderTemplatePanel(); };
+
+        $("template-load").onclick = () => {
+          const t = selectedTemplate();
+          if (!t) return;
+          $("title").value = t.title;
+          $("description").value = t.description;
+          $("priority").value = t.priority;
+          $("recurrence").value = t.recurrence;
+          $("tags").value = t.tags.join(", ");
+          $("subtasks").value = t.subtasks.join("\n");
+          $("title").focus();
+        };
+
+        $("template-save").onclick = () => run("템플릿 저장", async () => {
+          const created = await api("/task-templates", "POST",
+            { name: $("template-name").value.trim(), ...formTemplateFields() });
+          $("template-name").value = "";
+          await fetchTemplates(created.id);
+        });
+
+        $("template-edit").onclick = () => {
+          editingTemplateId = selectedTemplate()?.id ?? null;
+          renderTemplatePanel();
+          $("template-editor").querySelector("input")?.focus();
+        };
+
+        $("template-delete").onclick = () => {
+          const t = selectedTemplate();
+          if (!t || !confirm("정말 삭제할까요?")) return;
+          run("템플릿 삭제", async () => {
+            await api(`/task-templates/${t.id}`, "DELETE");
+            await fetchTemplates("");
           });
         };
 
         load();
+        run("템플릿 목록 불러오기", () => fetchTemplates());
      </script>
 </body>
 </html>
