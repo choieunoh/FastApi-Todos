@@ -7,3 +7,8 @@ venv/
 .env
 Dockerfile
 .dockerignore
+tests/
+requirements-dev.txt
+.pytest_cache/
+.playwright-mcp/
+coverage.xml
