@@ -1185,3 +1185,215 @@ def test_export_ignores_filters(page: Page, seed):
     _, data = download(page, "export-json")
     assert [t["title"] for t in json_module.loads(data)] == ["주간 보고, \"최종\"", "=SUM(1)", "숨겨질 항목"]
     expect(page.locator(ITEM)).to_have_count(1)                            # 필터 상태는 그대로
+
+
+# ---------- 5.0.0 8단계: 캘린더 보기 ----------
+
+CAL_TODOS = [
+    todo(1, "주간 보고", due_date="2026-10-15", favorite=True, recurrence="weekly", priority="높음", tags=["회사"]),
+    todo(2, "운동", due_date="2026-10-15", completed=True, tags=["개인"]),
+    todo(3, "장보기", due_date="2026-10-15", priority="낮음", tags=["개인"]),
+    todo(4, "독서", due_date="2026-10-15", tags=["개인"]),
+    todo(5, "청소", due_date="2026-10-15", tags=["개인"]),
+    todo(6, "밀린 숙제", due_date="2026-10-05"),
+    todo(7, "오늘 할 일", due_date=TODAY),
+    todo(8, "다음 달 회의", due_date="2026-11-03"),
+    todo(9, "마감 없음"),
+]
+
+
+def calendar(page: Page):
+    return page.get_by_test_id("calendar")
+
+
+def day(page: Page, date: str):
+    return page.locator(f"[data-testid=calendar-day][data-date='{date}']")
+
+
+def chips(page: Page, date: str):
+    return day(page, date).get_by_test_id("calendar-chip")
+
+
+def open_calendar(page: Page) -> None:
+    page.get_by_test_id("view-toggle").get_by_role("button", name="캘린더").click()
+    expect(calendar(page)).to_be_visible()
+
+
+def cal_title(page: Page):
+    return page.locator("#calendar-title")
+
+
+def go(page: Page, button: str, times: int = 1) -> None:
+    for _ in range(times):
+        calendar(page).get_by_role("button", name=button, exact=True).click()
+
+
+def test_calendar_toggle_and_month_grid(page: Page, seed):
+    seed(CAL_TODOS)
+    open_app(page)
+    toggle = page.get_by_test_id("view-toggle")
+    expect(toggle.get_by_role("button", name="목록")).to_have_attribute("aria-pressed", "true")
+    expect(calendar(page)).to_be_hidden()
+    expect(page.locator(ITEM)).to_have_count(9)
+
+    open_calendar(page)
+    expect(toggle.get_by_role("button", name="캘린더")).to_have_attribute("aria-pressed", "true")
+    expect(cal_title(page)).to_have_text("2026년 10월")
+    expect(page.locator(".calendar-weekday")).to_have_text(["일", "월", "화", "수", "목", "금", "토"])
+    days = page.get_by_test_id("calendar-day")
+    expect(days).to_have_count(31)
+    expect(days.first).to_have_attribute("data-date", "2026-10-01")
+    # 2026-10-01 은 목요일 → 일~수 4칸을 비운다
+    expect(page.locator("#calendar-grid > *").nth(7 + 4)).to_have_attribute("data-date", "2026-10-01")
+    expect(page.locator("#calendar-grid > div:not(.calendar-weekday)")).to_have_count(4)
+
+    today = day(page, TODAY)
+    expect(today).to_have_class(re.compile(r"\btoday\b"))
+    expect(today).to_have_attribute("aria-current", "date")
+    expect(page.locator(".calendar-day.today")).to_have_count(1)
+    expect(page.locator(ITEM)).to_have_count(0)                          # 날짜를 고르기 전에는 목록이 비어 있다
+    expect(page.locator("#calendar-selected")).to_have_text("날짜를 누르면 그날 마감인 할 일을 볼 수 있습니다.")
+    assert stats(page) == ("9", "1", "8", "1", "11%")                     # 통계는 그대로
+
+    toggle.get_by_role("button", name="목록").click()                     # 목록으로 돌아오면 원래 화면
+    expect(calendar(page)).to_be_hidden()
+    assert titles(page) == [t["title"] for t in CAL_TODOS]
+
+
+def test_calendar_chips_limit_and_marks(page: Page, seed):
+    seed(CAL_TODOS)
+    open_app(page)
+    open_calendar(page)
+    expect(chips(page, "2026-10-15")).to_have_text(["★🔁 주간 보고", "운동", "장보기"])   # 최대 3개
+    expect(day(page, "2026-10-15").locator(".calendar-more")).to_have_text("+2")
+    expect(chips(page, "2026-10-15").nth(0)).to_have_class(re.compile(r"\bhigh\b"))     # 우선순위 높음
+    expect(chips(page, "2026-10-15").nth(1)).to_have_class(re.compile(r"\bdone\b"))     # 완료
+    expect(chips(page, "2026-10-05")).to_have_class(re.compile(r"\boverdue\b"))         # 기한 초과
+    expect(chips(page, TODAY)).not_to_have_class(re.compile(r"\boverdue\b"))            # 오늘 마감은 초과 아님
+    expect(page.get_by_test_id("calendar-chip")).to_have_count(5)        # 10월: 3 + 1 + 1, 마감 없음은 없다
+    expect(calendar(page)).not_to_contain_text("마감 없음")
+    expect(calendar(page)).not_to_contain_text("다음 달 회의")
+
+
+def test_calendar_chip_order_follows_sort(page: Page, seed):
+    seed(CAL_TODOS)
+    open_app(page)
+    page.locator("#sort").select_option("priority")
+    open_calendar(page)
+    expect(chips(page, "2026-10-15")).to_have_text(["★🔁 주간 보고", "운동", "독서"])  # 높음 → 보통 → 보통
+
+
+def test_calendar_navigation_year_end_and_leap_year(page: Page, seed):
+    seed(CAL_TODOS)
+    open_app(page)
+    open_calendar(page)
+    go(page, "이전")
+    expect(cal_title(page)).to_have_text("2026년 9월")
+    expect(page.get_by_test_id("calendar-day")).to_have_count(30)
+    expect(page.get_by_test_id("calendar-chip")).to_have_count(0)
+
+    go(page, "다음", 2)
+    expect(cal_title(page)).to_have_text("2026년 11월")
+    expect(chips(page, "2026-11-03")).to_have_text(["다음 달 회의"])
+    expect(page.locator(".calendar-day.today")).to_have_count(0)         # 다른 달에는 오늘 표시가 없다
+
+    go(page, "다음", 2)                                                  # 12월 → 다음 해 1월
+    expect(cal_title(page)).to_have_text("2027년 1월")
+    expect(page.get_by_test_id("calendar-day")).to_have_count(31)
+    go(page, "다음")
+    expect(cal_title(page)).to_have_text("2027년 2월")
+    expect(page.get_by_test_id("calendar-day")).to_have_count(28)
+    expect(page.get_by_test_id("calendar-day").last).to_have_attribute("data-date", "2027-02-28")
+    go(page, "다음", 12)
+    expect(cal_title(page)).to_have_text("2028년 2월")                    # 윤년
+    expect(page.get_by_test_id("calendar-day")).to_have_count(29)
+    expect(page.get_by_test_id("calendar-day").last).to_have_attribute("data-date", "2028-02-29")
+    go(page, "이전", 26)
+    expect(cal_title(page)).to_have_text("2025년 12월")                   # 1월 → 이전 해 12월
+    go(page, "오늘")
+    expect(cal_title(page)).to_have_text("2026년 10월")
+    expect(day(page, TODAY)).to_have_class(re.compile(r"\btoday\b"))
+
+
+def test_calendar_filters_apply(page: Page, seed):
+    seed(CAL_TODOS)
+    open_app(page)
+    open_calendar(page)
+    page.get_by_test_id("tag-filter").select_option("개인")
+    expect(chips(page, "2026-10-15")).to_have_text(["운동", "장보기", "독서"])
+    expect(day(page, "2026-10-15").locator(".calendar-more")).to_have_text("+1")
+    expect(chips(page, "2026-10-05")).to_have_count(0)
+
+    page.locator("[data-filter=active]").click()
+    expect(chips(page, "2026-10-15")).to_have_text(["장보기", "독서", "청소"])
+    expect(day(page, "2026-10-15").locator(".calendar-more")).to_have_count(0)
+
+    page.locator("#search").fill("청소")
+    expect(page.get_by_test_id("calendar-chip")).to_have_text(["청소"])
+
+    page.locator("#search").fill("")
+    page.get_by_test_id("tag-filter").select_option("")
+    page.locator("[data-filter=all]").click()
+    page.get_by_test_id("favorite-filter").click()
+    expect(page.get_by_test_id("calendar-chip")).to_have_text(["★🔁 주간 보고"])
+    assert stats(page) == ("9", "1", "8", "1", "11%")                     # 필터와 상관없이 그대로
+
+
+def test_calendar_select_day_shows_full_items(page: Page, seed):
+    seed(CAL_TODOS)
+    open_app(page)
+    open_calendar(page)
+    day(page, "2026-10-15").click()
+    expect(day(page, "2026-10-15")).to_have_attribute("aria-pressed", "true")
+    expect(page.locator("#calendar-selected")).to_have_text("2026-10-15 마감 5개")
+    assert titles(page) == ["주간 보고", "운동", "장보기", "독서", "청소"]   # +N 에 숨은 항목도 목록에는 모두
+
+    row = item(page, "장보기")                                           # 목록 보기와 같은 항목 — 바로 완료 가능
+    row.locator(DONE_BOX).check()
+    expect(chips(page, "2026-10-15").nth(2)).to_have_class(re.compile(r"\bdone\b"))
+    expect(page.get_by_test_id("stat-completed")).to_have_text("2")
+
+    day(page, "2026-10-20").click()                                      # 항목이 없는 날
+    expect(page.locator(ITEM)).to_have_count(0)
+    expect(page.locator("#calendar-selected")).to_have_text("2026-10-20에 마감인 할 일이 없습니다.")
+
+    chips(page, "2026-10-05").click()                                    # 칩을 눌러도 그 날짜가 골라진다
+    assert titles(page) == ["밀린 숙제"]
+    go(page, "다음")                                                     # 다른 달로 가면 선택이 풀린다
+    expect(page.locator(ITEM)).to_have_count(0)
+    expect(page.locator(".calendar-day.selected")).to_have_count(0)
+
+
+def test_calendar_day_list_edit_moves_item(page: Page, seed):
+    seed(CAL_TODOS)
+    open_app(page)
+    open_calendar(page)
+    day(page, "2026-10-05").click()
+    item(page, "밀린 숙제").get_by_role("button", name="Edit").click()
+    page.get_by_test_id("edit-form").get_by_label("마감일").fill("2026-10-22")
+    page.get_by_test_id("edit-save").click()
+    expect(page.locator(ITEM)).to_have_count(0)                          # 그날 목록에서 빠지고
+    expect(chips(page, "2026-10-22")).to_have_text(["밀린 숙제"])          # 새 날짜 칸에 나타난다
+    expect(page.get_by_test_id("stat-overdue")).to_have_text("0")
+
+
+def test_calendar_bulk_and_undo_on_day_list(page: Page, seed):
+    seed(CAL_TODOS)
+    open_app(page)
+    pick(page, "밀린 숙제")                                              # 목록 보기에서 고른 항목은
+    open_calendar(page)
+    expect(bulk_count(page)).to_have_text("0개 선택")                      # 캘린더에서 안 보이면 선택에서 빠진다
+
+    day(page, "2026-10-15").click()
+    page.get_by_test_id("bulk-select-all").click()                       # 보이는 항목 = 그날 목록
+    expect(bulk_count(page)).to_have_text("5개 선택")
+    page.get_by_test_id("bulk-complete").click()
+    expect(page.get_by_test_id("stat-completed")).to_have_text("5")
+    expect(item(page, "주간 보고").locator(DONE_BOX)).to_be_checked()
+    expect(chips(page, "2026-10-22")).to_have_text(["★🔁 주간 보고"])     # 반복 → 다음 일정이 다음 주 칸에
+
+    delete_item(page, "청소")                                            # 삭제 → 실행 취소도 그날 목록에서
+    expect(page.locator(ITEM)).to_have_count(4)
+    page.get_by_test_id("undo-button").click()
+    expect(page.locator(ITEM)).to_have_count(5)
+    expect(day(page, "2026-10-15").locator(".calendar-more")).to_have_text("+2")
