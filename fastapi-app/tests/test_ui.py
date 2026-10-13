@@ -287,4 +287,4 @@ def test_b21_overdue_style(page: Page, seed):
 
 def test_b22_version(page: Page, seed):
     open_app(page)
-    expect(page.get_by_text("Version 4.0.0")).to_be_visible()
+    expect(page.get_by_text("Version 5.0.0")).to_be_visible()
