@@ -210,3 +210,45 @@ def test_index_served():
     res = client.get("/")
     assert res.status_code == 200
     assert "Version 5.0.0" in res.text
+
+
+# ---------- 5.0.0 1단계: 즐겨찾기 ----------
+
+def test_favorite_defaults_to_false():
+    assert create().json()["favorite"] is False
+    assert load_todos()[0].favorite is False
+
+
+def test_favorite_set_on_create():
+    assert create(favorite=True).json()["favorite"] is True
+
+
+def test_favorite_toggle_with_put():
+    created = create(title="별표", priority="높음", tags=["a"], completed=True).json()
+    on = put(created["id"], title="별표", priority="높음", tags=["a"], completed=True, favorite=True).json()
+    assert on["favorite"] is True
+    assert client.get("/todos").json()[0]["favorite"] is True
+    # 즐겨찾기만 바꿔도 다른 필드·시각은 그대로다
+    assert (on["priority"], on["tags"], on["created_at"], on["completed_at"]) == \
+        ("높음", ["a"], created["created_at"], created["completed_at"])
+    off = put(created["id"], title="별표", favorite=False).json()
+    assert off["favorite"] is False
+
+
+@pytest.mark.parametrize("value", ["yes", "true", 1, None])
+def test_favorite_must_be_boolean(value):
+    assert create(favorite=value).status_code == 422
+    todo_id = create().json()["id"]
+    assert put(todo_id, favorite=value).status_code == 422
+
+
+def test_v4_data_without_favorite(isolated_file):
+    isolated_file.write_text(
+        '[{"id": 1, "title": "v4", "description": "", "completed": false, "priority": "보통",'
+        ' "due_date": null, "tags": ["t"], "created_at": "2026-10-01T00:00:00Z", "completed_at": null}]',
+        encoding="utf-8",
+    )
+    res = client.get("/todos")
+    assert res.status_code == 200
+    assert res.json()[0]["favorite"] is False
+    assert put(1, title="v4", tags=["t"], favorite=True).json()["created_at"].startswith("2026-10-01")

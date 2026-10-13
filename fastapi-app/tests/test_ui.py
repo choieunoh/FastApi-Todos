@@ -288,3 +288,77 @@ def test_b21_overdue_style(page: Page, seed):
 def test_b22_version(page: Page, seed):
     open_app(page)
     expect(page.get_by_text("Version 5.0.0")).to_be_visible()
+
+
+# ---------- 5.0.0 1단계: 즐겨찾기 ----------
+
+def star(page: Page, title: str):
+    return item(page, title).get_by_test_id("favorite-toggle")
+
+
+def test_favorite_toggle_persists(page: Page, seed):
+    seed([todo(1, "별표 대상")])
+    open_app(page)
+    expect(star(page, "별표 대상")).to_have_text("☆")
+    expect(star(page, "별표 대상")).to_have_attribute("aria-pressed", "false")
+
+    star(page, "별표 대상").click()
+    expect(star(page, "별표 대상")).to_have_text("★")
+    expect(star(page, "별표 대상")).to_have_attribute("aria-pressed", "true")
+    page.reload()
+    expect(star(page, "별표 대상")).to_have_text("★")
+
+    star(page, "별표 대상").click()
+    expect(star(page, "별표 대상")).to_have_text("☆")
+    page.reload()
+    expect(star(page, "별표 대상")).to_have_text("☆")
+
+
+def test_favorite_filter_and_combination(page: Page, seed):
+    seed([
+        todo(1, "보고서 초안", tags=["학교"], favorite=True),
+        todo(2, "보고서 제출", tags=["학교"], favorite=True, completed=True),
+        todo(3, "보고서 정리", tags=["학교"]),
+        todo(4, "발표", tags=["학교"], favorite=True),
+        todo(5, "보고서 회의", tags=["회사"], favorite=True),
+    ])
+    open_app(page)
+    favorite_filter = page.get_by_test_id("favorite-filter")
+
+    favorite_filter.click()
+    expect(favorite_filter).to_have_attribute("aria-pressed", "true")
+    expect(favorite_filter).to_have_class("active")
+    assert titles(page) == ["보고서 초안", "보고서 제출", "발표", "보고서 회의"]
+
+    # 검색 + 상태 + 태그 + 즐겨찾기 AND
+    page.get_by_test_id("tag-filter").select_option("학교")
+    page.locator("#search").fill("보고서")
+    page.locator("[data-filter=active]").click()
+    assert titles(page) == ["보고서 초안"]
+    expect(page.locator("[data-filter].active")).to_have_count(1)  # 상태 필터 선택은 하나뿐
+
+    favorite_filter.click()                              # 끄면 나머지 필터만 남는다
+    expect(favorite_filter).to_have_attribute("aria-pressed", "false")
+    assert titles(page) == ["보고서 초안", "보고서 정리"]
+
+
+def test_favorite_filter_keeps_stats(page: Page, seed):
+    seed([todo(1, "A", favorite=True), todo(2, "B", completed=True), todo(3, "C")])
+    open_app(page)
+    page.get_by_test_id("favorite-filter").click()
+    expect(page.locator(ITEM)).to_have_count(1)
+    assert stats(page) == ("3", "1", "2", "0", "33%")
+
+
+def test_favorite_kept_after_edit_and_toggle(page: Page, seed):
+    seed([todo(1, "유지 확인", favorite=True)])
+    open_app(page)
+    item(page, "유지 확인").get_by_role("button", name="Edit").click()
+    page.get_by_test_id("edit-form").get_by_label("제목").fill("수정 후")
+    page.get_by_test_id("edit-save").click()
+    expect(star(page, "수정 후")).to_have_text("★")
+
+    item(page, "수정 후").locator("input[type=checkbox]").check()
+    expect(page.get_by_test_id("stat-completed")).to_have_text("1")
+    page.reload()
+    expect(star(page, "수정 후")).to_have_text("★")
