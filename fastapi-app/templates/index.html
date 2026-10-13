@@ -88,6 +88,16 @@
         .dday.overdue { color: #b00020; }
 
         .edit-form { flex: 1; margin: 0; }
+
+        .favorite {
+          padding: 0 .2rem;
+          font-size: 1.2rem;
+          line-height: 1;
+          color: #c9a400;
+          background: none;
+          border: none;
+          cursor: pointer;
+        }
      </style>
 </head>
 <body>
@@ -140,6 +150,7 @@
         <button type="button" data-filter="all">전체</button>
         <button type="button" data-filter="active">진행 중</button>
         <button type="button" data-filter="completed">완료</button>
+        <button type="button" id="favorite-filter" data-testid="favorite-filter" aria-pressed="false">★ 즐겨찾기만</button>
       </div>
       <div class="sort-controls">
         <label for="sort">정렬:</label>
@@ -161,6 +172,7 @@
         const listEl = $("todo-list"), errorEl = $("error");
         const searchEl = $("search"), sortEl = $("sort"), tagFilterEl = $("tag-filter");
         const filterButtons = document.querySelectorAll("[data-filter]");
+        const favoriteFilterEl = $("favorite-filter");
 
         // 우선순위는 여기 한 곳에서만 정의한다
         const PRIORITIES = ["높음", "보통", "낮음"];
@@ -168,10 +180,11 @@
         const PRIORITY_ORDER = Object.fromEntries(PRIORITIES.map((p, i) => [p, i]));
 
         // PUT 은 전체 교체이므로 클라이언트가 정하는 필드는 여기 한 곳에서만 나열한다
-        const TODO_FIELDS = ["title", "description", "completed", "priority", "due_date", "tags"];
+        const TODO_FIELDS = ["title", "description", "completed", "priority", "due_date", "tags", "favorite"];
 
         let allTodos = [];
         let currentFilter = "all";
+        let favoriteOnly = false;                // 즐겨찾기만 보기 (다른 필터와 AND)
         let editingId = null;                    // 수정 폼이 열린 항목 (한 번에 하나)
 
         // 모든 요청을 한 곳에서 처리하고, 실패는 조용히 넘기지 않는다
@@ -268,7 +281,9 @@
 
             const matchesTag = !tag || todo.tags.includes(tag);
 
-            return matchesSearch && matchesFilter && matchesTag;
+            const matchesFavorite = !favoriteOnly || todo.favorite;
+
+            return matchesSearch && matchesFilter && matchesTag && matchesFavorite;
           });
 
           // 정렬
@@ -292,6 +307,8 @@
             btn.classList.toggle("active", active);
             btn.setAttribute("aria-pressed", active);
           });
+          favoriteFilterEl.classList.toggle("active", favoriteOnly);
+          favoriteFilterEl.setAttribute("aria-pressed", favoriteOnly);
 
           const today = todayStr();
           renderStats(today);
@@ -319,6 +336,10 @@
             applyFilters();
           });
         });
+        favoriteFilterEl.addEventListener("click", () => {
+          favoriteOnly = !favoriteOnly;
+          applyFilters();
+        });
 
         const save = (todo, overrides) => run("수정", async () => {
           await api(`/todos/${todo.id}`, "PUT", toPayload(todo, overrides));
@@ -336,6 +357,12 @@
             checked: todo.completed,
             onchange: () => save(todo, { completed: check.checked }),
           });
+
+          const star = button(todo.favorite ? "★" : "☆", () => save(todo, { favorite: !todo.favorite }));
+          star.className = "favorite";
+          star.dataset.testid = "favorite-toggle";
+          star.setAttribute("aria-label", todo.favorite ? "즐겨찾기 해제" : "즐겨찾기 등록");
+          star.setAttribute("aria-pressed", todo.favorite);
 
           const overdue = isOverdue(todo, today);
           const text = el("span", {
@@ -369,7 +396,7 @@
 
           const li = el("li");
           li.dataset.testid = "todo-item";
-          li.append(check, content, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
+          li.append(check, star, content, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
           return li;
         }
 

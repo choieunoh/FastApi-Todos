@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, StringConstraints, field_validator
+from pydantic import BaseModel, StrictBool, StringConstraints, field_validator
 
 BASE_DIR = Path(__file__).resolve().parent       # main.py 가 있는 폴더
 TODO_FILE = Path(os.environ.get("TODO_FILE", BASE_DIR / "todo.json"))  # 테스트에서 바꿔 쓸 수 있다
@@ -28,6 +28,7 @@ class TodoIn(BaseModel):                         # 클라이언트가 보내는 
     priority: Priority = "보통"
     due_date: date | None = None
     tags: list[str] = []
+    favorite: StrictBool = False                 # 즐겨찾기 — "yes" 같은 문자열은 받지 않는다
 
     @field_validator("due_date", mode="before")
     @classmethod
