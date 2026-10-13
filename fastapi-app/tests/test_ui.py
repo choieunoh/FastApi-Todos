@@ -973,7 +973,9 @@ def test_load_template_fills_add_form_then_add_creates_subtasks(page: Page, seed
     expect(row).to_contain_text("우선순위: 높음")
     expand(page, "주간 보고서 (10월 3주)")
     expect(subtasks_of(page, "주간 보고서 (10월 3주)").locator("span")).to_have_text(["자료 수집", "초안, 검토"])
-    assert add_form_values(page)[0] == "" and add_form_values(page)[6] == ""   # 추가 후 폼이 비워진다
+    values = add_form_values(page)
+    assert values[0] == ""
+    assert values[6] == ""
     expect(template_names(page)).to_have_text(["템플릿 선택", "주간 보고"])   # 템플릿은 그대로
 
 
@@ -1108,7 +1110,8 @@ def test_template_flows_never_prompt(page: Page, seed):
     page.get_by_test_id("template-edit").click()
     page.get_by_test_id("template-edit-form").get_by_role("button", name="저장").click()
     expect(page.get_by_test_id("template-edit-form")).to_have_count(0)
-    assert "prompt" not in dialogs and dialogs == []
+    assert "prompt" not in dialogs
+    assert dialogs == []
 
 
 # ---------- 5.0.0 7단계: 내보내기 ----------
