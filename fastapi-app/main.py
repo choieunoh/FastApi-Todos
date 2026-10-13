@@ -1,3 +1,4 @@
+import calendar
 import json
 import os
 from datetime import date, datetime, timedelta, timezone
@@ -6,7 +7,7 @@ from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, StrictBool, StringConstraints, field_validator
+from pydantic import BaseModel, Field, StrictBool, StringConstraints, field_validator, model_validator
 
 BASE_DIR = Path(__file__).resolve().parent       # main.py 가 있는 폴더
 TODO_FILE = Path(os.environ.get("TODO_FILE", BASE_DIR / "todo.json"))  # 테스트에서 바꿔 쓸 수 있다
@@ -18,6 +19,7 @@ if not TODO_FILE.exists():                       # 없으면 빈 목록으로 �
 app = FastAPI(title="To-Do List API")
 
 Priority = Literal["높음", "보통", "낮음"]
+Recurrence = Literal["none", "daily", "weekly", "monthly"]
 Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]  # 할 일·하위 할 일 공용
 MAX_TAGS, MAX_TAG_LEN = 10, 20
 UNDO_TTL = timedelta(seconds=30)                 # 삭제 후 복구할 수 있는 시간
@@ -34,6 +36,7 @@ class TodoIn(BaseModel):                         # 클라이언트가 보내는 
     due_date: date | None = None
     tags: list[str] = []
     favorite: StrictBool = False                 # 즐겨찾기 — "yes" 같은 문자열은 받지 않는다
+    recurrence: Recurrence = "none"              # 반복 주기 — 반복하려면 마감일이 있어야 한다
 
     @field_validator("due_date", mode="before")
     @classmethod
@@ -60,6 +63,12 @@ class TodoIn(BaseModel):                         # 클라이언트가 보내는 
             raise ValueError(f"태그는 최대 {MAX_TAGS}개입니다")
         return result
 
+    @model_validator(mode="after")
+    def recurrence_needs_due_date(self) -> "TodoIn":
+        if self.recurrence != "none" and self.due_date is None:
+            raise ValueError("반복 일정에는 마감일이 필요합니다")
+        return self
+
 
 class Subtask(BaseModel):                        # 하위 할 일 — id 는 그 할 일 안에서만 고유하다
     id: int
@@ -81,6 +90,7 @@ class TodoItem(TodoIn):                          # 서버가 돌려주는 데이
     created_at: datetime | None = None
     completed_at: datetime | None = None
     subtasks: list[Subtask] = []                 # 서버가 관리 — POST/PUT 본문의 값은 받지 않는다
+    next_spawned: bool = False                   # 서버가 관리 — 다음 반복 일정을 이미 만들었는지
 
 
 class RestoreIn(BaseModel):                      # 삭제 실행 취소 요청
@@ -131,13 +141,54 @@ def next_id(todos: list[TodoItem]) -> int:
     return max([t.id for t in todos] + list(RECENTLY_DELETED), default=0) + 1
 
 
-def apply_completion(old: TodoItem | None, new: TodoItem) -> TodoItem:
-    # 완료 상태가 바뀔 때만 completed_at 을 정한다 (POST·PUT·bulk 공용, old 가 없으면 새로 만드는 경우)
+def add_months(d: date, months: int) -> date:
+    # 없는 날짜는 그 달의 마지막 날로 당긴다 (1/31 + 1개월 → 2/28, 윤년이면 2/29)
+    year, month = divmod(d.month - 1 + months, 12)
+    year, month = d.year + year, month + 1
+    return d.replace(year=year, month=month, day=min(d.day, calendar.monthrange(year, month)[1]))
+
+
+def next_due_date(due: date, recurrence: Recurrence) -> date:
+    # 직전 마감일 기준으로 한 주기 뒤 (이미 지난 날짜여도 건너뛰지 않는다)
+    if recurrence == "daily":
+        return due + timedelta(days=1)
+    if recurrence == "weekly":
+        return due + timedelta(days=7)
+    return add_months(due, 1)
+
+
+def next_occurrence(todo: TodoItem, new_id: int) -> TodoItem:
+    # 다음 반복 일정 — 내용은 복사하고 완료·시각·하위 완료 상태는 새로 시작한다
+    return TodoItem(
+        id=new_id,
+        title=todo.title,
+        description=todo.description,
+        priority=todo.priority,
+        due_date=next_due_date(todo.due_date, todo.recurrence),
+        tags=todo.tags,
+        favorite=todo.favorite,
+        recurrence=todo.recurrence,
+        created_at=now(),
+        subtasks=[Subtask(id=i, title=s.title) for i, s in enumerate(todo.subtasks, start=1)],
+    )
+
+
+def apply_completion(
+    todos: list[TodoItem], old: TodoItem | None, new: TodoItem,
+) -> tuple[TodoItem, TodoItem | None]:
+    # 완료 상태 전이 처리 (POST·PUT·bulk 공용, old 가 없으면 새로 만드는 경우)
+    # - 완료 상태가 바뀔 때만 completed_at 을 정한다
+    # - 반복 항목이 완료로 바뀌면 다음 일정을 한 번만 만든다 (돌려받은 쪽이 목록에 넣는다)
+    became_completed = new.completed and (old is None or not old.completed)
     if old is not None and old.completed == new.completed:
         completed_at = old.completed_at
     else:
         completed_at = now() if new.completed else None
-    return new.model_copy(update={"completed_at": completed_at})
+    todo = new.model_copy(update={"completed_at": completed_at})
+    if not (became_completed and todo.recurrence != "none" and not todo.next_spawned):
+        return todo, None
+    todo = todo.model_copy(update={"next_spawned": True})
+    return todo, next_occurrence(todo, next_id(todos + [todo]))
 
 
 def remember_deleted(todo: TodoItem, position: int) -> None:
@@ -185,8 +236,8 @@ def get_todos() -> list[TodoItem]:
 @app.post("/todos", status_code=201)             # 추가 — id·시각은 서버가 매긴다
 def create_todo(payload: TodoIn) -> TodoItem:
     todos = load_todos()
-    todo = apply_completion(None, TodoItem(id=next_id(todos), created_at=now(), **payload.model_dump()))
-    save_todos(todos + [todo])
+    todo, spawned = apply_completion(todos, None, TodoItem(id=next_id(todos), created_at=now(), **payload.model_dump()))
+    save_todos(todos + [todo] + ([spawned] if spawned else []))
     return todo
 
 
@@ -227,7 +278,10 @@ def bulk_todos(payload: BulkIn) -> BulkOut:
     completed = payload.action == "complete"
     for todo_id in payload.ids:
         old = todos[positions[todo_id]]
-        todos[positions[todo_id]] = apply_completion(old, old.model_copy(update={"completed": completed}))
+        todo, spawned = apply_completion(todos, old, old.model_copy(update={"completed": completed}))
+        todos[positions[todo_id]] = todo
+        if spawned:                              # 다음 반복 일정은 목록 끝에 붙인다 (기존 자리는 그대로)
+            todos.append(spawned)
     save_todos(todos)
     return BulkOut(updated=[todos[positions[i]] for i in payload.ids], deleted=[])
 
@@ -237,10 +291,11 @@ def update_todo(todo_id: int, payload: TodoIn) -> TodoItem:
     todos = load_todos()
     index = find_index(todos, todo_id)
     old = todos[index]
-    todo = apply_completion(old, TodoItem(
-        id=todo_id, created_at=old.created_at, subtasks=old.subtasks, **payload.model_dump()))
+    todo, spawned = apply_completion(todos, old, TodoItem(
+        id=todo_id, created_at=old.created_at, subtasks=old.subtasks, next_spawned=old.next_spawned,
+        **payload.model_dump()))
     todos[index] = todo
-    save_todos(todos)
+    save_todos(todos + ([spawned] if spawned else []))
     return todo
 
 

@@ -85,6 +85,7 @@
         .meta { display: flex; flex-wrap: wrap; gap: .6rem; font-size: .8rem; color: #777; }
         .meta:empty { display: none; }
         .dday { font-weight: bold; color: #2a4a8a; }
+        .recurrence { font-weight: bold; color: #6a4c93; }
         .dday.overdue { color: #b00020; }
 
         .edit-form { flex: 1; margin: 0; }
@@ -172,6 +173,8 @@
         aria-label="마감일"
       >
 
+      <select id="recurrence" aria-label="반복"></select>
+
       <input
         type="text"
         id="tags"
@@ -235,10 +238,14 @@
         // 우선순위는 여기 한 곳에서만 정의한다
         const PRIORITIES = ["높음", "보통", "낮음"];
         const DEFAULT_PRIORITY = "보통";
+
+        // 반복 주기와 표시 이름도 여기 한 곳에서만 정의한다 (서버 Recurrence 와 같은 값)
+        const RECURRENCES = { none: "반복 없음", daily: "매일", weekly: "매주", monthly: "매월" };
+        const DEFAULT_RECURRENCE = "none";
         const PRIORITY_ORDER = Object.fromEntries(PRIORITIES.map((p, i) => [p, i]));
 
         // PUT 은 전체 교체이므로 클라이언트가 정하는 필드는 여기 한 곳에서만 나열한다
-        const TODO_FIELDS = ["title", "description", "completed", "priority", "due_date", "tags", "favorite"];
+        const TODO_FIELDS = ["title", "description", "completed", "priority", "due_date", "tags", "favorite", "recurrence"];
 
         let allTodos = [];
         let currentFilter = "all";
@@ -283,10 +290,14 @@
           return el("button", { type: "button", textContent: label, onclick });
         }
 
-        function priorityOptions(select, selected) {
-          select.replaceChildren(...PRIORITIES.map((p) =>
-            el("option", { value: p, textContent: p, defaultSelected: p === selected, selected: p === selected })));
+        // [값, 표시 이름] 목록으로 select 를 채운다 (form.reset() 이 기본값으로 돌아가도록 defaultSelected 도 둔다)
+        function fillOptions(select, entries, selected) {
+          select.replaceChildren(...entries.map(([value, label]) =>
+            el("option", { value, textContent: label, defaultSelected: value === selected, selected: value === selected })));
         }
+
+        const priorityOptions = (select, selected) => fillOptions(select, PRIORITIES.map((p) => [p, p]), selected);
+        const recurrenceOptions = (select, selected) => fillOptions(select, Object.entries(RECURRENCES), selected);
 
         // 날짜는 모두 브라우저 로컬 기준 YYYY-MM-DD 로 다룬다
         function ymd(d) {
@@ -481,6 +492,11 @@
           }));
 
           const meta = el("div", { className: "meta" });
+          if (todo.recurrence && todo.recurrence !== DEFAULT_RECURRENCE) {
+            const badge = el("span", { className: "recurrence", textContent: `🔁 ${RECURRENCES[todo.recurrence]}` });
+            badge.dataset.testid = "recurrence-badge";
+            meta.append(badge);
+          }
           if (todo.due_date && !todo.completed) {
             const dday = el("span", { className: overdue ? "dday overdue" : "dday", textContent: ddayLabel(todo.due_date, today) });
             dday.dataset.testid = "dday";
@@ -605,11 +621,14 @@
           const priority = el("select");
           priorityOptions(priority, todo.priority || DEFAULT_PRIORITY);
           const dueDate = el("input", { type: "date", value: todo.due_date || "" });
+          const recurrence = el("select");
+          recurrenceOptions(recurrence, todo.recurrence || DEFAULT_RECURRENCE);
           const tags = el("input", { type: "text", value: todo.tags.join(", "), placeholder: "태그 (쉼표로 구분)" });
           title.setAttribute("aria-label", "제목");
           description.setAttribute("aria-label", "설명");
           priority.setAttribute("aria-label", "우선순위");
           dueDate.setAttribute("aria-label", "마감일");
+          recurrence.setAttribute("aria-label", "반복");
           tags.setAttribute("aria-label", "태그");
 
           const saveBtn = el("button", { type: "submit", textContent: "저장" });
@@ -619,7 +638,7 @@
 
           const form = el("form", { className: "edit-form" });
           form.dataset.testid = "edit-form";
-          form.append(title, description, priority, dueDate, tags, saveBtn, cancelBtn);
+          form.append(title, description, priority, dueDate, recurrence, tags, saveBtn, cancelBtn);
           form.onsubmit = (event) => {
             event.preventDefault();
             run("수정", async () => {
@@ -628,6 +647,7 @@
                 description: description.value.trim(),
                 priority: priority.value,
                 due_date: dueDate.value,
+                recurrence: recurrence.value,
                 tags: parseTags(tags.value),
               }));
               editingId = null;
@@ -705,6 +725,7 @@
         };
 
         priorityOptions($("priority"), DEFAULT_PRIORITY);
+        recurrenceOptions($("recurrence"), DEFAULT_RECURRENCE);
 
         $("todo-form").onsubmit = (event) => {
           event.preventDefault();
@@ -715,6 +736,7 @@
               description: $("description").value.trim(),
               priority: $("priority").value,
               due_date: $("due-date").value,
+              recurrence: $("recurrence").value,
               tags: parseTags($("tags").value),
             });
 
