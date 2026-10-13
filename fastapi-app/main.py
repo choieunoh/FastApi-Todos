@@ -20,7 +20,8 @@ app = FastAPI(title="To-Do List API")
 Priority = Literal["높음", "보통", "낮음"]
 MAX_TAGS, MAX_TAG_LEN = 10, 20
 UNDO_TTL = timedelta(seconds=30)                 # 삭제 후 복구할 수 있는 시간
-UNDO_MAX = 50                                    # 복구 버퍼에 담아 두는 최대 건수
+BULK_MAX = 100                                   # 일괄 작업 한 번에 고를 수 있는 최대 건수
+UNDO_MAX = BULK_MAX                              # 복구 버퍼·복구 요청 최대 건수 — 일괄 삭제 한 번을 모두 되돌릴 수 있게
 
 
 class TodoIn(BaseModel):                         # 클라이언트가 보내는 데이터 — 시각 필드는 받지 않는다
@@ -68,6 +69,21 @@ class RestoreIn(BaseModel):                      # 삭제 실행 취소 요청
     ids: list[int] = Field(min_length=1, max_length=UNDO_MAX)
 
 
+class BulkIn(BaseModel):                         # 일괄 작업 요청
+    ids: list[int] = Field(min_length=1, max_length=BULK_MAX)
+    action: Literal["complete", "uncomplete", "delete"]
+
+    @field_validator("ids")
+    @classmethod
+    def unique_ids(cls, ids: list[int]) -> list[int]:
+        return list(dict.fromkeys(ids))          # 중복 제거, 순서 유지
+
+
+class BulkOut(BaseModel):                        # 일괄 작업 결과
+    updated: list[TodoItem]
+    deleted: list[int]
+
+
 class DeletedEntry(BaseModel):                   # 복구 버퍼 항목 — 원래 자리와 삭제 시각을 함께 둔다
     todo: TodoItem
     position: int
@@ -95,6 +111,22 @@ def next_id(todos: list[TodoItem]) -> int:
     # 복구 대기 중인 id 도 피해서 매긴다 (복구할 때 id 가 겹치지 않게)
     prune_deleted()
     return max([t.id for t in todos] + list(RECENTLY_DELETED), default=0) + 1
+
+
+def apply_completion(old: TodoItem | None, new: TodoItem) -> TodoItem:
+    # 완료 상태가 바뀔 때만 completed_at 을 정한다 (POST·PUT·bulk 공용, old 가 없으면 새로 만드는 경우)
+    if old is not None and old.completed == new.completed:
+        completed_at = old.completed_at
+    else:
+        completed_at = now() if new.completed else None
+    return new.model_copy(update={"completed_at": completed_at})
+
+
+def remember_deleted(todo: TodoItem, position: int) -> None:
+    # 지운 항목을 잠시 복구 버퍼에 남긴다 (단건·일괄 삭제 공용)
+    RECENTLY_DELETED.pop(todo.id, None)
+    RECENTLY_DELETED[todo.id] = DeletedEntry(todo=todo, position=position, deleted_at=now())
+    prune_deleted()
 
 
 def load_todos() -> list[TodoItem]:
@@ -128,13 +160,7 @@ def get_todos() -> list[TodoItem]:
 @app.post("/todos", status_code=201)             # 추가 — id·시각은 서버가 매긴다
 def create_todo(payload: TodoIn) -> TodoItem:
     todos = load_todos()
-    created = now()
-    todo = TodoItem(
-        id=next_id(todos),
-        created_at=created,
-        completed_at=created if payload.completed else None,
-        **payload.model_dump(),
-    )
+    todo = apply_completion(None, TodoItem(id=next_id(todos), created_at=now(), **payload.model_dump()))
     save_todos(todos + [todo])
     return todo
 
@@ -155,21 +181,38 @@ def restore_todos(payload: RestoreIn) -> list[TodoItem]:
     return [todos[find_index(todos, i)] for i in ids]
 
 
+@app.post("/todos/bulk", responses={404: {"description": "없는 항목이 있음"}})  # 일괄 완료·미완료·삭제
+def bulk_todos(payload: BulkIn) -> BulkOut:
+    todos = load_todos()
+    positions = {t.id: i for i, t in enumerate(todos)}
+    missing = [i for i in payload.ids if i not in positions]
+    if missing:                                  # 하나라도 없으면 아무것도 바꾸지 않는다
+        raise HTTPException(404, f"없는 항목입니다: {missing}")
+
+    if payload.action == "delete":
+        removed = []
+        for todo_id in payload.ids:              # 하나씩 지우며 그때의 자리를 기억한다 (복구 순서용)
+            index = find_index(todos, todo_id)
+            removed.append((todos.pop(index), index))
+        save_todos(todos)
+        for todo, index in removed:
+            remember_deleted(todo, index)
+        return BulkOut(updated=[], deleted=payload.ids)
+
+    completed = payload.action == "complete"
+    for todo_id in payload.ids:
+        old = todos[positions[todo_id]]
+        todos[positions[todo_id]] = apply_completion(old, old.model_copy(update={"completed": completed}))
+    save_todos(todos)
+    return BulkOut(updated=[todos[positions[i]] for i in payload.ids], deleted=[])
+
+
 @app.put("/todos/{todo_id}", responses=NOT_FOUND_RESPONSE)  # 수정 — created_at 유지, 완료 상태가 바뀔 때만 completed_at 갱신
 def update_todo(todo_id: int, payload: TodoIn) -> TodoItem:
     todos = load_todos()
     index = find_index(todos, todo_id)
     old = todos[index]
-    if old.completed == payload.completed:
-        completed_at = old.completed_at
-    else:
-        completed_at = now() if payload.completed else None
-    todo = TodoItem(
-        id=todo_id,
-        created_at=old.created_at,
-        completed_at=completed_at,
-        **payload.model_dump(),
-    )
+    todo = apply_completion(old, TodoItem(id=todo_id, created_at=old.created_at, **payload.model_dump()))
     todos[index] = todo
     save_todos(todos)
     return todo
@@ -181,9 +224,7 @@ def delete_todo(todo_id: int) -> None:
     index = find_index(todos, todo_id)
     todo = todos.pop(index)
     save_todos(todos)
-    RECENTLY_DELETED.pop(todo_id, None)
-    RECENTLY_DELETED[todo_id] = DeletedEntry(todo=todo, position=index, deleted_at=now())
-    prune_deleted()
+    remember_deleted(todo, index)
 
 
 @app.get("/", include_in_schema=False)           # 화면 서빙

@@ -89,6 +89,19 @@
 
         .edit-form { flex: 1; margin: 0; }
 
+        .bulk-bar {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: .5rem;
+          padding: .4rem .6rem;
+          margin-bottom: .5rem;
+          border: 1px solid #e5e5e5;
+          border-radius: 6px;
+        }
+        .bulk-bar #bulk-count { margin-right: auto; font-size: .9rem; color: #555; }
+        li.selected { background: #f3f7ff; }
+
         .undo-toast {
           position: fixed;
           left: 50%;
@@ -188,6 +201,13 @@
         </select>
       </div>
     </div>
+    <div class="bulk-bar" data-testid="bulk-bar" aria-label="일괄 작업">
+      <span id="bulk-count" aria-live="polite">0개 선택</span>
+      <button type="button" id="bulk-select-all" data-testid="bulk-select-all">보이는 항목 전체 선택</button>
+      <button type="button" id="bulk-complete" data-testid="bulk-complete" disabled>완료</button>
+      <button type="button" id="bulk-uncomplete" data-testid="bulk-uncomplete" disabled>미완료</button>
+      <button type="button" id="bulk-delete" data-testid="bulk-delete" disabled>삭제</button>
+    </div>
     <p id="error" role="alert" hidden></p>
     <ul id="todo-list"></ul>
     <div id="undo-toast" class="undo-toast" data-testid="undo-toast" role="status" hidden>
@@ -216,6 +236,9 @@
         const UNDO_MS = 5000;                    // 실행 취소 토스트를 보여주는 시간 (서버 보관은 30초)
         let undoIds = [];                        // 마지막 삭제에서 지운 id들
         let undoTimer = null;
+
+        const selectedIds = new Set();           // 일괄 작업 대상 (지금 보이는 항목만 남긴다)
+        let visibleIds = [];
         let editingId = null;                    // 수정 폼이 열린 항목 (한 번에 하나)
 
         // 모든 요청을 한 곳에서 처리하고, 실패는 조용히 넘기지 않는다
@@ -341,9 +364,23 @@
           favoriteFilterEl.classList.toggle("active", favoriteOnly);
           favoriteFilterEl.setAttribute("aria-pressed", favoriteOnly);
 
+          // 필터로 가려진 항목은 선택에서 뺀다
+          visibleIds = filtered.map((todo) => todo.id);
+          for (const id of [...selectedIds]) if (!visibleIds.includes(id)) selectedIds.delete(id);
+
           const today = todayStr();
           renderStats(today);
           render(filtered, today);
+          renderBulkBar();
+        }
+
+        function renderBulkBar() {
+          const count = selectedIds.size;
+          const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
+          $("bulk-count").textContent = `${count}개 선택`;
+          $("bulk-select-all").textContent = allSelected ? "선택 해제" : "보이는 항목 전체 선택";
+          $("bulk-select-all").disabled = visibleIds.length === 0;
+          for (const id of ["bulk-complete", "bulk-uncomplete", "bulk-delete"]) $(id).disabled = count === 0;
         }
 
         // 통계는 필터와 상관없이 전체 목록 기준
@@ -383,11 +420,26 @@
         }
 
         function renderItem(todo, today) {
+          const li = el("li", { className: selectedIds.has(todo.id) ? "selected" : "" });
+
+          const pick = el("input", {
+            type: "checkbox",
+            checked: selectedIds.has(todo.id),
+            onchange: () => {
+              if (pick.checked) selectedIds.add(todo.id); else selectedIds.delete(todo.id);
+              li.classList.toggle("selected", pick.checked);
+              renderBulkBar();
+            },
+          });
+          pick.dataset.testid = "bulk-select";
+          pick.setAttribute("aria-label", `${todo.title} 선택`);
+
           const check = el("input", {
             type: "checkbox",
             checked: todo.completed,
             onchange: () => save(todo, { completed: check.checked }),
           });
+          check.setAttribute("aria-label", `${todo.title} 완료`);
 
           const star = button(todo.favorite ? "★" : "☆", () => save(todo, { favorite: !todo.favorite }));
           star.className = "favorite";
@@ -425,9 +477,8 @@
           const content = el("div", { className: "content" });
           content.append(text, tags, meta);
 
-          const li = el("li");
           li.dataset.testid = "todo-item";
-          li.append(check, star, content, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
+          li.append(pick, check, star, content, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
           return li;
         }
 
@@ -488,6 +539,30 @@
             await load();
           });
         }
+
+        // 일괄 작업 — 삭제는 단건과 같이 confirm 후 실행 취소 토스트를 띄운다
+        const BULK_LABELS = { complete: "일괄 완료", uncomplete: "일괄 미완료", delete: "일괄 삭제" };
+
+        function bulk(action) {
+          const ids = [...selectedIds];
+          if (!ids.length) return;
+          if (action === "delete" && !confirm(`선택한 ${ids.length}개를 삭제할까요?`)) return;
+          run(BULK_LABELS[action], async () => {
+            const result = await api("/todos/bulk", "POST", { ids, action });
+            selectedIds.clear();
+            if (result.deleted.length) showUndo(result.deleted);
+            await load();
+          });
+        }
+
+        $("bulk-complete").onclick = () => bulk("complete");
+        $("bulk-uncomplete").onclick = () => bulk("uncomplete");
+        $("bulk-delete").onclick = () => bulk("delete");
+        $("bulk-select-all").onclick = () => {
+          const allSelected = visibleIds.every((id) => selectedIds.has(id));
+          for (const id of visibleIds) if (allSelected) selectedIds.delete(id); else selectedIds.add(id);
+          applyFilters();
+        };
 
         // 삭제 직후 실행 취소 토스트 — 새 삭제가 일어나면 내용을 바꾸고 시간을 다시 잰다
         function showUndo(ids) {
