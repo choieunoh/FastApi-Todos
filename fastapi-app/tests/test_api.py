@@ -15,6 +15,7 @@ def isolated_file(tmp_path, monkeypatch):
     # 실제 todo.json 대신 테스트마다 새 임시 파일 사용 (본인 데이터 보호 + 테스트 간 격리)
     path = tmp_path / "todo.json"
     monkeypatch.setattr(main, "TODO_FILE", path)
+    monkeypatch.setattr(main, "TEMPLATE_FILE", tmp_path / "task_templates.json")   # 템플릿도 임시 파일
     monkeypatch.setattr(main, "RECENTLY_DELETED", {})   # 삭제 복구 버퍼도 테스트마다 비운다
     save_todos([])
     return path
@@ -818,3 +819,148 @@ def test_add_months_unit():
     assert main.add_months(date(2026, 11, 30), 1) == date(2026, 12, 30)
     assert main.add_months(date(2026, 12, 31), 1) == date(2027, 1, 31)
     assert main.add_months(date(2026, 8, 31), 1) == date(2026, 9, 30)
+
+
+# ---------- 5.0.0 6단계: 작업 템플릿 ----------
+
+def tpl(**fields) -> dict:
+    return {"name": "주간 보고", "title": "주간 보고서", **fields}
+
+
+def create_tpl(**fields):
+    return client.post("/task-templates", json=tpl(**fields))
+
+
+def put_tpl(template_id: int, **fields):
+    return client.put(f"/task-templates/{template_id}", json=tpl(**fields))
+
+
+def test_templates_empty_and_file_created_on_first_save():
+    assert not main.TEMPLATE_FILE.exists()                        # 처음엔 파일이 없어도 된다
+    assert client.get("/task-templates").json() == []
+    assert create_tpl().status_code == 201
+    assert main.TEMPLATE_FILE.exists()
+
+
+def test_create_template_with_all_fields():
+    res = create_tpl(name="  주간 보고  ", title="  주간 보고서 ", description=" 금요일까지 ", priority="높음",
+                     tags=["회사", " 보고 ", "회사"], recurrence="weekly", subtasks=[" 자료 수집 ", "초안"])
+    assert res.status_code == 201
+    assert res.json() == {"id": 1, "name": "주간 보고", "title": "주간 보고서", "description": "금요일까지",
+                          "priority": "높음", "tags": ["회사", "보고"], "recurrence": "weekly",
+                          "subtasks": ["자료 수집", "초안"]}
+    assert client.get("/task-templates").json() == [res.json()]
+
+
+def test_template_defaults():
+    assert create_tpl().json() == {"id": 1, "name": "주간 보고", "title": "주간 보고서", "description": "",
+                                   "priority": "보통", "tags": [], "recurrence": "none", "subtasks": []}
+
+
+def test_template_excludes_todo_only_fields():
+    body = create_tpl(id=99, due_date="2026-10-13", completed=True, favorite=True,
+                      created_at="2000-01-01T00:00:00Z", completed_at="2000-01-01T00:00:00Z").json()
+    assert body["id"] == 1                                        # id 는 서버가 매긴다
+    assert set(body) == {"id", "name", "title", "description", "priority", "tags", "recurrence", "subtasks"}
+
+
+def test_recurring_template_without_due_date_allowed():
+    assert create_tpl(recurrence="monthly").status_code == 201   # 마감일 검사는 할 일을 만들 때
+
+
+def test_template_ids_max_plus_one():
+    create_tpl(name="a")
+    create_tpl(name="b")
+    client.delete("/task-templates/2")
+    assert create_tpl(name="c").json()["id"] == 2
+    assert [t["id"] for t in client.get("/task-templates").json()] == [1, 2]
+
+
+@pytest.mark.parametrize("fields", [
+    {"name": ""}, {"name": "   "}, {"name": "가" * 51},
+    {"title": "   "}, {"title": "가" * 101},
+    {"description": "a" * 501},
+    {"priority": "긴급"},
+    {"recurrence": "yearly"},
+    {"tags": [""]}, {"tags": ["가" * 21]}, {"tags": ["a,b"]}, {"tags": [f"t{i}" for i in range(11)]},
+    {"subtasks": [""]}, {"subtasks": ["   "]}, {"subtasks": ["가" * 101]}, {"subtasks": [f"s{i}" for i in range(21)]},
+])
+def test_template_validation(fields):
+    assert create_tpl(**fields).status_code == 422
+    template_id = create_tpl(name="정상").json()["id"]
+    assert put_tpl(template_id, **{"name": "정상", **fields}).status_code == 422
+
+
+def test_template_name_limits_ok():
+    assert create_tpl(name="가" * 50).status_code == 201
+    assert create_tpl(name="b", subtasks=[f"s{i}" for i in range(20)]).status_code == 201
+
+
+@pytest.mark.parametrize("missing", ["name", "title"])
+def test_template_required_fields(missing):
+    body = tpl()
+    del body[missing]
+    assert client.post("/task-templates", json=body).status_code == 422
+
+
+def test_template_name_conflict_409():
+    create_tpl(name="Weekly")
+    res = create_tpl(name="  weekly ")                            # 대소문자·공백 무시
+    assert res.status_code == 409
+    assert len(client.get("/task-templates").json()) == 1
+    other = create_tpl(name="Daily").json()["id"]
+    assert put_tpl(other, name="WEEKLY").status_code == 409
+    assert put_tpl(other, name="daily", title="이름 대소문자만 바꿈").status_code == 200   # 자기 이름은 괜찮다
+
+
+def test_update_template_replaces_all_fields():
+    template_id = create_tpl(tags=["a"], subtasks=["x"], recurrence="daily", priority="높음").json()["id"]
+    res = put_tpl(template_id, name="새 이름", title="새 제목", subtasks=["y", "z"])
+    assert res.status_code == 200
+    assert res.json() == {"id": template_id, "name": "새 이름", "title": "새 제목", "description": "",
+                          "priority": "보통", "tags": [], "recurrence": "none", "subtasks": ["y", "z"]}
+    assert client.get("/task-templates").json() == [res.json()]
+
+
+def test_template_not_found():
+    assert put_tpl(9).status_code == 404
+    assert client.delete("/task-templates/9").status_code == 404
+
+
+def test_delete_template():
+    a = create_tpl(name="a").json()["id"]
+    b = create_tpl(name="b").json()["id"]
+    res = client.delete(f"/task-templates/{a}")
+    assert res.status_code == 204
+    assert res.content == b""
+    assert [t["id"] for t in client.get("/task-templates").json()] == [b]
+    assert client.delete(f"/task-templates/{a}").status_code == 404
+
+
+def test_templates_and_todos_are_separate(isolated_file):
+    create(title="할 일")
+    before = isolated_file.read_bytes()
+    template_id = create_tpl().json()["id"]
+    put_tpl(template_id, name="바꿈")
+    client.delete(f"/task-templates/{template_id}")
+    assert isolated_file.read_bytes() == before                    # 템플릿 작업은 todo.json 을 건드리지 않는다
+
+
+def test_todo_from_template_flow_avoids_id_conflicts():
+    # 화면과 같은 흐름: 템플릿 값으로 POST /todos → 하위 할 일 POST
+    template = create_tpl(title="회의록", priority="높음", tags=["회사"], recurrence="weekly",
+                          subtasks=["안건", "정리"]).json()
+    create(title="기존")
+    deleted = create(title="지운 항목").json()["id"]
+    delete(deleted)                                               # 최대 id 가 복구 대기 중
+    fields = {k: template[k] for k in ("title", "description", "priority", "tags", "recurrence")}
+    assert create(**fields).status_code == 422                    # 반복 템플릿은 마감일이 있어야 만들 수 있다
+    todo = create(**fields, due_date="2026-10-13").json()
+    assert todo["id"] == deleted + 1
+    for title in template["subtasks"]:
+        add_sub(todo["id"], title)
+    saved = todos_now()[-1]
+    assert (saved["title"], saved["priority"], saved["tags"], saved["recurrence"]) == ("회의록", "높음", ["회사"], "weekly")
+    assert saved["subtasks"] == [{"id": 1, "title": "안건", "completed": False},
+                                 {"id": 2, "title": "정리", "completed": False}]
+    assert restore(deleted).status_code == 200

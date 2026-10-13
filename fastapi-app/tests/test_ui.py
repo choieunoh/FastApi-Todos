@@ -884,3 +884,228 @@ def test_recurrence_kept_through_delete_undo(page: Page, seed):
     expect(page.locator(ITEM)).to_have_count(0)
     page.get_by_test_id("undo-button").click()
     expect(badge(item(page, "매일 운동"))).to_have_text("🔁 매일")
+
+
+# ---------- 5.0.0 6단계: 작업 템플릿 ----------
+
+def template(id: int, name: str, title: str, **fields) -> dict:
+    return {"id": id, "name": name, "title": title, "description": "", "priority": "보통",
+            "tags": [], "recurrence": "none", "subtasks": [], **fields}
+
+
+WEEKLY = template(1, "주간 보고", "주간 보고서", description="금요일까지", priority="높음",
+                  tags=["회사", "보고"], recurrence="weekly", subtasks=["자료 수집", "초안, 검토"])
+
+
+def panel(page: Page):
+    return page.get_by_test_id("template-panel")
+
+
+def choose_template(page: Page, name: str) -> None:
+    page.get_by_test_id("template-select").select_option(label=name)
+
+
+def template_names(page: Page):
+    return page.get_by_test_id("template-select").locator("option")
+
+
+def add_form_values(page: Page) -> tuple[str, ...]:
+    return tuple(page.locator(f"#{i}").input_value()
+                 for i in ("title", "description", "priority", "due-date", "recurrence", "tags", "subtasks"))
+
+
+def test_template_buttons_disabled_without_selection(page: Page, seed):
+    seed.templates([WEEKLY])
+    open_app(page)
+    expect(template_names(page)).to_have_text(["템플릿 선택", "주간 보고"])
+    for name in ("load", "edit", "delete"):
+        expect(page.get_by_test_id(f"template-{name}")).to_be_disabled()
+    choose_template(page, "주간 보고")
+    for name in ("load", "edit", "delete"):
+        expect(page.get_by_test_id(f"template-{name}")).to_be_enabled()
+
+
+def test_save_current_form_as_template(page: Page, seed):
+    open_app(page)
+    page.locator("#title").fill("회의록 작성")
+    page.locator("#description").fill("회의 직후")
+    page.locator("#priority").select_option("낮음")
+    page.locator("#due-date").fill("2026-10-20")                          # 마감일은 템플릿에 들어가지 않는다
+    page.locator("#recurrence").select_option("monthly")
+    page.locator("#tags").fill("회사, 회의")
+    page.locator("#subtasks").fill("참석자 정리\n\n  결정 사항  \n")
+    page.get_by_test_id("template-name").fill("회의록")
+    page.get_by_test_id("template-save").click()
+
+    expect(template_names(page)).to_have_text(["템플릿 선택", "회의록"])
+    expect(page.get_by_test_id("template-select")).to_have_value("1")    # 방금 저장한 템플릿이 선택된다
+    expect(page.get_by_test_id("template-name")).to_have_value("")
+    expect(page.locator(ITEM)).to_have_count(0)                          # 할 일은 만들지 않는다
+
+    page.reload()
+    expect(template_names(page)).to_have_text(["템플릿 선택", "회의록"])
+    choose_template(page, "회의록")
+    page.get_by_test_id("template-edit").click()
+    form = page.get_by_test_id("template-edit-form")
+    expect(form.get_by_label("반복")).to_have_value("monthly")
+    expect(form.get_by_label("하위 작업")).to_have_value("참석자 정리\n결정 사항")   # 빈 줄·공백 정리
+
+
+def test_load_template_fills_add_form_then_add_creates_subtasks(page: Page, seed):
+    seed.templates([WEEKLY])
+    seed([todo(1, "기존 할 일")])
+    open_app(page)
+    page.locator("#due-date").fill("2026-10-16")
+    choose_template(page, "주간 보고")
+    page.get_by_test_id("template-load").click()
+    assert add_form_values(page) == ("주간 보고서", "금요일까지", "높음", "2026-10-16", "weekly",
+                                     "회사, 보고", "자료 수집\n초안, 검토")       # 마감일은 그대로 둔다
+    expect(page.locator("#title")).to_be_focused()
+    expect(page.locator(ITEM)).to_have_count(1)                          # 불러오기만으로는 만들지 않는다
+
+    page.locator("#title").fill("주간 보고서 (10월 3주)")                  # 채운 뒤 고칠 수 있다
+    page.get_by_role("button", name="Add To-Do").click()
+    row = item(page, "주간 보고서 (10월 3주)")
+    expect(row).to_have_count(1)
+    expect(row.get_by_test_id("subtask-progress")).to_have_text("0/2 (0%)")
+    expect(badge(row)).to_have_text("🔁 매주")
+    expect(row.get_by_test_id("todo-tag")).to_have_text(["#회사", "#보고"])
+    expect(row).to_contain_text("우선순위: 높음")
+    expand(page, "주간 보고서 (10월 3주)")
+    expect(subtasks_of(page, "주간 보고서 (10월 3주)").locator("span")).to_have_text(["자료 수집", "초안, 검토"])
+    assert add_form_values(page)[0] == "" and add_form_values(page)[6] == ""   # 추가 후 폼이 비워진다
+    expect(template_names(page)).to_have_text(["템플릿 선택", "주간 보고"])   # 템플릿은 그대로
+
+
+def test_add_form_subtasks_without_template(page: Page, seed):
+    open_app(page)
+    page.locator("#title").fill("이사 준비")
+    page.locator("#subtasks").fill("짐 싸기\n\n전입 신고")
+    page.get_by_role("button", name="Add To-Do").click()
+    expect(item(page, "이사 준비").get_by_test_id("subtask-progress")).to_have_text("0/2 (0%)")
+    page.locator("#title").fill("하위 없음")
+    page.get_by_role("button", name="Add To-Do").click()
+    expect(item(page, "하위 없음").get_by_test_id("subtask-progress")).to_have_count(0)
+
+
+def test_recurring_template_needs_due_date(page: Page, seed):
+    seed.templates([WEEKLY])
+    open_app(page)
+    choose_template(page, "주간 보고")
+    page.get_by_test_id("template-load").click()
+    page.get_by_role("button", name="Add To-Do").click()
+    expect(page.locator("#error")).to_contain_text("추가 실패")
+    expect(page.locator(ITEM)).to_have_count(0)
+    assert add_form_values(page)[0] == "주간 보고서"                      # 실패하면 폼을 지우지 않는다
+    page.locator("#due-date").fill("2026-10-16")
+    page.get_by_role("button", name="Add To-Do").click()
+    expect(page.locator(ITEM)).to_have_count(1)
+    expect(page.locator("#error")).to_be_hidden()
+
+
+def test_template_inline_edit_all_fields(page: Page, seed):
+    seed.templates([WEEKLY, template(2, "일일 점검", "서버 점검")])
+    open_app(page)
+    choose_template(page, "주간 보고")
+    page.get_by_test_id("template-edit").click()
+    form = page.get_by_test_id("template-edit-form")
+    expect(form.get_by_label("템플릿 이름")).to_be_focused()
+    for label, value in (("템플릿 이름", "주간 보고"), ("제목", "주간 보고서"), ("설명", "금요일까지"),
+                         ("우선순위", "높음"), ("반복", "weekly"), ("태그", "회사, 보고"),
+                         ("하위 작업", "자료 수집\n초안, 검토")):
+        expect(form.get_by_label(label)).to_have_value(value)
+
+    form.get_by_label("템플릿 이름").fill("월간 보고")
+    form.get_by_label("제목").fill("월간 보고서")
+    form.get_by_label("우선순위").select_option("보통")
+    form.get_by_label("반복").select_option("monthly")
+    form.get_by_label("태그").fill("회사")
+    form.get_by_label("하위 작업").fill("통계 정리")
+    form.get_by_role("button", name="저장").click()
+    expect(form).to_have_count(0)
+    expect(template_names(page)).to_have_text(["템플릿 선택", "월간 보고", "일일 점검"])
+    expect(page.get_by_test_id("template-select")).to_have_value("1")
+
+    page.reload()
+    choose_template(page, "월간 보고")
+    page.get_by_test_id("template-load").click()
+    assert add_form_values(page) == ("월간 보고서", "금요일까지", "보통", "", "monthly", "회사", "통계 정리")
+
+
+def test_template_edit_cancel_and_single_editor(page: Page, seed):
+    seed.templates([WEEKLY, template(2, "일일 점검", "서버 점검")])
+    open_app(page)
+    choose_template(page, "주간 보고")
+    page.get_by_test_id("template-edit").click()
+    page.get_by_test_id("template-edit-form").get_by_label("제목").fill("버릴 제목")
+    page.get_by_test_id("template-edit-form").get_by_role("button", name="취소").click()
+    expect(page.get_by_test_id("template-edit-form")).to_have_count(0)
+
+    page.get_by_test_id("template-edit").click()
+    expect(page.get_by_test_id("template-edit-form").get_by_label("제목")).to_have_value("주간 보고서")
+    choose_template(page, "일일 점검")                                    # 다른 템플릿을 고르면 닫힌다
+    expect(page.get_by_test_id("template-edit-form")).to_have_count(0)
+    page.get_by_test_id("template-edit").click()
+    expect(page.get_by_test_id("template-edit-form")).to_have_count(1)
+    expect(page.get_by_test_id("template-edit-form").get_by_label("제목")).to_have_value("서버 점검")
+
+
+def test_template_errors(page: Page, seed):
+    seed.templates([WEEKLY, template(2, "일일 점검", "서버 점검")])
+    open_app(page)
+    page.locator("#title").fill("아무 제목")
+    page.get_by_test_id("template-name").fill(" 주간 보고 ")             # 이름 중복 (공백 무시)
+    page.get_by_test_id("template-save").click()
+    expect(page.locator("#error")).to_contain_text("템플릿 저장 실패: 409")
+    expect(template_names(page)).to_have_count(3)
+    expect(page.get_by_test_id("template-name")).to_have_value(" 주간 보고 ")
+
+    page.get_by_test_id("template-name").fill("빈 제목")
+    page.locator("#title").fill("")
+    page.get_by_test_id("template-save").click()                         # 제목이 없으면 422
+    expect(page.locator("#error")).to_contain_text("템플릿 저장 실패: 422")
+
+    choose_template(page, "일일 점검")
+    page.get_by_test_id("template-edit").click()
+    form = page.get_by_test_id("template-edit-form")
+    form.get_by_label("템플릿 이름").fill("주간 보고")
+    form.get_by_role("button", name="저장").click()
+    expect(page.locator("#error")).to_contain_text("템플릿 수정 실패: 409")
+    expect(form).to_be_visible()                                         # 실패하면 폼이 열린 채 남는다
+
+
+def test_template_delete_confirm(page: Page, seed):
+    seed.templates([WEEKLY, template(2, "일일 점검", "서버 점검")])
+    open_app(page)
+    choose_template(page, "주간 보고")
+
+    messages = []
+    page.once("dialog", lambda d: (messages.append(d.message), d.dismiss()))
+    page.get_by_test_id("template-delete").click()
+    expect(template_names(page)).to_have_count(3)
+    assert messages == ["정말 삭제할까요?"]
+
+    page.once("dialog", lambda d: d.accept())
+    page.get_by_test_id("template-delete").click()
+    expect(template_names(page)).to_have_text(["템플릿 선택", "일일 점검"])
+    expect(page.get_by_test_id("template-select")).to_have_value("")
+    expect(page.get_by_test_id("template-load")).to_be_disabled()
+    page.reload()
+    expect(template_names(page)).to_have_text(["템플릿 선택", "일일 점검"])
+
+
+def test_template_flows_never_prompt(page: Page, seed):
+    seed.templates([WEEKLY])
+    dialogs = []
+    page.on("dialog", lambda d: (dialogs.append(d.type), d.dismiss()))
+    open_app(page)
+    page.locator("#title").fill("새 템플릿 제목")
+    page.get_by_test_id("template-name").fill("새 템플릿")
+    page.get_by_test_id("template-save").click()
+    expect(template_names(page)).to_have_count(3)
+    choose_template(page, "주간 보고")
+    page.get_by_test_id("template-load").click()
+    page.get_by_test_id("template-edit").click()
+    page.get_by_test_id("template-edit-form").get_by_role("button", name="저장").click()
+    expect(page.get_by_test_id("template-edit-form")).to_have_count(0)
+    assert "prompt" not in dialogs and dialogs == []
