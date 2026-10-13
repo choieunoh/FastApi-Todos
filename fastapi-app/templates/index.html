@@ -8,6 +8,15 @@
         body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
         form { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
         input[type="text"] { flex: 1 1 12rem; padding: .5rem; }
+        textarea { flex: 1 1 100%; min-height: 3.2rem; padding: .5rem; font: inherit; }
+        .template-panel {
+          padding: .6rem .8rem;
+          margin-bottom: 1rem;
+          border: 1px dashed #c8d6f0;
+          border-radius: 6px;
+        }
+        .template-row { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-bottom: .4rem; }
+        .template-row:last-child { margin-bottom: 0; }
         ul { list-style: none; padding: 0; }
         li { display: flex; align-items: center; gap: .5rem; padding: .4rem 0; border-bottom: 1px solid #e5e5e5; }
         .content { flex: 1; display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
@@ -181,8 +190,30 @@
         placeholder="태그 (쉼표로 구분, 예: 학교, 과제)"
       >
 
+      <textarea
+        id="subtasks"
+        aria-label="하위 작업"
+        placeholder="하위 작업 (한 줄에 하나)"
+      ></textarea>
+
       <button type="submit">Add To-Do</button>
     </form>
+    <section class="template-panel" data-testid="template-panel" aria-label="작업 템플릿">
+      <div class="template-row">
+        <label for="template-select">템플릿:</label>
+        <select id="template-select" data-testid="template-select">
+          <option value="">템플릿 선택</option>
+        </select>
+        <button type="button" id="template-load" data-testid="template-load" disabled>불러오기</button>
+        <button type="button" id="template-edit" data-testid="template-edit" disabled>수정</button>
+        <button type="button" id="template-delete" data-testid="template-delete" disabled>삭제</button>
+      </div>
+      <div class="template-row">
+        <input type="text" id="template-name" data-testid="template-name" placeholder="템플릿 이름" aria-label="새 템플릿 이름">
+        <button type="button" id="template-save" data-testid="template-save">현재 폼을 템플릿으로 저장</button>
+      </div>
+      <div id="template-editor"></div>
+    </section>
     <div class="stats" aria-label="진행률 통계">
       <span>전체 <strong id="stat-total" data-testid="stat-total">0</strong></span>
       <span>완료 <strong id="stat-completed" data-testid="stat-completed">0</strong></span>
@@ -315,6 +346,9 @@
         }
 
         const parseTags = (text) => text.split(",").map((t) => t.trim()).filter(Boolean);
+
+        // 한 줄에 하나씩 적은 하위 작업 제목 (빈 줄은 건너뛴다)
+        const parseLines = (text) => text.split("\n").map((t) => t.trim()).filter(Boolean);
 
         const isOverdue = (todo, today) =>
           Boolean(todo.due_date) && todo.due_date < today && !todo.completed;
@@ -731,7 +765,7 @@
           event.preventDefault();
 
           run("추가", async () => {
-            await api("/todos", "POST", {
+            const todo = await api("/todos", "POST", {
               title: $("title").value.trim(),
               description: $("description").value.trim(),
               priority: $("priority").value,
@@ -740,12 +774,130 @@
               tags: parseTags($("tags").value),
             });
 
-            event.target.reset();
-            await load();
+            try {                                // 하위 작업은 할 일을 만든 뒤 차례로 추가한다
+              for (const title of parseLines($("subtasks").value)) {
+                await api(`/todos/${todo.id}/subtasks`, "POST", { title });
+              }
+            } finally {                          // 할 일은 이미 생겼으니 폼을 비워 중복 추가를 막는다
+              event.target.reset();
+              await load();
+            }
+          });
+        };
+
+        // ---------- 작업 템플릿 — 불러오면 추가 폼을 채우고, 생성은 위 추가 흐름을 그대로 쓴다 ----------
+        const templateSelectEl = $("template-select");
+        let templates = [];
+        let editingTemplateId = null;            // 인라인 수정 중인 템플릿 (한 번에 하나)
+
+        const selectedTemplate = () => templates.find((t) => String(t.id) === templateSelectEl.value);
+
+        // 추가 폼의 지금 값 → 템플릿 내용 (마감일은 템플릿에 넣지 않는다)
+        const formTemplateFields = () => ({
+          title: $("title").value.trim(),
+          description: $("description").value.trim(),
+          priority: $("priority").value,
+          recurrence: $("recurrence").value,
+          tags: parseTags($("tags").value),
+          subtasks: parseLines($("subtasks").value),
+        });
+
+        async function fetchTemplates(selectId = templateSelectEl.value) {
+          templates = await api("/task-templates");
+          templateSelectEl.replaceChildren(
+            el("option", { value: "", textContent: "템플릿 선택" }),
+            ...templates.map((t) => el("option", { value: t.id, textContent: t.name })),
+          );
+          templateSelectEl.value = templates.some((t) => String(t.id) === String(selectId)) ? selectId : "";
+          if (!templates.some((t) => t.id === editingTemplateId)) editingTemplateId = null;
+          renderTemplatePanel();
+        }
+
+        function renderTemplatePanel() {
+          const template = selectedTemplate();
+          for (const id of ["template-load", "template-edit", "template-delete"]) $(id).disabled = !template;
+          $("template-editor").replaceChildren(...(template && template.id === editingTemplateId
+            ? [renderTemplateEditor(template)] : []));
+        }
+
+        function renderTemplateEditor(template) {
+          const field = (tag, label, props) => {
+            const input = el(tag, props);
+            input.setAttribute("aria-label", label);
+            return input;
+          };
+          const name = field("input", "템플릿 이름", { type: "text", value: template.name });
+          const title = field("input", "제목", { type: "text", value: template.title });
+          const description = field("input", "설명", { type: "text", value: template.description });
+          const priority = field("select", "우선순위");
+          priorityOptions(priority, template.priority);
+          const recurrence = field("select", "반복");
+          recurrenceOptions(recurrence, template.recurrence);
+          const tags = field("input", "태그", { type: "text", value: template.tags.join(", ") });
+          const subtasks = field("textarea", "하위 작업", { value: template.subtasks.join("\n") });
+
+          const form = el("form");
+          form.dataset.testid = "template-edit-form";
+          form.append(name, title, description, priority, recurrence, tags, subtasks,
+            el("button", { type: "submit", textContent: "저장" }),
+            button("취소", () => { editingTemplateId = null; renderTemplatePanel(); }));
+          form.onsubmit = (event) => {
+            event.preventDefault();
+            run("템플릿 수정", async () => {   // 실패하면 폼을 그대로 두고 오류만 띄운다
+              await api(`/task-templates/${template.id}`, "PUT", {
+                name: name.value.trim(),
+                title: title.value.trim(),
+                description: description.value.trim(),
+                priority: priority.value,
+                recurrence: recurrence.value,
+                tags: parseTags(tags.value),
+                subtasks: parseLines(subtasks.value),
+              });
+              editingTemplateId = null;
+              await fetchTemplates();
+            });
+          };
+          return form;
+        }
+
+        templateSelectEl.onchange = () => { editingTemplateId = null; renderTemplatePanel(); };
+
+        $("template-load").onclick = () => {
+          const t = selectedTemplate();
+          if (!t) return;
+          $("title").value = t.title;
+          $("description").value = t.description;
+          $("priority").value = t.priority;
+          $("recurrence").value = t.recurrence;
+          $("tags").value = t.tags.join(", ");
+          $("subtasks").value = t.subtasks.join("\n");
+          $("title").focus();
+        };
+
+        $("template-save").onclick = () => run("템플릿 저장", async () => {
+          const created = await api("/task-templates", "POST",
+            { name: $("template-name").value.trim(), ...formTemplateFields() });
+          $("template-name").value = "";
+          await fetchTemplates(created.id);
+        });
+
+        $("template-edit").onclick = () => {
+          editingTemplateId = selectedTemplate()?.id ?? null;
+          renderTemplatePanel();
+          $("template-editor").querySelector("input")?.focus();
+        };
+
+        $("template-delete").onclick = () => {
+          const t = selectedTemplate();
+          if (!t || !confirm("정말 삭제할까요?")) return;
+          run("템플릿 삭제", async () => {
+            await api(`/task-templates/${t.id}`, "DELETE");
+            await fetchTemplates("");
           });
         };
 
         load();
+        run("템플릿 목록 불러오기", () => fetchTemplates());
      </script>
 </body>
 </html>

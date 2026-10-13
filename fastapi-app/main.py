@@ -7,10 +7,13 @@ from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, StrictBool, StringConstraints, field_validator, model_validator
+from pydantic import (
+    AfterValidator, BaseModel, Field, StrictBool, StringConstraints, field_validator, model_validator,
+)
 
 BASE_DIR = Path(__file__).resolve().parent       # main.py 가 있는 폴더
 TODO_FILE = Path(os.environ.get("TODO_FILE", BASE_DIR / "todo.json"))  # 테스트에서 바꿔 쓸 수 있다
+TEMPLATE_FILE = Path(os.environ.get("TEMPLATE_FILE", BASE_DIR / "task_templates.json"))  # 처음 저장할 때 만든다
 INDEX_FILE = BASE_DIR / "templates" / "index.html"
 
 if not TODO_FILE.exists():                       # 없으면 빈 목록으로 만들어 둔다
@@ -28,13 +31,33 @@ UNDO_MAX = BULK_MAX                              # 복구 버퍼·복구 요청 
 SUBTASK_MAX = 20                                 # 할 일 하나에 둘 수 있는 하위 할 일 수
 
 
+def clean_tag_list(tags: list[str]) -> list[str]:
+    # 할 일·템플릿 공용 태그 규칙
+    result, seen = [], set()
+    for tag in (t.strip() for t in tags):
+        if not tag or len(tag) > MAX_TAG_LEN:
+            raise ValueError(f"태그는 1~{MAX_TAG_LEN}자여야 합니다")
+        if "," in tag:
+            raise ValueError("태그에 쉼표를 넣을 수 없습니다")
+        if tag.casefold() not in seen:           # 대소문자 무시 중복 제거, 처음 표기 유지
+            seen.add(tag.casefold())
+            result.append(tag)
+    if len(result) > MAX_TAGS:
+        raise ValueError(f"태그는 최대 {MAX_TAGS}개입니다")
+    return result
+
+
+Description = Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)]
+Tags = Annotated[list[str], AfterValidator(clean_tag_list)]
+
+
 class TodoIn(BaseModel):                         # 클라이언트가 보내는 데이터 — 시각 필드는 받지 않는다
     title: Title
-    description: Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)] = ""
+    description: Description = ""
     completed: bool = False
     priority: Priority = "보통"
     due_date: date | None = None
-    tags: list[str] = []
+    tags: Tags = []
     favorite: StrictBool = False                 # 즐겨찾기 — "yes" 같은 문자열은 받지 않는다
     recurrence: Recurrence = "none"              # 반복 주기 — 반복하려면 마감일이 있어야 한다
 
@@ -47,27 +70,25 @@ class TodoIn(BaseModel):                         # 클라이언트가 보내는 
             raise ValueError("due_date 는 YYYY-MM-DD 문자열이어야 합니다")
         return v
 
-    @field_validator("tags")
-    @classmethod
-    def clean_tags(cls, tags: list[str]) -> list[str]:
-        result, seen = [], set()
-        for tag in (t.strip() for t in tags):
-            if not tag or len(tag) > MAX_TAG_LEN:
-                raise ValueError(f"태그는 1~{MAX_TAG_LEN}자여야 합니다")
-            if "," in tag:
-                raise ValueError("태그에 쉼표를 넣을 수 없습니다")
-            if tag.casefold() not in seen:       # 대소문자 무시 중복 제거, 처음 표기 유지
-                seen.add(tag.casefold())
-                result.append(tag)
-        if len(result) > MAX_TAGS:
-            raise ValueError(f"태그는 최대 {MAX_TAGS}개입니다")
-        return result
-
     @model_validator(mode="after")
     def recurrence_needs_due_date(self) -> "TodoIn":
         if self.recurrence != "none" and self.due_date is None:
             raise ValueError("반복 일정에는 마감일이 필요합니다")
         return self
+
+
+class TemplateIn(BaseModel):                     # 작업 템플릿 — 마감일·완료·시각은 없다
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
+    title: Title
+    description: Description = ""
+    priority: Priority = "보통"
+    tags: Tags = []
+    recurrence: Recurrence = "none"              # 마감일 필수 검사는 할 일을 만들 때(POST /todos) 한다
+    subtasks: list[Title] = Field(default=[], max_length=SUBTASK_MAX)   # 하위 할 일 제목들
+
+
+class TaskTemplate(TemplateIn):
+    id: int
 
 
 class Subtask(BaseModel):                        # 하위 할 일 — id 는 그 할 일 안에서만 고유하다
@@ -198,14 +219,42 @@ def remember_deleted(todo: TodoItem, position: int) -> None:
     prune_deleted()
 
 
+def read_list(path: Path) -> list[dict]:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+
+
+def write_list(path: Path, items: list[BaseModel]) -> None:
+    data = json.dumps([i.model_dump(mode="json") for i in items], indent=2, ensure_ascii=False)
+    path.write_text(data, encoding="utf-8")
+
+
 def load_todos() -> list[TodoItem]:
-    raw = TODO_FILE.read_text(encoding="utf-8") if TODO_FILE.exists() else "[]"
-    return [TodoItem(**t) for t in json.loads(raw)]
+    return [TodoItem(**t) for t in read_list(TODO_FILE)]
 
 
 def save_todos(todos: list[TodoItem]) -> None:
-    data = json.dumps([t.model_dump(mode="json") for t in todos], indent=2, ensure_ascii=False)
-    TODO_FILE.write_text(data, encoding="utf-8")
+    write_list(TODO_FILE, todos)
+
+
+def load_templates() -> list[TaskTemplate]:
+    return [TaskTemplate(**t) for t in read_list(TEMPLATE_FILE)]
+
+
+def save_templates(templates: list[TaskTemplate]) -> None:
+    write_list(TEMPLATE_FILE, templates)
+
+
+def find_template_index(templates: list[TaskTemplate], template_id: int) -> int:
+    for i, template in enumerate(templates):
+        if template.id == template_id:
+            return i
+    raise HTTPException(404, "Template not found")
+
+
+def check_template_name(templates: list[TaskTemplate], name: str, skip_id: int | None = None) -> None:
+    # 이름은 대소문자 무시로 겹치면 안 된다 (저장된 목록을 봐야 알 수 있는 규칙)
+    if any(t.name.casefold() == name.casefold() and t.id != skip_id for t in templates):
+        raise HTTPException(409, f"이미 있는 템플릿 이름입니다: {name}")
 
 
 def find_index(todos: list[TodoItem], todo_id: int) -> int:
@@ -343,6 +392,45 @@ def delete_subtask(todo_id: int, subtask_id: int) -> None:
     todo = todos[find_index(todos, todo_id)]
     del todo.subtasks[find_subtask_index(todo, subtask_id)]
     save_todos(todos)
+
+
+# ---------- 작업 템플릿 — 재사용은 화면에서 추가 폼을 채우는 방식 (apply API 없음) ----------
+
+TEMPLATE_RESPONSES: dict[int | str, dict[str, object]] = {
+    404: {"description": "Template not found"},
+    409: {"description": "이미 있는 템플릿 이름"},
+}
+
+
+@app.get("/task-templates")
+def get_templates() -> list[TaskTemplate]:
+    return load_templates()
+
+
+@app.post("/task-templates", status_code=201, responses={409: TEMPLATE_RESPONSES[409]})
+def create_template(payload: TemplateIn) -> TaskTemplate:
+    templates = load_templates()
+    check_template_name(templates, payload.name)
+    template = TaskTemplate(id=max((t.id for t in templates), default=0) + 1, **payload.model_dump())
+    save_templates(templates + [template])
+    return template
+
+
+@app.put("/task-templates/{template_id}", responses=TEMPLATE_RESPONSES)
+def update_template(template_id: int, payload: TemplateIn) -> TaskTemplate:
+    templates = load_templates()
+    index = find_template_index(templates, template_id)
+    check_template_name(templates, payload.name, skip_id=template_id)
+    templates[index] = TaskTemplate(id=template_id, **payload.model_dump())
+    save_templates(templates)
+    return templates[index]
+
+
+@app.delete("/task-templates/{template_id}", status_code=204, responses={404: TEMPLATE_RESPONSES[404]})
+def delete_template(template_id: int) -> None:
+    templates = load_templates()
+    del templates[find_template_index(templates, template_id)]
+    save_templates(templates)
 
 
 @app.get("/", include_in_schema=False)           # 화면 서빙
