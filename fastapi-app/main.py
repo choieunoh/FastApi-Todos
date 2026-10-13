@@ -1,12 +1,14 @@
 import calendar
+import csv
+import io
 import json
 import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, Response
 from pydantic import (
     AfterValidator, BaseModel, Field, StrictBool, StringConstraints, field_validator, model_validator,
 )
@@ -29,6 +31,12 @@ UNDO_TTL = timedelta(seconds=30)                 # 삭제 후 복구할 수 있�
 BULK_MAX = 100                                   # 일괄 작업 한 번에 고를 수 있는 최대 건수
 UNDO_MAX = BULK_MAX                              # 복구 버퍼·복구 요청 최대 건수 — 일괄 삭제 한 번을 모두 되돌릴 수 있게
 SUBTASK_MAX = 20                                 # 할 일 하나에 둘 수 있는 하위 할 일 수
+KST = timezone(timedelta(hours=9), "KST")        # 내보내기 파일명 날짜 기준 (tzdata 없이 고정 오프셋)
+ExportFormat = Literal["json", "csv"]
+# CSV 고정 헤더 — 값은 JSON 과 같은 표기, 서버 내부용 next_spawned 는 뺀다
+CSV_COLUMNS = ["id", "title", "description", "completed", "priority", "due_date", "tags",
+               "favorite", "recurrence", "subtasks", "created_at", "completed_at"]
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")      # 스프레드시트가 수식으로 읽는 시작 문자
 
 
 def clean_tag_list(tags: list[str]) -> list[str]:
@@ -288,6 +296,45 @@ def create_todo(payload: TodoIn) -> TodoItem:
     todo, spawned = apply_completion(todos, None, TodoItem(id=next_id(todos), created_at=now(), **payload.model_dump()))
     save_todos(todos + [todo] + ([spawned] if spawned else []))
     return todo
+
+
+# ---------- 내보내기 — 읽기 전용, 항상 전체 목록 ----------
+
+def csv_cell(value: object) -> str:
+    # JSON 과 같은 표기로 바꾸고, 수식으로 읽힐 값은 앞에 ' 를 붙인다
+    if value is None:
+        text = ""
+    elif isinstance(value, bool):
+        text = "true" if value else "false"
+    else:
+        text = str(value)
+    return "'" + text if text.startswith(CSV_FORMULA_PREFIXES) else text
+
+
+def todos_to_csv(todos: list[TodoItem]) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)                  # 쉼표·따옴표·줄바꿈이 든 값은 csv 모듈이 따옴표로 감싼다
+    writer.writerow(CSV_COLUMNS)
+    for todo in todos:
+        row = todo.model_dump(mode="json")
+        row["tags"] = ";".join(todo.tags)
+        row["subtasks"] = f"{sum(s.completed for s in todo.subtasks)}/{len(todo.subtasks)}"
+        writer.writerow([csv_cell(row[column]) for column in CSV_COLUMNS])
+    return "\ufeff" + buffer.getvalue()          # BOM — 엑셀에서 한글이 깨지지 않게
+
+
+@app.get("/todos/export", responses={200: {"content": {"text/csv": {}}}})
+def export_todos(export_format: Annotated[ExportFormat, Query(alias="format")]) -> Response:
+    todos = load_todos()
+    filename = f"todos-{now().astimezone(KST):%Y%m%d}.{export_format}"
+    if export_format == "json":                  # GET /todos 와 같은 내용
+        body = json.dumps([t.model_dump(mode="json") for t in todos], indent=2, ensure_ascii=False)
+        media_type = "application/json; charset=utf-8"
+    else:
+        body = todos_to_csv(todos)
+        media_type = "text/csv; charset=utf-8"
+    return Response(body.encode("utf-8"), media_type=media_type,
+                    headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
 @app.post("/todos/restore", responses={404: {"description": "복구할 수 없는 항목이 있음"}})  # 삭제 실행 취소

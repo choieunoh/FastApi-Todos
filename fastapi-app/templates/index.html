@@ -64,6 +64,15 @@
           padding: .4rem;
         }
 
+        .export-links { display: flex; align-items: center; gap: .5rem; margin-top: .8rem; font-size: .9rem; }
+        .export-links a {
+          padding: .3rem .7rem;
+          color: #2a4a8a;
+          text-decoration: none;
+          border: 1px solid #c8d6f0;
+          border-radius: 4px;
+        }
+
         .overdue {
           color: #b00020;
           font-weight: bold;
@@ -244,6 +253,12 @@
         <select id="tag-filter" data-testid="tag-filter">
           <option value="">전체 태그</option>
         </select>
+      </div>
+      <!-- 내보내기는 파일 다운로드라 api() 를 거치지 않는 유일한 예외 — 필터와 상관없이 전체 목록 -->
+      <div class="export-links">
+        <span>내보내기:</span>
+        <a href="/todos/export?format=csv" download data-testid="export-csv">CSV 내보내기</a>
+        <a href="/todos/export?format=json" download data-testid="export-json">JSON 내보내기</a>
       </div>
     </div>
     <div class="bulk-bar" data-testid="bulk-bar" aria-label="일괄 작업">
