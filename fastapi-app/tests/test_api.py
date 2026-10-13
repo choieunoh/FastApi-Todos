@@ -481,3 +481,149 @@ def test_next_bulk_delete_pushes_out_oldest():
     bulk(list(range(101, 106)), "delete")
     assert restore(*range(1, 6)).status_code == 404       # 먼저 지운 5건은 밀려났다
     assert restore(*range(6, 106)).status_code == 200
+
+
+# ---------- 5.0.0 4단계: 하위 할 일 ----------
+
+def add_sub(todo_id: int, title: str = "하위"):
+    return client.post(f"/todos/{todo_id}/subtasks", json={"title": title})
+
+
+def put_sub(todo_id: int, sid: int, **body):
+    return client.put(f"/todos/{todo_id}/subtasks/{sid}", json=body)
+
+
+def del_sub(todo_id: int, sid: int):
+    return client.delete(f"/todos/{todo_id}/subtasks/{sid}")
+
+
+def test_new_todo_has_empty_subtasks():
+    assert create().json()["subtasks"] == []
+    assert client.get("/todos").json()[0]["subtasks"] == []
+
+
+def test_add_subtask_returns_updated_todo():
+    todo_id = create().json()["id"]
+    res = add_sub(todo_id, "  자료 조사  ")
+    assert res.status_code == 201
+    assert res.json()["id"] == todo_id
+    assert res.json()["subtasks"] == [{"id": 1, "title": "자료 조사", "completed": False}]
+    res = add_sub(todo_id, "초안 작성")
+    assert [s["id"] for s in res.json()["subtasks"]] == [1, 2]
+    assert client.get("/todos").json()[0]["subtasks"] == res.json()["subtasks"]   # GET /todos 로 조회
+
+
+def test_subtask_ids_are_per_todo_and_max_plus_one():
+    a, b = create().json()["id"], create().json()["id"]
+    add_sub(a), add_sub(a), add_sub(a)
+    assert add_sub(b).json()["subtasks"][0]["id"] == 1       # 할 일마다 따로 매긴다
+    del_sub(a, 2)
+    assert [s["id"] for s in add_sub(a).json()["subtasks"]] == [1, 3, 4]
+
+
+def test_update_subtask_title_and_completed():
+    todo_id = create().json()["id"]
+    add_sub(todo_id, "원래")
+    add_sub(todo_id, "다른 것")
+    res = put_sub(todo_id, 1, title="  바뀐 제목 ", completed=True)
+    assert res.status_code == 200
+    assert res.json()["subtasks"] == [{"id": 1, "title": "바뀐 제목", "completed": True},
+                                      {"id": 2, "title": "다른 것", "completed": False}]
+    res = put_sub(todo_id, 1, title="바뀐 제목", completed=False)
+    assert res.json()["subtasks"][0]["completed"] is False
+
+
+def test_delete_subtask():
+    todo_id = create().json()["id"]
+    add_sub(todo_id, "하나")
+    add_sub(todo_id, "둘")
+    res = del_sub(todo_id, 1)
+    assert res.status_code == 204
+    assert res.content == b""
+    assert client.get("/todos").json()[0]["subtasks"] == [{"id": 2, "title": "둘", "completed": False}]
+
+
+def test_subtask_not_found():
+    todo_id = create().json()["id"]
+    add_sub(todo_id)
+    assert add_sub(999).status_code == 404
+    assert put_sub(999, 1, title="x", completed=False).status_code == 404
+    assert put_sub(todo_id, 9, title="x", completed=False).status_code == 404
+    assert del_sub(999, 1).status_code == 404
+    assert del_sub(todo_id, 9).status_code == 404
+
+
+@pytest.mark.parametrize("title", ["", "   ", "가" * 101])
+def test_subtask_title_validation(title):
+    todo_id = create().json()["id"]
+    assert add_sub(todo_id, title).status_code == 422
+    add_sub(todo_id, "정상")
+    assert put_sub(todo_id, 1, title=title, completed=False).status_code == 422
+    assert add_sub(todo_id, "가" * 100).status_code == 201
+
+
+@pytest.mark.parametrize("body", [{"title": "x"}, {"completed": True}, {"title": "x", "completed": "yes"}])
+def test_subtask_put_requires_title_and_completed(body):
+    todo_id = create().json()["id"]
+    add_sub(todo_id)
+    assert put_sub(todo_id, 1, **body).status_code == 422
+    assert client.get("/todos").json()[0]["subtasks"][0] == {"id": 1, "title": "하위", "completed": False}
+
+
+def test_subtask_limit_20(isolated_file):
+    todo_id = create().json()["id"]
+    for i in range(20):
+        assert add_sub(todo_id, f"s{i}").status_code == 201
+    before = isolated_file.read_bytes()
+    res = add_sub(todo_id, "21번째")
+    assert res.status_code == 422
+    assert isolated_file.read_bytes() == before
+    del_sub(todo_id, 1)
+    assert add_sub(todo_id, "자리 남으면 다시 가능").status_code == 201
+
+
+def test_parent_put_ignores_and_keeps_subtasks():
+    todo_id = create().json()["id"]
+    add_sub(todo_id, "유지")
+    body = put(todo_id, title="상위 수정", completed=True, subtasks=[{"id": 9, "title": "가짜", "completed": True}]).json()
+    assert body["subtasks"] == [{"id": 1, "title": "유지", "completed": False}]
+    assert body["completed"] is True                          # 하위가 미완료여도 상위는 완료될 수 있다
+
+
+def test_post_ignores_subtasks_in_body():
+    assert create(subtasks=[{"id": 1, "title": "가짜", "completed": True}]).json()["subtasks"] == []
+
+
+def test_subtasks_do_not_change_parent_completion():
+    todo_id = create().json()["id"]
+    add_sub(todo_id, "a")
+    body = put_sub(todo_id, 1, title="a", completed=True).json()
+    assert (body["completed"], body["completed_at"]) == (False, None)   # 모두 완료해도 상위는 그대로
+    done = create(completed=True).json()
+    body = add_sub(done["id"], "나중에 추가").json()
+    assert (body["completed"], body["completed_at"]) == (True, done["completed_at"])
+
+
+def test_subtasks_kept_by_favorite_bulk_delete_and_restore():
+    todo_id = create(title="상위").json()["id"]
+    add_sub(todo_id, "a")
+    subtasks = put_sub(todo_id, 1, title="a", completed=True).json()["subtasks"]
+    add_sub(todo_id, "b")
+    subtasks = client.get("/todos").json()[0]["subtasks"]
+
+    assert put(todo_id, title="상위", favorite=True).json()["subtasks"] == subtasks
+    assert bulk([todo_id], "complete").json()["updated"][0]["subtasks"] == subtasks
+    delete(todo_id)
+    assert restore(todo_id).json()[0]["subtasks"] == subtasks             # 단건 삭제 → 복구
+    bulk([todo_id], "delete")
+    assert restore(todo_id).json()[0]["subtasks"] == subtasks             # 일괄 삭제 → 복구
+
+
+def test_v4_data_without_subtasks(isolated_file):
+    isolated_file.write_text(
+        '[{"id": 1, "title": "v4", "description": "", "completed": false, "priority": "보통",'
+        ' "due_date": null, "tags": [], "created_at": null, "completed_at": null, "favorite": true}]',
+        encoding="utf-8",
+    )
+    assert client.get("/todos").json()[0]["subtasks"] == []
+    assert add_sub(1, "처음").json()["subtasks"] == [{"id": 1, "title": "처음", "completed": False}]

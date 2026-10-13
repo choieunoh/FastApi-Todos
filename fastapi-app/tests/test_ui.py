@@ -5,7 +5,7 @@ from playwright.sync_api import Page, expect
 
 TODAY = "2026-10-12"                                # 브라우저 시계를 이 날짜 정오로 고정한다
 ITEM = "[data-testid=todo-item]"
-DONE_BOX = "input[type=checkbox]:not([data-testid=bulk-select])"   # 완료 체크박스
+DONE_BOX = "input.todo-check"                                       # 상위 할 일의 완료 체크박스
 
 
 def todo(id: int, title: str, **fields) -> dict:
@@ -559,3 +559,209 @@ def test_bulk_failure_shows_error_and_keeps_selection(page: Page, seed):
     expect(page.locator("#error")).to_contain_text("일괄 완료 실패")
     expect(bulk_count(page)).to_have_text("2개 선택")
     assert stats(page) == ("2", "0", "2", "0", "0%")
+
+
+# ---------- 5.0.0 4단계: 하위 할 일 ----------
+
+def sub(id: int, title: str, completed: bool = False) -> dict:
+    return {"id": id, "title": title, "completed": completed}
+
+
+def subtasks_of(page: Page, title: str):
+    return item(page, title).get_by_test_id("subtask-item")
+
+
+def progress(page: Page, title: str):
+    return item(page, title).get_by_test_id("subtask-progress")
+
+
+def expand(page: Page, title: str) -> None:
+    toggle = item(page, title).get_by_test_id("subtask-toggle")
+    expect(toggle).to_have_attribute("aria-expanded", "false")
+    toggle.click()
+    expect(item(page, title).get_by_test_id("subtask-list")).to_be_visible()
+
+
+def test_subtask_add_check_and_progress(page: Page, seed):
+    seed([todo(1, "보고서"), todo(2, "다른 일")])
+    open_app(page)
+    row = item(page, "보고서")
+    expect(row.get_by_test_id("subtask-list")).to_have_count(0)        # 기본은 접힘
+    expect(progress(page, "보고서")).to_have_count(0)                   # 하위가 없으면 진행률 숨김
+    expect(row.get_by_test_id("subtask-toggle")).to_have_text("▸ 하위 작업 (0)")
+
+    expand(page, "보고서")
+    add = row.get_by_test_id("subtask-add")
+    add.fill("자료 조사")
+    add.press("Enter")
+    expect(subtasks_of(page, "보고서")).to_have_count(1)
+    expect(row.get_by_test_id("subtask-add")).to_be_focused()          # 이어서 입력할 수 있다
+    row.get_by_test_id("subtask-add").fill("초안 작성")
+    row.get_by_role("button", name="추가").click()
+    expect(subtasks_of(page, "보고서").locator("span")).to_have_text(["자료 조사", "초안 작성"])
+    expect(progress(page, "보고서")).to_have_text("0/2 (0%)")
+
+    row.get_by_label("자료 조사 완료").check()
+    expect(progress(page, "보고서")).to_have_text("1/2 (50%)")
+    expect(subtasks_of(page, "보고서").first.locator("span")).to_have_class("done")
+    expect(row.locator(DONE_BOX)).not_to_be_checked()                  # 상위 완료와 연동하지 않는다
+    assert stats(page) == ("2", "0", "2", "0", "0%")                    # 통계는 상위 기준 그대로
+
+    row.get_by_label("초안 작성 완료").check()
+    expect(progress(page, "보고서")).to_have_text("2/2 (100%)")
+    expect(row.locator(DONE_BOX)).not_to_be_checked()
+    assert stats(page) == ("2", "0", "2", "0", "0%")
+
+    page.reload()                                                       # 새로고침하면 접히지만 데이터는 남는다
+    expect(row.get_by_test_id("subtask-list")).to_have_count(0)
+    expect(progress(page, "보고서")).to_have_text("2/2 (100%)")
+    expect(row.get_by_test_id("subtask-toggle")).to_have_text("▸ 하위 작업 (2)")
+
+
+def test_subtask_edit_title(page: Page, seed):
+    seed([todo(1, "보고서", subtasks=[sub(1, "자료 조사", True), sub(2, "초안 작성")])])
+    open_app(page)
+    expand(page, "보고서")
+    row = item(page, "보고서")
+
+    row.get_by_role("button", name="자료 조사 수정").click()
+    field = row.get_by_label("하위 작업 제목")
+    expect(field).to_have_value("자료 조사")
+    expect(field).to_be_focused()
+    field.fill("논문 조사")
+    field.press("Enter")
+    expect(subtasks_of(page, "보고서").first).to_contain_text("논문 조사")
+    expect(row.get_by_label("논문 조사 완료")).to_be_checked()            # 완료 상태는 그대로
+
+    row.get_by_role("button", name="초안 작성 수정").click()                # 취소하면 원래 제목
+    row.get_by_label("하위 작업 제목").fill("버릴 제목")
+    row.get_by_role("button", name="취소").click()
+    expect(subtasks_of(page, "보고서").nth(1)).to_contain_text("초안 작성")
+
+    row.get_by_role("button", name="초안 작성 수정").click()                # Esc 도 취소
+    row.get_by_label("하위 작업 제목").fill("버릴 제목")
+    row.get_by_label("하위 작업 제목").press("Escape")
+    expect(row.get_by_label("하위 작업 제목")).to_have_count(0)
+    expect(subtasks_of(page, "보고서").nth(1)).to_contain_text("초안 작성")
+
+    page.reload()
+    expand(page, "보고서")
+    expect(subtasks_of(page, "보고서").locator("span")).to_have_text(["논문 조사", "초안 작성"])
+
+
+def test_subtask_single_edit_and_error(page: Page, seed):
+    seed([todo(1, "보고서", subtasks=[sub(1, "자료 조사"), sub(2, "초안 작성")])])
+    open_app(page)
+    expand(page, "보고서")
+    row = item(page, "보고서")
+    row.get_by_role("button", name="자료 조사 수정").click()
+    row.get_by_role("button", name="초안 작성 수정").click()
+    expect(row.get_by_label("하위 작업 제목")).to_have_count(1)            # 한 번에 하나만
+    expect(row.get_by_label("하위 작업 제목")).to_have_value("초안 작성")
+
+    row.get_by_label("하위 작업 제목").fill("   ")
+    row.get_by_role("button", name="저장").click()
+    expect(page.locator("#error")).to_contain_text("하위 작업 수정 실패")
+    expect(row.get_by_label("하위 작업 제목")).to_be_visible()             # 실패하면 입력란을 그대로 둔다
+
+
+def delete_subtask(page: Page, todo_title: str, subtask_title: str, accept: bool = True) -> list[str]:
+    messages = []
+    page.once("dialog", lambda d: (messages.append(d.message), d.accept() if accept else d.dismiss()))
+    item(page, todo_title).get_by_role("button", name=f"{subtask_title} 삭제").click()
+    return messages
+
+
+def test_subtask_delete_confirm_accept(page: Page, seed):
+    seed([todo(1, "보고서", subtasks=[sub(1, "자료 조사", True), sub(3, "초안 작성")])])
+    open_app(page)
+    expand(page, "보고서")
+    row = item(page, "보고서")
+    expect(progress(page, "보고서")).to_have_text("1/2 (50%)")
+
+    assert delete_subtask(page, "보고서", "자료 조사") == ["정말 삭제할까요?"]   # 상위 삭제와 같은 확인창
+    expect(subtasks_of(page, "보고서")).to_have_count(1)
+    expect(progress(page, "보고서")).to_have_text("0/1 (0%)")
+    delete_subtask(page, "보고서", "초안 작성")
+    expect(subtasks_of(page, "보고서")).to_have_count(0)
+    expect(progress(page, "보고서")).to_have_count(0)
+    page.reload()
+    expect(row.get_by_test_id("subtask-toggle")).to_have_text("▸ 하위 작업 (0)")
+
+
+def test_subtask_delete_confirm_dismiss(page: Page, seed):
+    seed([todo(1, "보고서", subtasks=[sub(1, "자료 조사", True), sub(2, "초안 작성")])])
+    open_app(page)
+    expand(page, "보고서")
+    requests = []
+    page.on("request", lambda r: requests.append(f"{r.method} {r.url}"))
+
+    assert delete_subtask(page, "보고서", "자료 조사", accept=False) == ["정말 삭제할까요?"]
+    expect(subtasks_of(page, "보고서").locator("span")).to_have_text(["자료 조사", "초안 작성"])
+    expect(progress(page, "보고서")).to_have_text("1/2 (50%)")
+    expect(item(page, "보고서").get_by_test_id("subtask-list")).to_be_visible()   # 펼친 상태도 그대로
+    expect(page.locator("#error")).to_be_hidden()
+    assert requests == []                                                   # API 요청을 보내지 않는다
+
+    page.reload()
+    expect(progress(page, "보고서")).to_have_text("1/2 (50%)")
+    expand(page, "보고서")
+    expect(subtasks_of(page, "보고서").locator("span")).to_have_text(["자료 조사", "초안 작성"])
+
+
+def test_subtask_add_errors(page: Page, seed):
+    seed([todo(1, "가득", subtasks=[sub(i, f"s{i}") for i in range(1, 21)])])
+    open_app(page)
+    expand(page, "가득")
+    row = item(page, "가득")
+    row.get_by_test_id("subtask-add").fill("21번째")
+    row.get_by_test_id("subtask-add").press("Enter")
+    expect(page.locator("#error")).to_contain_text("하위 작업 추가 실패")
+    expect(subtasks_of(page, "가득")).to_have_count(20)
+
+
+def test_subtask_add_blank_title_error(page: Page, seed):
+    seed([todo(1, "보고서")])
+    open_app(page)
+    expand(page, "보고서")
+    page.get_by_test_id("subtask-add").fill("   ")
+    page.get_by_test_id("subtask-add").press("Enter")
+    expect(page.locator("#error")).to_contain_text("하위 작업 추가 실패")
+    expect(subtasks_of(page, "보고서")).to_have_count(0)
+
+
+def test_subtask_expanded_state_survives_rerender(page: Page, seed):
+    seed([todo(1, "보고서", subtasks=[sub(1, "자료 조사")]), todo(2, "운동")])
+    open_app(page)
+    expand(page, "보고서")
+    star(page, "보고서").click()                                        # 다른 동작으로 목록을 다시 그려도
+    expect(star(page, "보고서")).to_have_text("★")
+    expect(item(page, "보고서").get_by_test_id("subtask-list")).to_be_visible()
+    page.locator("[data-filter=active]").click()
+    expect(item(page, "보고서").get_by_test_id("subtask-list")).to_be_visible()
+    expect(item(page, "운동").get_by_test_id("subtask-list")).to_have_count(0)
+    item(page, "보고서").get_by_test_id("subtask-toggle").click()        # 다시 누르면 접힌다
+    expect(item(page, "보고서").get_by_test_id("subtask-list")).to_have_count(0)
+
+
+def test_subtasks_kept_through_edit_bulk_and_undo(page: Page, seed):
+    seed([todo(1, "보고서", subtasks=[sub(1, "자료 조사", True), sub(2, "초안 작성")]), todo(2, "운동")])
+    open_app(page)
+
+    item(page, "보고서").get_by_role("button", name="Edit").click()       # 상위 수정
+    page.get_by_test_id("edit-form").get_by_label("제목").fill("최종 보고서")
+    page.get_by_test_id("edit-save").click()
+    expect(progress(page, "최종 보고서")).to_have_text("1/2 (50%)")
+
+    pick(page, "최종 보고서")                                              # 일괄 완료
+    page.get_by_test_id("bulk-complete").click()
+    expect(item(page, "최종 보고서").locator(DONE_BOX)).to_be_checked()
+    expect(progress(page, "최종 보고서")).to_have_text("1/2 (50%)")        # 하위는 그대로
+
+    delete_item(page, "최종 보고서")                                        # 삭제 → 실행 취소
+    expect(page.locator(ITEM)).to_have_count(1)
+    page.get_by_test_id("undo-button").click()
+    expect(page.locator(ITEM)).to_have_count(2)
+    expect(progress(page, "최종 보고서")).to_have_text("1/2 (50%)")
+    expand(page, "최종 보고서")
+    expect(subtasks_of(page, "최종 보고서").locator("span")).to_have_text(["자료 조사", "초안 작성"])
