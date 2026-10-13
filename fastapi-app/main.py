@@ -82,6 +82,12 @@ def find_index(todos: list[TodoItem], todo_id: int) -> int:
     raise HTTPException(404, "To-Do item not found")
 
 
+# find_index가 던지는 404를 OpenAPI 문서에 명시
+NOT_FOUND_RESPONSE: dict[int | str, dict[str, object]] = {
+    404: {"description": "To-Do item not found"},
+}
+
+
 @app.get("/todos")                               # 목록 조회
 def get_todos() -> list[TodoItem]:
     return load_todos()
@@ -102,7 +108,7 @@ def create_todo(payload: TodoIn) -> TodoItem:
     return todo
 
 
-@app.put("/todos/{todo_id}")                     # 수정 — created_at 유지, 완료 상태가 바뀔 때만 completed_at 갱신
+@app.put("/todos/{todo_id}", responses=NOT_FOUND_RESPONSE)  # 수정 — created_at 유지, 완료 상태가 바뀔 때만 completed_at 갱신
 def update_todo(todo_id: int, payload: TodoIn) -> TodoItem:
     todos = load_todos()
     index = find_index(todos, todo_id)
@@ -122,7 +128,7 @@ def update_todo(todo_id: int, payload: TodoIn) -> TodoItem:
     return todo
 
 
-@app.delete("/todos/{todo_id}", status_code=204)  # 삭제
+@app.delete("/todos/{todo_id}", status_code=204, responses=NOT_FOUND_RESPONSE)  # 삭제
 def delete_todo(todo_id: int) -> None:
     todos = load_todos()
     del todos[find_index(todos, todo_id)]
