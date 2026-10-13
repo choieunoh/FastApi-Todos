@@ -64,6 +64,47 @@
           padding: .4rem;
         }
 
+        .view-toggle { display: flex; gap: .5rem; margin-top: .8rem; }
+        .view-toggle button { padding: .4rem .8rem; cursor: pointer; }
+        .view-toggle button.active { color: #fff; background: #333; border-color: #333; }
+
+        .calendar { margin-bottom: 1rem; }
+        .calendar[hidden] { display: none; }
+        .calendar-nav { display: flex; align-items: center; gap: .5rem; margin-bottom: .5rem; }
+        .calendar-nav strong { flex: 1; text-align: center; }
+        .calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 2px; }
+        .calendar-weekday { padding: .2rem 0; font-size: .8rem; text-align: center; color: #666; }
+        .calendar-day {
+          display: flex;
+          flex-direction: column;
+          align-items: stretch;
+          gap: .1rem;
+          min-height: 4.5rem;
+          padding: .2rem;
+          overflow: hidden;
+          font: inherit;
+          text-align: left;
+          background: #fff;
+          border: 1px solid #e5e5e5;
+          cursor: pointer;
+        }
+        .calendar-day.today { border-color: #2a4a8a; box-shadow: inset 0 0 0 1px #2a4a8a; }
+        .calendar-day.today .calendar-date { color: #2a4a8a; font-weight: bold; }
+        .calendar-day.selected { background: #f3f7ff; }
+        .calendar-date { font-size: .8rem; }
+        .calendar-chip {
+          overflow: hidden;
+          font-size: .72rem;
+          white-space: nowrap;
+          text-overflow: ellipsis;
+          color: #333;
+        }
+        .calendar-chip.high { font-weight: bold; }
+        .calendar-chip.done { color: #888; text-decoration: line-through; }
+        .calendar-chip.overdue { color: #b00020; }
+        .calendar-more { font-size: .72rem; color: #666; }
+        .calendar-selected { margin: .5rem 0 0; font-size: .9rem; color: #555; }
+
         .export-links { display: flex; align-items: center; gap: .5rem; margin-top: .8rem; font-size: .9rem; }
         .export-links a {
           padding: .3rem .7rem;
@@ -260,7 +301,21 @@
         <a href="/todos/export?format=csv" download data-testid="export-csv">CSV 내보내기</a>
         <a href="/todos/export?format=json" download data-testid="export-json">JSON 내보내기</a>
       </div>
+      <div class="view-toggle" data-testid="view-toggle" role="group" aria-label="보기">
+        <button type="button" data-view="list">목록</button>
+        <button type="button" data-view="calendar">캘린더</button>
+      </div>
     </div>
+    <section id="calendar" class="calendar" data-testid="calendar" aria-label="캘린더" hidden>
+      <div class="calendar-nav">
+        <button type="button" id="calendar-prev">이전</button>
+        <strong id="calendar-title" aria-live="polite"></strong>
+        <button type="button" id="calendar-next">다음</button>
+        <button type="button" id="calendar-today">오늘</button>
+      </div>
+      <div class="calendar-grid" id="calendar-grid"></div>
+      <p class="calendar-selected" id="calendar-selected"></p>
+    </section>
     <div class="bulk-bar" data-testid="bulk-bar" aria-label="일괄 작업">
       <span id="bulk-count" aria-live="polite">0개 선택</span>
       <button type="button" id="bulk-select-all" data-testid="bulk-select-all">보이는 항목 전체 선택</button>
@@ -295,6 +350,12 @@
 
         let allTodos = [];
         let currentFilter = "all";
+
+        let currentView = "list";                // "list" | "calendar"
+        let calendarMonth = null;                // 캘린더에 보이는 달 { year, month(0~11) } — 처음 열 때 이번 달
+        let selectedDate = null;                 // 캘린더에서 고른 날짜 (YYYY-MM-DD)
+        const CALENDAR_CHIPS = 3;                // 날짜 칸에 보여줄 최대 항목 수 (나머지는 +N)
+        const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"];
         let favoriteOnly = false;                // 즐겨찾기만 보기 (다른 필터와 AND)
 
         const UNDO_MS = 5000;                    // 실행 취소 토스트를 보여주는 시간 (서버 보관은 30초)
@@ -438,13 +499,19 @@
           favoriteFilterEl.classList.toggle("active", favoriteOnly);
           favoriteFilterEl.setAttribute("aria-pressed", favoriteOnly);
 
+          // 캘린더 보기에서는 고른 날짜의 항목만 목록에 보인다 (일괄 작업도 이 목록 기준)
+          const visible = currentView === "list" ? filtered
+            : filtered.filter((todo) => selectedDate && todo.due_date === selectedDate);
+
           // 필터로 가려진 항목은 선택에서 뺀다
-          visibleIds = filtered.map((todo) => todo.id);
+          visibleIds = visible.map((todo) => todo.id);
           for (const id of [...selectedIds]) if (!visibleIds.includes(id)) selectedIds.delete(id);
 
           const today = todayStr();
           renderStats(today);
-          render(filtered, today);
+          renderViewToggle();
+          renderCalendar(filtered, today);
+          render(visible, today);
           renderBulkBar();
         }
 
@@ -456,6 +523,95 @@
           $("bulk-select-all").disabled = visibleIds.length === 0;
           for (const id of ["bulk-complete", "bulk-uncomplete", "bulk-delete"]) $(id).disabled = count === 0;
         }
+
+        // ---------- 캘린더 — 서버 변경 없이 필터를 거친 목록을 마감일별로 그린다 ----------
+        function renderViewToggle() {
+          document.querySelectorAll("[data-view]").forEach((btn) => {
+            const active = btn.dataset.view === currentView;
+            btn.classList.toggle("active", active);
+            btn.setAttribute("aria-pressed", active);
+          });
+          $("calendar").hidden = currentView !== "calendar";
+        }
+
+        function setCalendarMonth(year, month) {
+          const first = new Date(year, month, 1);  // 13월·0월은 Date 가 연도를 넘겨 맞춘다
+          calendarMonth = { year: first.getFullYear(), month: first.getMonth() };
+          selectedDate = null;                     // 다른 달로 가면 고른 날짜는 풀린다
+          applyFilters();
+        }
+
+        function calendarChip(todo, today) {
+          const marks = `${todo.favorite ? "★" : ""}${todo.recurrence && todo.recurrence !== DEFAULT_RECURRENCE ? "🔁" : ""}`;
+          const classes = ["calendar-chip"];
+          if (todo.completed) classes.push("done");
+          else if (isOverdue(todo, today)) classes.push("overdue");
+          if (todo.priority === PRIORITIES[0]) classes.push("high");
+          const chip = el("span", { className: classes.join(" "), textContent: marks ? `${marks} ${todo.title}` : todo.title });
+          chip.dataset.testid = "calendar-chip";
+          chip.title = todo.title;
+          return chip;
+        }
+
+        function renderCalendar(filtered, today) {
+          if (currentView !== "calendar") return;
+          if (!calendarMonth) {
+            const now = new Date();
+            calendarMonth = { year: now.getFullYear(), month: now.getMonth() };
+          }
+          const { year, month } = calendarMonth;
+          $("calendar-title").textContent = `${year}년 ${month + 1}월`;
+
+          const byDate = new Map();                // 필터를 거친 순서(정렬 반영) 그대로 날짜별로 모은다
+          for (const todo of filtered) {
+            if (!todo.due_date) continue;          // 마감일 없는 항목은 캘린더에 없다
+            if (!byDate.has(todo.due_date)) byDate.set(todo.due_date, []);
+            byDate.get(todo.due_date).push(todo);
+          }
+
+          const cells = WEEKDAYS.map((name) => el("div", { className: "calendar-weekday", textContent: name }));
+          const leading = new Date(year, month, 1).getDay();          // 일요일 시작
+          const days = new Date(year, month + 1, 0).getDate();        // 그 달 마지막 날 (윤년 2월 포함)
+          for (let i = 0; i < leading; i++) cells.push(el("div"));    // 다른 달 칸은 비워 둔다
+          for (let day = 1; day <= days; day++) {
+            const date = ymd(new Date(year, month, day));
+            const todos = byDate.get(date) || [];
+            const cell = el("button", { type: "button", className: "calendar-day" });
+            cell.dataset.testid = "calendar-day";
+            cell.dataset.date = date;
+            if (date === today) {
+              cell.classList.add("today");
+              cell.setAttribute("aria-current", "date");
+            }
+            if (date === selectedDate) cell.classList.add("selected");
+            cell.setAttribute("aria-pressed", date === selectedDate);
+            cell.append(el("span", { className: "calendar-date", textContent: day }),
+              ...todos.slice(0, CALENDAR_CHIPS).map((todo) => calendarChip(todo, today)));
+            if (todos.length > CALENDAR_CHIPS) {
+              cell.append(el("span", { className: "calendar-more", textContent: `+${todos.length - CALENDAR_CHIPS}` }));
+            }
+            cell.onclick = () => { selectedDate = date; applyFilters(); };
+            cells.push(cell);
+          }
+          $("calendar-grid").replaceChildren(...cells);
+
+          const count = selectedDate ? (byDate.get(selectedDate) || []).length : 0;
+          $("calendar-selected").textContent = !selectedDate ? "날짜를 누르면 그날 마감인 할 일을 볼 수 있습니다."
+            : count ? `${selectedDate} 마감 ${count}개` : `${selectedDate}에 마감인 할 일이 없습니다.`;
+        }
+
+        document.querySelectorAll("[data-view]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            currentView = btn.dataset.view;
+            applyFilters();
+          });
+        });
+        $("calendar-prev").onclick = () => setCalendarMonth(calendarMonth.year, calendarMonth.month - 1);
+        $("calendar-next").onclick = () => setCalendarMonth(calendarMonth.year, calendarMonth.month + 1);
+        $("calendar-today").onclick = () => {
+          const now = new Date();
+          setCalendarMonth(now.getFullYear(), now.getMonth());
+        };
 
         // 통계는 필터와 상관없이 전체 목록 기준
         function renderStats(today) {
