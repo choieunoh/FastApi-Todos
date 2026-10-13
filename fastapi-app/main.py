@@ -1,12 +1,12 @@
 import json
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, StrictBool, StringConstraints, field_validator
+from pydantic import BaseModel, Field, StrictBool, StringConstraints, field_validator
 
 BASE_DIR = Path(__file__).resolve().parent       # main.py 가 있는 폴더
 TODO_FILE = Path(os.environ.get("TODO_FILE", BASE_DIR / "todo.json"))  # 테스트에서 바꿔 쓸 수 있다
@@ -19,6 +19,8 @@ app = FastAPI(title="To-Do List API")
 
 Priority = Literal["높음", "보통", "낮음"]
 MAX_TAGS, MAX_TAG_LEN = 10, 20
+UNDO_TTL = timedelta(seconds=30)                 # 삭제 후 복구할 수 있는 시간
+UNDO_MAX = 50                                    # 복구 버퍼에 담아 두는 최대 건수
 
 
 class TodoIn(BaseModel):                         # 클라이언트가 보내는 데이터 — 시각 필드는 받지 않는다
@@ -62,8 +64,37 @@ class TodoItem(TodoIn):                          # 서버가 돌려주는 데이
     completed_at: datetime | None = None
 
 
+class RestoreIn(BaseModel):                      # 삭제 실행 취소 요청
+    ids: list[int] = Field(min_length=1, max_length=UNDO_MAX)
+
+
+class DeletedEntry(BaseModel):                   # 복구 버퍼 항목 — 원래 자리와 삭제 시각을 함께 둔다
+    todo: TodoItem
+    position: int
+    deleted_at: datetime
+
+
+# 삭제 직후 복구용 메모리 버퍼 (id → 항목, 오래된 것부터). 재시작하면 비워진다
+RECENTLY_DELETED: dict[int, DeletedEntry] = {}
+
+
 def now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def prune_deleted() -> None:
+    # 시간이 지난 항목을 버리고, 최대 건수를 넘으면 오래된 것부터 버린다
+    limit = now() - UNDO_TTL
+    for todo_id in [i for i, e in RECENTLY_DELETED.items() if e.deleted_at <= limit]:
+        del RECENTLY_DELETED[todo_id]
+    while len(RECENTLY_DELETED) > UNDO_MAX:
+        del RECENTLY_DELETED[next(iter(RECENTLY_DELETED))]
+
+
+def next_id(todos: list[TodoItem]) -> int:
+    # 복구 대기 중인 id 도 피해서 매긴다 (복구할 때 id 가 겹치지 않게)
+    prune_deleted()
+    return max([t.id for t in todos] + list(RECENTLY_DELETED), default=0) + 1
 
 
 def load_todos() -> list[TodoItem]:
@@ -97,16 +128,31 @@ def get_todos() -> list[TodoItem]:
 @app.post("/todos", status_code=201)             # 추가 — id·시각은 서버가 매긴다
 def create_todo(payload: TodoIn) -> TodoItem:
     todos = load_todos()
-    new_id = max((t.id for t in todos), default=0) + 1
     created = now()
     todo = TodoItem(
-        id=new_id,
+        id=next_id(todos),
         created_at=created,
         completed_at=created if payload.completed else None,
         **payload.model_dump(),
     )
     save_todos(todos + [todo])
     return todo
+
+
+@app.post("/todos/restore", responses={404: {"description": "복구할 수 없는 항목이 있음"}})  # 삭제 실행 취소
+def restore_todos(payload: RestoreIn) -> list[TodoItem]:
+    prune_deleted()
+    ids = list(dict.fromkeys(payload.ids))       # 중복 제거, 순서 유지
+    missing = [i for i in ids if i not in RECENTLY_DELETED]
+    if missing:                                  # 하나라도 복구할 수 없으면 아무것도 바꾸지 않는다
+        raise HTTPException(404, f"복구할 수 없는 항목입니다: {missing}")
+    todos = load_todos()
+    # 지운 순서의 역순으로 넣어야 각 항목이 지울 때의 자리로 돌아간다
+    for todo_id in [i for i in reversed(RECENTLY_DELETED) if i in ids]:
+        entry = RECENTLY_DELETED.pop(todo_id)
+        todos.insert(min(entry.position, len(todos)), entry.todo)
+    save_todos(todos)
+    return [todos[find_index(todos, i)] for i in ids]
 
 
 @app.put("/todos/{todo_id}", responses=NOT_FOUND_RESPONSE)  # 수정 — created_at 유지, 완료 상태가 바뀔 때만 completed_at 갱신
@@ -129,11 +175,15 @@ def update_todo(todo_id: int, payload: TodoIn) -> TodoItem:
     return todo
 
 
-@app.delete("/todos/{todo_id}", status_code=204, responses=NOT_FOUND_RESPONSE)  # 삭제
+@app.delete("/todos/{todo_id}", status_code=204, responses=NOT_FOUND_RESPONSE)  # 삭제 — 잠시 복구 버퍼에 남긴다
 def delete_todo(todo_id: int) -> None:
     todos = load_todos()
-    del todos[find_index(todos, todo_id)]
+    index = find_index(todos, todo_id)
+    todo = todos.pop(index)
     save_todos(todos)
+    RECENTLY_DELETED.pop(todo_id, None)
+    RECENTLY_DELETED[todo_id] = DeletedEntry(todo=todo, position=index, deleted_at=now())
+    prune_deleted()
 
 
 @app.get("/", include_in_schema=False)           # 화면 서빙

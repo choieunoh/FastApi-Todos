@@ -89,6 +89,29 @@
 
         .edit-form { flex: 1; margin: 0; }
 
+        .undo-toast {
+          position: fixed;
+          left: 50%;
+          bottom: 1.5rem;
+          transform: translateX(-50%);
+          display: flex;
+          align-items: center;
+          gap: .8rem;
+          padding: .6rem 1rem;
+          color: #fff;
+          background: #333;
+          border-radius: 6px;
+          box-shadow: 0 2px 8px rgba(0, 0, 0, .25);
+        }
+        .undo-toast[hidden] { display: none; }
+        .undo-toast button {
+          color: #ffd54f;
+          font-weight: bold;
+          background: none;
+          border: none;
+          cursor: pointer;
+        }
+
         .favorite {
           padding: 0 .2rem;
           font-size: 1.2rem;
@@ -167,6 +190,10 @@
     </div>
     <p id="error" role="alert" hidden></p>
     <ul id="todo-list"></ul>
+    <div id="undo-toast" class="undo-toast" data-testid="undo-toast" role="status" hidden>
+      <span id="undo-message"></span>
+      <button type="button" id="undo-button" data-testid="undo-button">실행 취소</button>
+    </div>
     <script>
         const $ = (id) => document.getElementById(id);
         const listEl = $("todo-list"), errorEl = $("error");
@@ -185,6 +212,10 @@
         let allTodos = [];
         let currentFilter = "all";
         let favoriteOnly = false;                // 즐겨찾기만 보기 (다른 필터와 AND)
+
+        const UNDO_MS = 5000;                    // 실행 취소 토스트를 보여주는 시간 (서버 보관은 30초)
+        let undoIds = [];                        // 마지막 삭제에서 지운 id들
+        let undoTimer = null;
         let editingId = null;                    // 수정 폼이 열린 항목 (한 번에 하나)
 
         // 모든 요청을 한 곳에서 처리하고, 실패는 조용히 넘기지 않는다
@@ -451,8 +482,36 @@
 
         function remove(id) {
           if (!confirm("정말 삭제할까요?")) return;
-          run("삭제", async () => { await api(`/todos/${id}`, "DELETE"); await load(); });
+          run("삭제", async () => {
+            await api(`/todos/${id}`, "DELETE");
+            showUndo([id]);
+            await load();
+          });
         }
+
+        // 삭제 직후 실행 취소 토스트 — 새 삭제가 일어나면 내용을 바꾸고 시간을 다시 잰다
+        function showUndo(ids) {
+          undoIds = ids;
+          $("undo-message").textContent = `${ids.length}개 삭제됨`;
+          $("undo-toast").hidden = false;
+          clearTimeout(undoTimer);
+          undoTimer = setTimeout(hideUndo, UNDO_MS);
+        }
+
+        function hideUndo() {
+          clearTimeout(undoTimer);
+          $("undo-toast").hidden = true;
+          undoIds = [];
+        }
+
+        $("undo-button").onclick = () => {
+          const ids = undoIds;
+          hideUndo();
+          run("실행 취소", async () => {
+            await api("/todos/restore", "POST", { ids });
+            await load();
+          });
+        };
 
         priorityOptions($("priority"), DEFAULT_PRIORITY);
 
