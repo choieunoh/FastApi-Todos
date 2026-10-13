@@ -765,3 +765,122 @@ def test_subtasks_kept_through_edit_bulk_and_undo(page: Page, seed):
     expect(progress(page, "최종 보고서")).to_have_text("1/2 (50%)")
     expand(page, "최종 보고서")
     expect(subtasks_of(page, "최종 보고서").locator("span")).to_have_text(["자료 조사", "초안 작성"])
+
+
+# ---------- 5.0.0 5단계: 반복 일정 ----------
+
+def by_due(page: Page, title: str, due: str):
+    # 다음 일정은 제목이 같으므로 마감일로 구분한다
+    return page.locator(ITEM).filter(has_text=title).filter(has_text=f"마감일: {due}")
+
+
+def badge(row):
+    return row.get_by_test_id("recurrence-badge")
+
+
+def test_recurrence_add_form(page: Page, seed):
+    open_app(page)
+    select = page.locator("#recurrence")
+    expect(select.locator("option")).to_have_text(["반복 없음", "매일", "매주", "매월"])
+    expect(select).to_have_value("none")
+
+    page.locator("#title").fill("주간 회의")
+    page.locator("#due-date").fill("2026-10-13")
+    select.select_option("weekly")
+    page.get_by_role("button", name="Add To-Do").click()
+    expect(badge(item(page, "주간 회의"))).to_have_text("🔁 매주")
+    expect(select).to_have_value("none")                                  # 추가 후 기본값으로 돌아간다
+
+    page.locator("#title").fill("일반 할 일")
+    page.get_by_role("button", name="Add To-Do").click()
+    expect(page.locator(ITEM)).to_have_count(2)
+    expect(badge(item(page, "일반 할 일"))).to_have_count(0)              # 반복 없음이면 배지 없음
+
+
+def test_recurrence_without_due_date_shows_error(page: Page, seed):
+    open_app(page)
+    page.locator("#title").fill("마감 없는 반복")
+    page.locator("#recurrence").select_option("daily")
+    page.get_by_role("button", name="Add To-Do").click()
+    expect(page.locator("#error")).to_contain_text("추가 실패")
+    expect(page.locator(ITEM)).to_have_count(0)
+
+
+def test_recurrence_edit_form_set_change_clear(page: Page, seed):
+    seed([todo(1, "운동", due_date="2026-10-13")])
+    open_app(page)
+    row = item(page, "운동")
+    expect(badge(row)).to_have_count(0)
+
+    for value, label in (("monthly", "🔁 매월"), ("daily", "🔁 매일")):
+        row.get_by_role("button", name="Edit").click()
+        page.get_by_test_id("edit-form").get_by_label("반복").select_option(value)
+        page.get_by_test_id("edit-save").click()
+        expect(badge(row)).to_have_text(label)
+
+    row.get_by_role("button", name="Edit").click()
+    expect(page.get_by_test_id("edit-form").get_by_label("반복")).to_have_value("daily")   # 현재 값이 채워진다
+    page.get_by_test_id("edit-form").get_by_label("반복").select_option("none")
+    page.get_by_test_id("edit-save").click()
+    expect(badge(row)).to_have_count(0)
+    page.reload()
+    expect(badge(row)).to_have_count(0)
+    expect(page.locator(ITEM)).to_have_count(1)
+
+
+def test_recurrence_edit_clearing_due_date_shows_error(page: Page, seed):
+    seed([todo(1, "운동", due_date="2026-10-13", recurrence="weekly")])
+    open_app(page)
+    item(page, "운동").get_by_role("button", name="Edit").click()
+    page.get_by_test_id("edit-form").get_by_label("마감일").fill("")
+    page.get_by_test_id("edit-save").click()
+    expect(page.locator("#error")).to_contain_text("수정 실패")
+    expect(page.get_by_test_id("edit-form")).to_be_visible()
+
+
+def test_recurrence_check_creates_next_once(page: Page, seed):
+    seed([todo(1, "주간 회의", due_date="2026-10-13", recurrence="weekly", favorite=True, tags=["회사"],
+               subtasks=[sub(1, "자료", True), sub(2, "발표")]), todo(2, "다른 일")])
+    open_app(page)
+    assert stats(page) == ("2", "0", "2", "0", "0%")
+
+    by_due(page, "주간 회의", "2026-10-13").locator(DONE_BOX).check()
+    nxt = by_due(page, "주간 회의", "2026-10-20")
+    expect(nxt).to_have_count(1)
+    assert stats(page) == ("3", "1", "2", "0", "33%")
+    expect(nxt.locator(DONE_BOX)).not_to_be_checked()
+    expect(badge(nxt)).to_have_text("🔁 매주")
+    expect(nxt.get_by_test_id("favorite-toggle")).to_have_text("★")
+    expect(nxt.get_by_test_id("todo-tag")).to_have_text(["#회사"])
+    expect(nxt.get_by_test_id("subtask-progress")).to_have_text("0/2 (0%)")       # 하위는 미완료로 복사
+    expect(by_due(page, "주간 회의", "2026-10-13").get_by_test_id("subtask-progress")).to_have_text("1/2 (50%)")
+
+    original = by_due(page, "주간 회의", "2026-10-13").locator(DONE_BOX)
+    original.uncheck()
+    expect(page.get_by_test_id("stat-completed")).to_have_text("0")
+    original.check()
+    expect(page.get_by_test_id("stat-completed")).to_have_text("1")
+    expect(page.locator(ITEM)).to_have_count(3)                            # 다시 완료해도 또 만들지 않는다
+    page.reload()
+    expect(page.locator(ITEM)).to_have_count(3)
+
+
+def test_recurrence_bulk_complete_creates_next(page: Page, seed):
+    seed([todo(1, "월말 정산", due_date="2026-01-31", recurrence="monthly"), todo(2, "메모")])
+    open_app(page)
+    pick(page, "월말 정산", "메모")
+    page.get_by_test_id("bulk-complete").click()
+    expect(by_due(page, "월말 정산", "2026-02-28")).to_have_count(1)
+    expect(page.locator(ITEM)).to_have_count(3)
+    # 다음 일정(2/28)도 오늘(10/12)보다 앞이라 바로 기한 초과다 — 지난 날짜를 건너뛰지 않는 규칙
+    assert stats(page) == ("3", "2", "1", "1", "67%")
+    expect(by_due(page, "월말 정산", "2026-02-28").locator(".content > span").first).to_contain_text("⚠ 기한 초과")
+
+
+def test_recurrence_kept_through_delete_undo(page: Page, seed):
+    seed([todo(1, "매일 운동", due_date="2026-10-13", recurrence="daily")])
+    open_app(page)
+    delete_item(page, "매일 운동")
+    expect(page.locator(ITEM)).to_have_count(0)
+    page.get_by_test_id("undo-button").click()
+    expect(badge(item(page, "매일 운동"))).to_have_text("🔁 매일")

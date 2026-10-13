@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -627,3 +627,194 @@ def test_v4_data_without_subtasks(isolated_file):
     )
     assert client.get("/todos").json()[0]["subtasks"] == []
     assert add_sub(1, "처음").json()["subtasks"] == [{"id": 1, "title": "처음", "completed": False}]
+
+
+# ---------- 5.0.0 5단계: 반복 일정 ----------
+
+def todos_now() -> list[dict]:
+    return client.get("/todos").json()
+
+
+def test_recurrence_defaults_to_none():
+    body = create().json()
+    assert (body["recurrence"], body["next_spawned"]) == ("none", False)
+
+
+@pytest.mark.parametrize("recurrence", ["daily", "weekly", "monthly"])
+def test_recurrence_requires_due_date(recurrence):
+    assert create(recurrence=recurrence).status_code == 422
+    assert create(recurrence=recurrence, due_date="").status_code == 422
+    todo_id = create(recurrence=recurrence, due_date="2026-10-13").json()["id"]
+    assert put(todo_id, recurrence=recurrence).status_code == 422           # 수정에서 마감일을 빼도 422
+
+
+@pytest.mark.parametrize("value", ["yearly", "매주", "", None, 1])
+def test_recurrence_invalid_value(value):
+    assert create(recurrence=value, due_date="2026-10-13").status_code == 422
+
+
+def test_recurrence_set_change_and_clear_with_put():
+    todo_id = create(due_date="2026-10-13").json()["id"]
+    assert put(todo_id, due_date="2026-10-13", recurrence="weekly").json()["recurrence"] == "weekly"
+    assert put(todo_id, due_date="2026-10-13", recurrence="monthly").json()["recurrence"] == "monthly"
+    assert put(todo_id, due_date="2026-10-13", recurrence="none").json()["recurrence"] == "none"
+    assert len(todos_now()) == 1                                            # 미완료 수정은 새 일정을 만들지 않는다
+
+
+@pytest.mark.parametrize("recurrence, due, expected", [
+    ("daily", "2026-10-13", "2026-10-14"),
+    ("daily", "2026-12-31", "2027-01-01"),
+    ("daily", "2028-02-28", "2028-02-29"),
+    ("weekly", "2026-10-13", "2026-10-20"),
+    ("weekly", "2026-12-28", "2027-01-04"),
+    ("monthly", "2026-10-13", "2026-11-13"),
+    ("monthly", "2026-12-15", "2027-01-15"),
+    ("monthly", "2026-01-31", "2026-02-28"),
+    ("monthly", "2028-01-31", "2028-02-29"),                                # 윤년
+    ("monthly", "2026-03-31", "2026-04-30"),
+    ("monthly", "2026-02-28", "2026-03-28"),                                # 직전 마감일 기준
+])
+def test_complete_spawns_next_due_date(recurrence, due, expected):
+    todo_id = create(title="반복", recurrence=recurrence, due_date=due).json()["id"]
+    res = put(todo_id, title="반복", recurrence=recurrence, due_date=due, completed=True)
+    assert res.status_code == 200
+    assert (res.json()["completed"], res.json()["next_spawned"]) == (True, True)
+    original, spawned = todos_now()
+    assert original["id"] == todo_id
+    assert spawned["id"] == todo_id + 1
+    assert (spawned["due_date"], spawned["completed"], spawned["completed_at"], spawned["next_spawned"]) == \
+        (expected, False, None, False)
+
+
+def test_monthly_chain_keeps_clamped_day():
+    todo_id = create(title="월말", recurrence="monthly", due_date="2026-01-31").json()["id"]
+    dues = ["2026-01-31"]
+    for _ in range(3):
+        current = todos_now()[-1]
+        put(current["id"], title="월말", recurrence="monthly", due_date=current["due_date"], completed=True)
+        dues.append(todos_now()[-1]["due_date"])
+    assert dues == ["2026-01-31", "2026-02-28", "2026-03-28", "2026-04-28"]
+    assert todos_now()[0]["id"] == todo_id
+
+
+def test_late_completion_uses_due_date_not_today():
+    todo_id = create(title="밀린 일", recurrence="daily", due_date="2020-01-01").json()["id"]
+    put(todo_id, title="밀린 일", recurrence="daily", due_date="2020-01-01", completed=True)
+    assert todos_now()[-1]["due_date"] == "2020-01-02"                       # 이미 지난 날짜여도 한 주기만
+
+
+def test_spawn_copies_spec_fields_and_resets_subtasks():
+    created = create(title="주간 회의", description="안건 정리", priority="높음", tags=["회사", "회의"],
+                     favorite=True, recurrence="weekly", due_date="2026-10-13").json()
+    add_sub(created["id"], "자료")
+    add_sub(created["id"], "발표")
+    del_sub(created["id"], 1)                                               # sid 2 만 남는다
+    add_sub(created["id"], "정리")                                           # sid 3
+    put_sub(created["id"], 3, title="정리", completed=True)
+
+    put(created["id"], title="주간 회의", description="안건 정리", priority="높음", tags=["회사", "회의"],
+        favorite=True, recurrence="weekly", due_date="2026-10-13", completed=True)
+    original, spawned = todos_now()
+    for key in ("title", "description", "priority", "tags", "favorite", "recurrence"):
+        assert spawned[key] == original[key]
+    assert spawned["due_date"] == "2026-10-20"
+    assert spawned["subtasks"] == [{"id": 1, "title": "발표", "completed": False},
+                                   {"id": 2, "title": "정리", "completed": False}]   # 미완료, sid 새로
+    assert datetime.fromisoformat(spawned["created_at"]) >= datetime.fromisoformat(original["created_at"])
+    assert original["subtasks"] == [{"id": 2, "title": "발표", "completed": False},
+                                    {"id": 3, "title": "정리", "completed": True}]   # 원본은 그대로
+
+
+def test_recomplete_does_not_spawn_again():
+    todo_id = create(title="반복", recurrence="daily", due_date="2026-10-13").json()["id"]
+    body = {"title": "반복", "recurrence": "daily", "due_date": "2026-10-13"}
+    put(todo_id, **body, completed=True)
+    off = put(todo_id, **body, completed=False).json()
+    assert (off["completed_at"], off["next_spawned"]) == (None, True)
+    put(todo_id, **body, completed=True)
+    put(todo_id, **body, completed=True)                                    # 완료 상태 그대로 수정
+    assert len(todos_now()) == 2
+
+
+def test_client_cannot_set_next_spawned():
+    todo_id = create(title="반복", recurrence="daily", due_date="2026-10-13", next_spawned=True).json()["id"]
+    assert todos_now()[0]["next_spawned"] is False
+    put(todo_id, title="반복", recurrence="daily", due_date="2026-10-13", next_spawned=True, completed=True)
+    assert len(todos_now()) == 2                                            # 본문의 next_spawned 는 무시된다
+    off = put(todo_id, title="반복", recurrence="daily", due_date="2026-10-13", next_spawned=False).json()
+    assert off["next_spawned"] is True                                      # 서버 값 유지
+
+
+def test_non_recurring_completion_does_not_spawn():
+    todo_id = create(due_date="2026-10-13").json()["id"]
+    assert put(todo_id, due_date="2026-10-13", completed=True).json()["next_spawned"] is False
+    assert len(todos_now()) == 1
+
+
+def test_create_completed_recurring_spawns():
+    res = create(title="바로 완료", recurrence="monthly", due_date="2026-10-31", completed=True)
+    assert res.status_code == 201
+    assert (res.json()["completed"], res.json()["next_spawned"]) == (True, True)
+    created, spawned = todos_now()
+    assert created == res.json()
+    assert (spawned["id"], spawned["due_date"], spawned["completed"]) == (created["id"] + 1, "2026-11-30", False)
+
+
+def test_bulk_complete_spawns_once_each():
+    a = create(title="매일", recurrence="daily", due_date="2026-10-13").json()["id"]
+    b = create(title="일반").json()["id"]
+    c = create(title="매월", recurrence="monthly", due_date="2026-01-31").json()["id"]
+    done = create(title="이미 완료", recurrence="weekly", due_date="2026-10-13", completed=True).json()["id"]
+    assert len(todos_now()) == 5                                            # done 은 생성 때 이미 다음 일정을 만들었다
+
+    res = bulk([a, b, c, done], "complete")
+    assert res.status_code == 200
+    assert [t["id"] for t in res.json()["updated"]] == [a, b, c, done]     # 응답 형식은 그대로
+    after = todos_now()
+    assert len(after) == 7                                                  # a, c 의 다음 일정만 추가
+    assert [(t["title"], t["due_date"]) for t in after[5:]] == [("매일", "2026-10-14"), ("매월", "2026-02-28")]
+    assert len({t["id"] for t in after}) == 7                               # id 가 겹치지 않는다
+
+    bulk([a, c], "uncomplete")
+    bulk([a, c], "complete")
+    assert len(todos_now()) == 7                                            # 다시 완료해도 또 만들지 않는다
+
+
+def test_spawned_id_skips_deleted_buffer():
+    todo_id = create(title="반복", recurrence="daily", due_date="2026-10-13").json()["id"]
+    other = create().json()["id"]
+    delete(other)                                                           # 최대 id 가 복구 버퍼에 있다
+    put(todo_id, title="반복", recurrence="daily", due_date="2026-10-13", completed=True)
+    assert todos_now()[-1]["id"] == other + 1
+    assert restore(other).status_code == 200
+
+
+def test_restore_keeps_recurrence_and_next_spawned():
+    todo_id = create(title="반복", recurrence="weekly", due_date="2026-10-13", completed=True).json()["id"]
+    original = todos_now()[0]
+    delete(todo_id)
+    assert restore(todo_id).json() == [original]
+    put(todo_id, title="반복", recurrence="weekly", due_date="2026-10-13", completed=False)
+    put(todo_id, title="반복", recurrence="weekly", due_date="2026-10-13", completed=True)
+    assert len(todos_now()) == 2                                            # 복구 후에도 중복 생성 없음
+
+
+def test_v4_data_without_recurrence(isolated_file):
+    isolated_file.write_text(
+        '[{"id": 1, "title": "v4", "description": "", "completed": false, "priority": "보통",'
+        ' "due_date": "2026-10-13", "tags": [], "created_at": null, "completed_at": null,'
+        ' "favorite": false, "subtasks": []}]',
+        encoding="utf-8",
+    )
+    body = client.get("/todos").json()[0]
+    assert (body["recurrence"], body["next_spawned"]) == ("none", False)
+    put(1, title="v4", due_date="2026-10-13", completed=True)
+    assert len(todos_now()) == 1
+
+
+def test_add_months_unit():
+    assert main.add_months(date(2026, 1, 31), 1) == date(2026, 2, 28)
+    assert main.add_months(date(2024, 1, 31), 1) == date(2024, 2, 29)
+    assert main.add_months(date(2026, 11, 30), 1) == date(2026, 12, 30)
+    assert main.add_months(date(2026, 12, 31), 1) == date(2027, 1, 31)
+    assert main.add_months(date(2026, 8, 31), 1) == date(2026, 9, 30)
