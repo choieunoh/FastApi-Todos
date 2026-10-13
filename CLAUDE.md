@@ -173,6 +173,10 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - `POST /todos/{id}/subtasks` `{title}` → 201, `PUT /todos/{id}/subtasks/{sid}` `{title, completed}` → 200, `DELETE /todos/{id}/subtasks/{sid}` → 204. 없는 todo/sid는 404. 응답은 갱신된 Todo(삭제 제외).
 - 하위 제목은 trim 후 1~100자, 상위 할 일당 최대 20개. sid는 그 할 일 안에서 최대 sid + 1.
 - 상위 할 일의 `completed`와 **연동하지 않는다**. 진행률 `완료/전체 (N%)`만 보여주고, 하위가 0개면 진행률을 숨긴다.
+- 조회는 별도 경로 없이 `GET /todos` 응답의 `subtasks`로 한다.
+- `PUT .../subtasks/{sid}`는 전체 교체라 `title`, `completed`(bool)가 모두 필수다. 빠지면 422.
+- 상위 PUT·bulk·삭제·복구는 `subtasks`를 그대로 유지한다.
+- UI: 하위 목록은 기본으로 접혀 있다. 펼친 상태는 다시 그려도 유지되고 새로고침하면 접힌다. 진행률은 접혀 있어도 보인다. 제목은 [수정] 버튼 → 인라인 입력으로 고치며(Enter 저장, Esc 취소) 한 번에 하나만 연다. 삭제는 상위 할 일과 같은 `confirm()`을 거치고, 취소하면 요청을 보내지 않는다(하위 삭제는 실행 취소가 없다).
 
 ### 15. 반복 일정 (5단계)
 - `recurrence`가 `none`이 아니면 `due_date`가 필수다 (없으면 422).
@@ -233,7 +237,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - 우선순위·반복 종류·클라이언트 필드 목록 같은 상수는 한 곳에만 정의한다.
 - **테스트용 선택자**: UI 테스트 대상 요소에는 `data-testid`를 붙인다.
   - v4: `todo-item`, `todo-tag`, `tag-filter`, `edit-form`, `edit-save`, `edit-cancel`, `stat-total`, `stat-completed`, `stat-active`, `stat-overdue`, `stat-rate`, `dday`
-  - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`
+  - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-toggle`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`
 - **커밋**: Conventional Commits 형식이다 (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
   - 기능 커밋 예: `feat: add favorites for Version 5.0.0`
 
@@ -262,8 +266,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - [x] 3-2. UI: 선택 개수 표시, 전체 선택은 보이는 항목만, 일괄 완료 후 통계 즉시 갱신, 일괄 삭제 → confirm → 토스트 → 실행 취소로 전부 복구.
 
 ### 4. 하위 할 일
-- [ ] 4-1. API: 추가 201, 수정 200, 삭제 204, 없는 todo/sid 404, 공백·101자 제목 422, 21번째 추가 422. 상위 PUT 본문의 `subtasks`는 무시된다. 상위 `completed`는 하위와 무관하다.
-- [ ] 4-2. UI: 추가/체크/제목 수정/삭제가 반영되고 새로고침 후에도 유지된다. 진행률 `1/2 (50%)`, 0개면 숨김. 상위 통계는 바뀌지 않는다.
+- [x] 4-1. API: 추가 201, 수정 200, 삭제 204, 없는 todo/sid 404, 공백·101자 제목 422, 21번째 추가 422. 상위 PUT 본문의 `subtasks`는 무시된다. 상위 `completed`는 하위와 무관하다.
+- [x] 4-2. UI: 추가/체크/제목 수정/삭제(confirm 수락 시만)가 반영되고 새로고침 후에도 유지된다. 진행률 `1/2 (50%)`, 0개면 숨김. 상위 통계는 바뀌지 않는다.
 
 ### 5. 반복 일정
 - [ ] 5-1. API: 반복 + 마감일 없음 → 422. daily/weekly/monthly 완료 시 다음 마감일 항목 생성. 1/31 monthly → 2/28(윤년 2/29). 완료 취소 후 재완료해도 추가 생성 없음. 하위는 미완료로 복사. bulk complete와 `completed:true` POST에서도 동작.
