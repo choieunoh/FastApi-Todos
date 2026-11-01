@@ -29,9 +29,9 @@ FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 데이터는 JSON 파�
 ```bash
 docker compose up --build fastapi-app
 ```
-http://localhost:5004 에서 열립니다.
+http://localhost:5001 에서 열립니다 (컨테이너 이름 `FastApi-app`, 내부 포트 8000).
 
-> **주의**: 작업 템플릿(`task_templates.json`)은 컨테이너 안에만 저장됩니다. 볼륨을 설정하지 않았으므로 컨테이너를 다시 만들면(`docker compose up --build` 등) 저장한 템플릿이 사라집니다. 데이터 보존은 이후 배포 설정 단계에서 다룰 예정입니다.
+할 일과 작업 템플릿은 Docker 볼륨 `fastapi_todos_fastapi-data`(컨테이너 안 `/app/data`)에 저장되므로 컨테이너를 다시 만들어도 유지됩니다. 백업·복구·재배포 절차는 아래 [배포와 데이터 관리](#배포와-데이터-관리)를 보세요.
 
 ### 로컬
 ```bash
@@ -67,6 +67,144 @@ CSV 컬럼은 `id,title,description,completed,priority,due_date,tags,favorite,re
 
 서버를 띄운 뒤 http://localhost:8000/docs 에서 요청·응답 스키마를 볼 수 있습니다.
 
+## 배포와 데이터 관리
+명령은 모두 **배포 서버(Linux)의 저장소 루트**에서 실행합니다.
+
+### 구성
+| 항목 | 값 |
+|---|---|
+| 컨테이너 | `FastApi-app` (서비스 `fastapi-app`), 이전 이름 `FastApi-app4` |
+| 포트 | `5001` → 컨테이너 `8000` |
+| 데이터 볼륨 | `fastapi_todos_fastapi-data` → `/app/data` (이름 고정) |
+| 데이터 경로 | `TODO_FILE=/app/data/todo.json`, `TEMPLATE_FILE=/app/data/task_templates.json` |
+
+- 이미지에는 데이터를 넣지 않습니다. 볼륨이 비어 있으면 앱이 시작하면서 `todo.json`을 `[]`로 만들고, 템플릿 파일은 처음 저장할 때 만듭니다.
+- 백업 파일은 `backups/`에 둡니다 (`.gitignore`에 들어 있어 커밋되지 않습니다).
+- [`scripts/load-data.sh`](scripts/load-data.sh)는 백업 폴더의 파일을 볼륨으로 옮깁니다. 앱 이미지 안에서 `appuser` 권한으로 실행되므로 파일 소유자가 맞게 들어갑니다. 동작은 다음과 같습니다.
+  - 모든 파일이 JSON 목록인지 먼저 검사합니다. 하나라도 깨졌으면 아무것도 바꾸지 않습니다.
+  - `todo.json`이 없거나 비어 있으면 `[]`로 시작합니다. 템플릿 파일이 없으면 건너뜁니다.
+  - 볼륨에 이미 할 일 데이터가 있으면 멈춥니다. 덮어쓰려면 `--force`를 붙입니다.
+
+### Compose 프로젝트 이름 (Jenkins와 수동 배포 공통)
+컨테이너 이름이 `FastApi-app`로 고정이므로, Jenkins와 수동 배포가 **같은 Compose 프로젝트 이름**을 써야 합니다.
+- 프로젝트 이름이 다르면 서로를 다른 프로젝트로 봅니다.
+- 그래서 `container name "/FastApi-app" is already in use` 충돌이 나고 포트 5001도 겹칩니다.
+- SonarQube·Prometheus·Grafana 볼륨도 프로젝트 이름이 앞에 붙으므로, 이름이 달라지면 빈 볼륨이 새로 만들어집니다.
+
+1. 서버에서 지금 쓰는 프로젝트 이름을 확인합니다.
+   ```bash
+   docker inspect FastApi-app4 --format '{{index .Config.Labels "com.docker.compose.project"}}'
+   docker volume ls --filter name=sonarqube_data      # 앞부분(<프로젝트>_sonarqube_data)이 프로젝트 이름
+   ```
+2. 그 이름을 수동 배포와 Jenkins에 똑같이 지정합니다. 아래 예시의 `fastapi_todos`를 1번에서 확인한 이름으로 바꾸세요.
+   ```bash
+   export COMPOSE_PROJECT_NAME=fastapi_todos          # 수동 배포 (셸마다)
+   ```
+   ```groovy
+   // Jenkinsfile
+   environment {
+       COMPOSE_PROJECT_NAME = 'fastapi_todos'
+   }
+   stages {
+       stage('Deploy') {
+           steps {
+               sh 'docker compose build fastapi-app'
+               sh 'docker compose up -d --no-deps fastapi-app'   // 앱만 교체, 다른 서비스는 건드리지 않음
+           }
+       }
+   }
+   ```
+3. 배포 스크립트에 `docker compose down -v`와 `docker volume prune`을 쓰지 않습니다. 볼륨이 지워집니다.
+
+FastAPI 데이터 볼륨은 이름을 `fastapi_todos_fastapi-data`로 고정했습니다. 그래서 프로젝트 이름이 달라도 같은 데이터를 씁니다. 다만 다른 프로젝트 이름으로 실행하면 Compose가 "volume already exists but was created for project ..." 경고를 냅니다. 이 경고가 보이면 프로젝트 이름이 어긋났다는 뜻입니다.
+
+### FastApi-app4 → FastApi-app 데이터 이전 (한 번만)
+**순서를 지키고, 6단계 검증이 끝나기 전에는 이전 컨테이너·스냅샷·백업을 지우지 않습니다.**
+
+```bash
+export COMPOSE_PROJECT_NAME=fastapi_todos             # 위에서 확인한 이름
+
+# 1. 사전 점검 (읽기만 함)
+docker ps -a --filter name=FastApi-app --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'
+docker inspect FastApi-app4 --format '{{index .Config.Labels "com.docker.compose.project"}}'
+docker volume ls --filter name=fastapi_todos_fastapi-data   # 비어 있어야 함
+ss -ltn | grep ':5001 ' || echo "5001 사용 가능"
+
+# 2. 이전 컨테이너에서 백업 (실행 중이든 멈춰 있든 가능)
+B=backups/$(date +%Y%m%d-%H%M%S); mkdir -p "$B"
+docker cp FastApi-app4:/app/todo.json "$B/todo.json"
+docker cp FastApi-app4:/app/task_templates.json "$B/task_templates.json" \
+  || echo "템플릿 파일 없음 (정상, 건너뜀)"
+docker commit FastApi-app4 "fastapi-app4-backup:${B#backups/}"   # 컨테이너 전체 스냅샷 (롤백용)
+ls -l "$B"
+
+# 3. 새 이미지 빌드 (아직 컨테이너는 바꾸지 않음)
+docker compose build fastapi-app
+
+# 4. 백업을 새 볼륨에 넣기 (볼륨은 여기서 처음 만들어짐)
+docker compose run --rm --no-deps \
+  -v "$PWD/$B:/backup:ro" -v "$PWD/scripts:/scripts:ro" \
+  fastapi-app sh /scripts/load-data.sh
+#    출력된 건수가 백업 파일의 항목 수와 같은지 확인한다
+
+# 5. 새 컨테이너 시작
+docker compose up -d --no-deps fastapi-app
+
+# 6. 검증
+docker compose ps fastapi-app
+curl -s http://localhost:5001/todos          | python3 -c 'import json,sys; print(len(json.load(sys.stdin)), "건")'
+curl -s http://localhost:5001/task-templates | python3 -c 'import json,sys; print(len(json.load(sys.stdin)), "건")'
+docker compose up -d --no-deps --force-recreate fastapi-app   # 다시 만들어도 같은 건수인지 위 두 줄로 재확인
+```
+- 4단계 출력과 6단계 건수가 2단계 백업과 같아야 합니다.
+- 화면(http://서버:5001)에서 항목 추가와 템플릿 저장이 되는지도 확인합니다. 쓰기 권한까지 확인하는 단계입니다.
+- Prometheus(`http://127.0.0.1:7070/targets`)에서 `fastapi` 대상이 UP인지 봅니다.
+
+**5단계에서 이전 컨테이너가 어떻게 되나**
+- `FastApi-app4`가 **같은 프로젝트** 소속이면 Compose가 새 컨테이너로 교체하면서 이전 컨테이너를 지웁니다. 2단계의 파일 백업과 `docker commit` 스냅샷이 그래서 필요합니다.
+- **다른 프로젝트**(예: Jenkins 작업 폴더) 소속이면 그대로 남아 5004에서 계속 돌아갑니다. 검증이 끝난 뒤 직접 정리합니다.
+
+**롤백** (검증 실패 시)
+```bash
+docker compose stop fastapi-app
+docker start FastApi-app4 2>/dev/null \
+  || docker run -d --name FastApi-app4 -p 5004:8000 --restart unless-stopped "fastapi-app4-backup:<시각>"
+```
+
+**정리** (검증 통과 후, 충분히 운영해 본 다음)
+```bash
+docker stop FastApi-app4 && docker rm FastApi-app4    # 남아 있는 경우만
+docker image rm "fastapi-app4-backup:<시각>"
+# backups/ 폴더는 보관
+```
+
+### 백업
+```bash
+B=backups/$(date +%Y%m%d-%H%M%S); mkdir -p "$B"
+docker compose cp fastapi-app:/app/data/. "$B/"
+ls -l "$B"
+```
+
+### 복구
+복구는 볼륨의 현재 데이터를 덮어씁니다. 먼저 위 "백업"으로 지금 상태를 남겨 두세요.
+```bash
+R=backups/<복구할 시각>
+docker compose stop fastapi-app
+docker compose run --rm --no-deps \
+  -v "$PWD/$R:/backup:ro" -v "$PWD/scripts:/scripts:ro" \
+  fastapi-app sh /scripts/load-data.sh --force
+docker compose start fastapi-app
+```
+백업에 템플릿 파일이 없으면 템플릿은 지금 상태 그대로 둡니다.
+
+### 재배포
+```bash
+export COMPOSE_PROJECT_NAME=fastapi_todos
+docker compose build fastapi-app
+docker compose up -d --no-deps fastapi-app            # 데이터는 볼륨에 남는다
+```
+코드만 바꾼 재배포라면 데이터 이전이나 복구가 필요 없습니다. 그래도 큰 변경 전에는 백업을 먼저 해 두세요.
+
 ## 테스트
 ```bash
 cd fastapi-app
@@ -88,8 +226,9 @@ pytest -m integration              # 배포 서버 대상 통합 테스트
 fastapi-app/
 ├── main.py               # API, 모델, 저장 로직
 ├── templates/index.html  # 화면 (HTML + CSS + JS 한 파일)
-├── todo.json             # 데이터
+├── todo.json             # 로컬 실행용 데이터 (Docker는 볼륨 /app/data 사용)
 ├── requirements.txt      # 런타임 의존성
 ├── requirements-dev.txt  # 테스트 의존성
 └── tests/                # pytest (API, UI, 통합)
+scripts/load-data.sh      # 백업 → 데이터 볼륨 이전·복구
 ```

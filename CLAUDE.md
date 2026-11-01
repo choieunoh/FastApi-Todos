@@ -17,9 +17,9 @@ FastAPI와 바닐라 JS로 만든 To-Do 웹 앱이다.
 |---|---|
 | Backend | Python 3.13 (Docker), FastAPI ≥ 0.142, Starlette ≥ 1.7, Pydantic v2, Uvicorn ≥ 0.54 |
 | Frontend | `fastapi-app/templates/index.html` 단일 파일 (HTML + CSS + 바닐라 JS, 빌드 없음) |
-| Storage | `fastapi-app/todo.json`, `fastapi-app/task_templates.json` (JSON 파일, 후자는 5.0.0 6단계) |
+| Storage | `fastapi-app/todo.json`, `fastapi-app/task_templates.json` (JSON 파일, 후자는 5.0.0 6단계). Docker에서는 볼륨 `/app/data` 안 |
 | Test | pytest, FastAPI `TestClient`(httpx2), UI는 Playwright(pytest-playwright) |
-| Deploy | Docker (`python:3.13-slim`), docker-compose (포트 `5004:8000`) |
+| Deploy | Docker (`python:3.13-slim`), docker-compose (포트 `5001:8000`, 컨테이너 `FastApi-app`) |
 
 ## Project Structure
 ```
@@ -28,6 +28,7 @@ FastApi_Todos/
 ├── README.md
 ├── .gitignore
 ├── docker-compose.yml
+├── scripts/load-data.sh        # 백업 → 데이터 볼륨 이전·복구 (README "배포와 데이터 관리")
 └── fastapi-app/
     ├── main.py                 # API + 모델 + 저장 로직
     ├── templates/index.html    # UI 전체
@@ -199,7 +200,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 템플릿에는 `recurrence`만 있고 마감일이 없으므로 '반복이면 마감일 필수'는 템플릿에 적용하지 않는다. 할 일을 만들 때(POST /todos) 검사한다.
 - id는 템플릿 목록 안에서 최대 id + 1이다(할 일 id와 별개). 파일은 서버 시작 때 만들지 않고 처음 저장할 때 만든다.
 - **Git 제외**: `fastapi-app/task_templates.json`은 사용자 데이터라 `.gitignore`에 넣고 커밋하지 않는다. 다른 경로를 쓰려면 `TEMPLATE_FILE` 환경변수로 지정한다.
-- **Docker 주의**: 이미지에는 템플릿 파일을 넣지 않고 컨테이너 안 `/app`에 처음 저장할 때 만들어진다. 볼륨이 없으므로 컨테이너를 다시 만들면(`docker compose up --build` 등) 템플릿이 사라진다. 보존 방법(볼륨 등)은 이후 배포 설정 단계에서 정하며, 그 전까지 Dockerfile·docker-compose·Jenkins 설정은 바꾸지 않는다.
+- **Docker**: 이미지에는 템플릿 파일을 넣지 않는다. 컨테이너에서는 `TEMPLATE_FILE=/app/data/task_templates.json`(데이터 볼륨 안)에 처음 저장할 때 만들어지고, 컨테이너를 다시 만들어도 유지된다 (아래 "배포 설정").
 - 이름 중복(409)은 저장된 목록을 봐야 알 수 있으므로, 404 처리처럼 `check_template_name()`에서 검사한다(아래 코딩 규칙의 '엔드포인트 안 수동 검증 금지'의 허용된 예외).
 - 템플릿으로 만든 할 일의 id는 일반 추가와 같은 `next_id()`를 거친다(복구 대기 id와도 겹치지 않는다).
 - 추가 폼에 '하위 작업 (한 줄에 하나)' 여러 줄 입력란을 둔다. 템플릿을 불러오면 여기에 채워지고, 템플릿 없이도 쓸 수 있다. 추가하면 POST /todos 뒤 하위 할 일을 차례로 POST한다. 할 일이 만들어진 뒤에는 하위 추가가 실패해도 폼을 비운다(중복 추가 방지).
@@ -227,12 +228,27 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 일괄 작업의 '보이는 항목'은 캘린더 보기에서 그날 목록이다. 보기를 바꾸거나 날짜를 바꿔 안 보이게 된 항목은 선택에서 빠진다.
 - 보기 상태(목록/캘린더, 보던 달)는 새로고침하면 목록 보기로 돌아간다.
 
+## 배포 설정 (현재 명세)
+| 항목 | 값 |
+|---|---|
+| 서비스 / 컨테이너 이름 | `fastapi-app` / `FastApi-app` (이전 `FastApi-app4`) |
+| 포트 | `5001:8000` (이전 `5004:8000`), 컨테이너 내부 8000 고정 |
+| 데이터 볼륨 | `fastapi-data` → `/app/data`, 볼륨 이름은 `fastapi_todos_fastapi-data`로 고정 |
+| 데이터 경로 | `TODO_FILE=/app/data/todo.json`, `TEMPLATE_FILE=/app/data/task_templates.json` (compose `environment`) |
+| 그 밖의 포트 | SonarQube `9000`, Prometheus `127.0.0.1:7070`, Grafana `3000` — 바꾸지 않는다 |
+
+- 이미지에는 데이터 파일을 넣지 않는다. Dockerfile은 `appuser` 소유의 빈 `/app/data`만 만들고, 새 볼륨은 이 소유자를 이어받는다.
+- 볼륨이 비어 있으면 `main.py`가 시작할 때 `todo.json`을 `[]`로 만든다. 템플릿 파일은 처음 저장할 때 만든다.
+- 볼륨 이름을 고정했으므로 Compose 프로젝트 이름이 달라도 같은 데이터를 쓴다. 그래도 컨테이너 이름이 고정이라, Jenkins와 수동 배포는 **같은 Compose 프로젝트 이름**(`COMPOSE_PROJECT_NAME`)을 써야 이름 충돌이 없다.
+- 데이터 이전·백업·복구 절차는 README의 "배포와 데이터 관리"를 따른다. 이전한 데이터를 검증하기 전에는 이전 컨테이너와 백업을 지우지 않는다.
+- Prometheus는 `fastapi-app:8000`(서비스명·내부 포트)으로 수집하므로 외부 포트와 무관하다.
+
 ## Out of Scope
 - DB 도입 (SQLite 등), 사용자 인증
 - 프론트엔드 프레임워크(React 등)와 빌드 도구
 - 서버 측 검색·필터·정렬 쿼리 파라미터 (내보내기의 `format`은 예외), PATCH API
 - 다크 모드, 알림
-- Docker volume 등 배포 구성 변경, 포트·컨테이너 이름 변경
+- "배포 설정"에 적힌 것 외의 배포 구성 변경 (다른 서비스의 포트·컨테이너 이름·볼륨 변경 등)
 - 검색 대상에 태그 포함
 - 동시 쓰기 잠금과 원자적 저장
 - 삭제 항목의 영구 휴지통(재시작 후 복구), 하위 할 일 ↔ 상위 완료 자동 연동, 하위 할 일 순서 변경
@@ -377,6 +393,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 
 ### C. 공통
 - [ ] C1. `pytest`가 모두 통과한다 (A, B, 5.0.0 단계별 테스트 전체).
-- [ ] C2. `docker compose up --build` 후 `http://localhost:5004`에서 화면이 뜨고 5.0.0 기능 8개가 동작한다.
+- [ ] C2. `docker compose up --build` 후 `http://localhost:5001`에서 화면이 뜨고 5.0.0 기능 8개가 동작한다.
 - [ ] C3. Out of Scope 항목이 구현되지 않았고, 기존 API 경로와 상태 코드가 v3/v4와 같다.
 - [ ] C4. 단계별로 Conventional Commits 커밋이 되어 있다.
+- [ ] C5. `docker compose up -d --force-recreate fastapi-app`로 컨테이너를 다시 만들어도 할 일과 템플릿이 유지된다.

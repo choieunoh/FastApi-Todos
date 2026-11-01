@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # root가 아닌 실행 전용 사용자 생성
 RUN useradd --create-home --uid 10001 appuser \
- && mkdir /app && chown appuser:appuser /app
+ && mkdir -p /app/data && chown appuser:appuser /app /app/data
 
 # 작업 디렉토리 설정
 WORKDIR /app
@@ -22,8 +22,8 @@ RUN pip install -r requirements.txt
 COPY main.py .
 COPY templates/ ./templates/
 
-# 데이터 파일만 appuser 소유 (앱이 todo.json을 읽고 써야 함)
-COPY --chown=appuser:appuser todo.json .
+# 데이터는 이미지에 넣지 않는다: docker-compose 가 /app/data 에 볼륨을 붙이고
+# TODO_FILE·TEMPLATE_FILE 로 그 안을 가리킨다. 새 볼륨은 이 폴더의 소유자(appuser)를 이어받는다.
 
 # 이후 명령은 appuser 권한으로 실행
 USER appuser
