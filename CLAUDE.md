@@ -33,7 +33,7 @@ FastApi_Todos/
     ├── main.py                 # API + 모델 + 저장 로직
     ├── templates/index.html    # UI 전체
     ├── todo.json               # 데이터
-    ├── requirements.txt        # 런타임 의존성 (fastapi, starlette, uvicorn 만)
+    ├── requirements.txt        # 런타임 의존성 (fastapi, starlette, uvicorn, prometheus 계측만)
     ├── requirements-dev.txt    # 테스트 의존성
     ├── pyproject.toml          # pytest 설정 (integration 마커)
     ├── Dockerfile, .dockerignore, sonar-project.properties
@@ -256,7 +256,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 데이터 가져오기(import), 캘린더 드래그로 날짜 변경, 주간/일간 보기
 
 ## Constraints
-- 런타임 의존성(`requirements.txt`)을 추가하지 않는다. 테스트 도구는 `requirements-dev.txt`에만 넣는다.
+- 런타임 의존성(`requirements.txt`)은 fastapi, starlette, uvicorn과 `/metrics`용 prometheus-fastapi-instrumentator·prometheus-client뿐이다. 새로 추가하지 않는다. 테스트 도구는 `requirements-dev.txt`에만 넣는다.
 - 파일 구성을 유지한다: `main.py` 1개, `index.html` 1개. 외부 CDN이나 스크립트를 불러오지 않는다.
 - 기존 API 경로, 메서드, 상태 코드는 v3/v4와 호환되어야 한다. 새 경로만 추가한다.
 - 테스트는 실제 `todo.json`, `task_templates.json`을 건드리면 안 된다.
