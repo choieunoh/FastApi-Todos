@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  # FastApi 애플리케이션의 메트릭 수집
+  - job_name: 'fastapi'
+    static_configs:
+      - targets: ['fastapi-app:8000']  # Docker Compose 내부에서는 서비스명과 컨테이너 내부 포트를 사용
+
+  # 시스템 메트릭 수집 (node-exporter)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']

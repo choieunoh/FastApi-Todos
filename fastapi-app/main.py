@@ -9,6 +9,7 @@ from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import (
     AfterValidator, BaseModel, Field, StrictBool, StringConstraints, field_validator, model_validator,
 )
@@ -22,6 +23,8 @@ if not TODO_FILE.exists():                       # 없으면 빈 목록으로 �
     TODO_FILE.write_text("[]", encoding="utf-8")
 
 app = FastAPI(title="To-Do List API")
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 Priority = Literal["높음", "보통", "낮음"]
 Recurrence = Literal["none", "daily", "weekly", "monthly"]
