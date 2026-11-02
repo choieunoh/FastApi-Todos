@@ -38,6 +38,12 @@ def free_port() -> int:
 
 
 @pytest.fixture(scope="session")
+def browser_context_args(browser_context_args):
+    # 앱의 날짜 기준이 Asia/Seoul 이므로 브라우저도 맞춘다 — 테스트 기계의 시간대와 무관하게 같은 결과
+    return {**browser_context_args, "timezone_id": "Asia/Seoul"}
+
+
+@pytest.fixture(scope="session")
 def ui_data_file(tmp_path_factory) -> Path:
     path = tmp_path_factory.mktemp("ui") / "todo.json"
     path.write_text("[]", encoding="utf-8")

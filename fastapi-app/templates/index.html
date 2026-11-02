@@ -5,6 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>To-Do List</title>
     <style>
+        /* 색 토큰 — 새 화면(6.0.0)부터 이 변수를 쓴다 (테마는 4단계에서 여기에 덧붙인다) */
+        :root {
+          --surface: #fff;
+          --surface-muted: #f5f5f5;
+          --text-muted: #666;
+          --border: #e5e5e5;
+          --accent: #2a4a8a;
+          --danger: #b00020;
+          --chart-bar: #2a4a8a;
+          --chart-track: #eef3fc;
+        }
         body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
         form { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
         input[type="text"] { flex: 1 1 12rem; padding: .5rem; }
@@ -104,6 +115,46 @@
         .calendar-chip.overdue { color: #b00020; }
         .calendar-more { font-size: .72rem; color: #666; }
         .calendar-selected { margin: .5rem 0 0; font-size: .9rem; color: #555; }
+
+        .dashboard { display: flex; flex-direction: column; gap: .8rem; margin-bottom: 1rem; }
+        .dashboard[hidden] { display: none; }
+        .dash-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr)); gap: .5rem; }
+        .dash-card {
+          display: flex;
+          flex-direction: column;
+          gap: .2rem;
+          padding: .6rem .8rem;
+          background: var(--surface-muted);
+          border-radius: 6px;
+        }
+        .dash-card span { font-size: .8rem; color: var(--text-muted); }
+        .dash-card strong { font-size: 1.4rem; font-variant-numeric: tabular-nums; }
+        .dash-panel { padding: .6rem .8rem; border: 1px solid var(--border); border-radius: 6px; }
+        .dash-panel h2 { margin: 0; font-size: .95rem; }
+        .dash-panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem; }
+        .dash-range { display: flex; gap: .3rem; }
+        .dash-range button { padding: .25rem .6rem; cursor: pointer; }
+        .dash-range button.active { color: #fff; background: #333; border-color: #333; }
+        .dash-summary { margin: .4rem 0; font-size: .9rem; }
+        .dash-note { margin: .4rem 0 0; font-size: .8rem; color: var(--text-muted); }
+        /* 일별 막대 — 막대 사이 2px, 위쪽만 4px 둥글게, 마우스를 올리면 칸 전체가 툴팁 대상 */
+        .dash-bars { display: flex; align-items: flex-end; gap: 2px; height: 7rem; padding-top: .3rem; border-bottom: 1px solid var(--border); }
+        .dash-bar-col { flex: 1; display: flex; align-items: flex-end; height: 100%; min-width: 0; }
+        .dash-bar { width: 100%; min-height: 0; background: var(--chart-bar); border-radius: 4px 4px 0 0; }
+        .dash-bar-col:hover .dash-bar { opacity: .8; }
+        .dash-axis { display: flex; gap: 2px; font-size: .7rem; color: var(--text-muted); }
+        .dash-axis span { flex: 1; min-width: 0; overflow: visible; white-space: nowrap; text-align: center; }
+        .dash-hbars { margin: .4rem 0 0; }
+        .dash-hbars li { display: grid; grid-template-columns: 2.5rem 1fr 2rem; gap: .5rem; padding: .2rem 0; border: none; }
+        .dash-track { height: .6rem; background: var(--chart-track); border-radius: 0 4px 4px 0; }
+        .dash-fill { height: 100%; background: var(--chart-bar); border-radius: 0 4px 4px 0; }
+        .dash-hbars strong { text-align: right; font-variant-numeric: tabular-nums; }
+        .dash-compliance { margin: .4rem 0 0; font-size: 1.2rem; font-weight: bold; }
+        .dash-table { width: 100%; margin-top: .4rem; font-size: .85rem; border-collapse: collapse; }
+        .dash-table th, .dash-table td { padding: .15rem .4rem; text-align: left; border-bottom: 1px solid var(--border); }
+        .dash-table td:last-child, .dash-table th:last-child { text-align: right; }
+        details summary { margin-top: .4rem; font-size: .85rem; cursor: pointer; }
+        .bulk-bar[hidden] { display: none; }
 
         .export-links { display: flex; align-items: center; gap: .5rem; margin-top: .8rem; font-size: .9rem; }
         .export-links a {
@@ -209,7 +260,7 @@
 </head>
 <body>
     <h1>To-Do List</h1>
-    <p class="version">Version 5.0.0</p>
+    <p class="version">Version 6.0.0</p>
     <form id="todo-form">
       <input
         type="text"
@@ -304,8 +355,50 @@
       <div class="view-toggle" data-testid="view-toggle" role="group" aria-label="보기">
         <button type="button" data-view="list">목록</button>
         <button type="button" data-view="calendar">캘린더</button>
+        <button type="button" data-view="stats">통계</button>
       </div>
     </div>
+    <!-- 통계 대시보드 — GET /stats 값만 보여준다 (필터와 상관없이 전체 목록, 날짜는 Asia/Seoul) -->
+    <section id="dashboard" class="dashboard" data-testid="view-stats" aria-label="통계 대시보드" hidden>
+      <div class="dash-cards">
+        <div class="dash-card"><span>전체</span><strong id="dash-total" data-testid="dash-total">0</strong></div>
+        <div class="dash-card"><span>완료</span><strong id="dash-completed" data-testid="dash-completed">0</strong></div>
+        <div class="dash-card"><span>미완료</span><strong id="dash-active" data-testid="dash-active">0</strong></div>
+        <div class="dash-card"><span>기한 초과</span><strong id="dash-overdue" data-testid="dash-overdue">0</strong></div>
+        <div class="dash-card"><span>완료율</span><strong id="dash-rate" data-testid="dash-rate">0.0%</strong></div>
+      </div>
+      <section class="dash-panel" aria-labelledby="dash-trend-title">
+        <div class="dash-panel-head">
+          <h2 id="dash-trend-title">일별 완료 건수</h2>
+          <div class="dash-range" role="group" aria-label="기간">
+            <button type="button" data-range="7">최근 7일</button>
+            <button type="button" data-range="30">최근 30일</button>
+          </div>
+        </div>
+        <p class="dash-summary" id="dash-trend-summary" data-testid="dash-trend-summary" aria-live="polite"></p>
+        <div class="dash-bars" id="dash-trend" data-testid="dash-trend" aria-hidden="true"></div>
+        <div class="dash-axis" id="dash-axis" aria-hidden="true"></div>
+        <p class="dash-note" id="dash-excluded" data-testid="dash-excluded"></p>
+        <details>
+          <summary>표로 보기</summary>
+          <table class="dash-table" data-testid="dash-trend-table">
+            <caption class="dash-note" id="dash-table-caption"></caption>
+            <thead><tr><th scope="col">날짜</th><th scope="col">완료</th></tr></thead>
+            <tbody id="dash-trend-rows"></tbody>
+          </table>
+        </details>
+      </section>
+      <section class="dash-panel" aria-labelledby="dash-priority-title">
+        <h2 id="dash-priority-title">우선순위별 미완료</h2>
+        <ul class="dash-hbars" id="dash-priority" data-testid="dash-priority"></ul>
+      </section>
+      <section class="dash-panel" aria-labelledby="dash-compliance-title">
+        <h2 id="dash-compliance-title">마감일 준수율</h2>
+        <p class="dash-compliance" id="dash-compliance" data-testid="dash-compliance"></p>
+        <p class="dash-note" id="dash-compliance-note"></p>
+      </section>
+      <p class="dash-note" id="dash-basis" data-testid="dash-basis"></p>
+    </section>
     <section id="calendar" class="calendar" data-testid="calendar" aria-label="캘린더" hidden>
       <div class="calendar-nav">
         <button type="button" id="calendar-prev">이전</button>
@@ -316,7 +409,7 @@
       <div class="calendar-grid" id="calendar-grid"></div>
       <p class="calendar-selected" id="calendar-selected"></p>
     </section>
-    <div class="bulk-bar" data-testid="bulk-bar" aria-label="일괄 작업">
+    <div class="bulk-bar" id="bulk-bar" data-testid="bulk-bar" aria-label="일괄 작업">
       <span id="bulk-count" aria-live="polite">0개 선택</span>
       <button type="button" id="bulk-select-all" data-testid="bulk-select-all">보이는 항목 전체 선택</button>
       <button type="button" id="bulk-complete" data-testid="bulk-complete" disabled>완료</button>
@@ -351,7 +444,7 @@
         let allTodos = [];
         let currentFilter = "all";
 
-        let currentView = "list";                // "list" | "calendar"
+        let currentView = "list";                // "list" | "calendar" | "stats"
         let calendarMonth = null;                // 캘린더에 보이는 달 { year, month(0~11) } — 처음 열 때 이번 달
         let selectedDate = null;                 // 캘린더에서 고른 날짜 (YYYY-MM-DD)
         const CALENDAR_CHIPS = 3;                // 날짜 칸에 보여줄 최대 항목 수 (나머지는 +N)
@@ -406,14 +499,29 @@
         const priorityOptions = (select, selected) => fillOptions(select, PRIORITIES.map((p) => [p, p]), selected);
         const recurrenceOptions = (select, selected) => fillOptions(select, Object.entries(RECURRENCES), selected);
 
-        // 날짜는 모두 브라우저 로컬 기준 YYYY-MM-DD 로 다룬다
+        // 달력 칸을 만들 때 쓰는 연·월·일 → YYYY-MM-DD (시간대와 무관한 날짜 계산용)
         function ymd(d) {
           return `${d.getFullYear()}-` +
             `${String(d.getMonth() + 1).padStart(2, "0")}-` +
             `${String(d.getDate()).padStart(2, "0")}`;
         }
 
-        const todayStr = () => ymd(new Date());
+        // '오늘'과 시각의 날짜는 Asia/Seoul 기준이다 (서버 KST 와 같은 고정 오프셋, 한국은 서머타임이 없다)
+        const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
+        const HAS_ZONE = /(?:Z|[+-]\d{2}:?\d{2})$/i;
+
+        // ISO 시각(또는 ms) → 한국 날짜 YYYY-MM-DD. 시간대가 없는 예전 시각은 서버처럼 UTC 로 본다
+        function kstDate(value) {
+          const ms = typeof value === "string" ? Date.parse(HAS_ZONE.test(value) ? value : `${value}Z`) : value;
+          return new Date(ms + KST_OFFSET_MS).toISOString().slice(0, 10);
+        }
+
+        const todayStr = () => kstDate(Date.now());
+
+        function kstMonth() {
+          const [year, month] = todayStr().split("-").map(Number);
+          return { year, month: month - 1 };
+        }
 
         // 기존 값에 바꿀 값만 덮어써서 PUT 본문을 만든다 (빠진 필드가 기본값으로 지워지지 않게)
         function toPayload(todo, overrides = {}) {
@@ -437,10 +545,12 @@
           return `D+${-days}`;
         }
 
+        // 목록이 바뀔 때마다 부른다 — 통계 보기면 대시보드도 서버 값으로 다시 그린다
         const load = () => run("목록 불러오기", async () => {
           allTodos = await api("/todos");
           renderTagOptions();
           applyFilters();
+          if (currentView === "stats") await loadStats();
         });
 
         // 지금 존재하는 태그로 필터 목록을 다시 만든다 (선택한 태그가 사라지면 전체로)
@@ -500,8 +610,10 @@
           favoriteFilterEl.setAttribute("aria-pressed", favoriteOnly);
 
           // 캘린더 보기에서는 고른 날짜의 항목만 목록에 보인다 (일괄 작업도 이 목록 기준)
+          // 통계 보기에는 항목 목록이 없다
           const visible = currentView === "list" ? filtered
-            : filtered.filter((todo) => selectedDate && todo.due_date === selectedDate);
+            : currentView === "calendar" ? filtered.filter((todo) => selectedDate && todo.due_date === selectedDate)
+            : [];
 
           // 필터로 가려진 항목은 선택에서 뺀다
           visibleIds = visible.map((todo) => todo.id);
@@ -532,6 +644,9 @@
             btn.setAttribute("aria-pressed", active);
           });
           $("calendar").hidden = currentView !== "calendar";
+          $("dashboard").hidden = currentView !== "stats";
+          listEl.hidden = currentView === "stats";
+          $("bulk-bar").hidden = currentView === "stats";
         }
 
         function setCalendarMonth(year, month) {
@@ -555,10 +670,7 @@
 
         function renderCalendar(filtered, today) {
           if (currentView !== "calendar") return;
-          if (!calendarMonth) {
-            const now = new Date();
-            calendarMonth = { year: now.getFullYear(), month: now.getMonth() };
-          }
+          if (!calendarMonth) calendarMonth = kstMonth();
           const { year, month } = calendarMonth;
           $("calendar-title").textContent = `${year}년 ${month + 1}월`;
 
@@ -604,14 +716,100 @@
           btn.addEventListener("click", () => {
             currentView = btn.dataset.view;
             applyFilters();
+            if (currentView === "stats") run("통계 불러오기", loadStats);
           });
         });
         $("calendar-prev").onclick = () => setCalendarMonth(calendarMonth.year, calendarMonth.month - 1);
         $("calendar-next").onclick = () => setCalendarMonth(calendarMonth.year, calendarMonth.month + 1);
         $("calendar-today").onclick = () => {
-          const now = new Date();
-          setCalendarMonth(now.getFullYear(), now.getMonth());
+          const { year, month } = kstMonth();
+          setCalendarMonth(year, month);
         };
+
+        // ---------- 통계 대시보드 — 집계는 서버(GET /stats)만 한다. 화면은 받은 값을 그리기만 한다 ----------
+        const DASH_RANGES = [7, 30];
+        let dashRange = DASH_RANGES[0];          // 일별 완료 추이 기간 (일)
+        let lastStats = null;
+
+        const formatRate = (rate) => `${rate.toFixed(1)}%`;
+        const shortDate = (date) => date.slice(5).split("-").map(Number).join("/");   // 2026-10-05 → 10/5
+
+        async function loadStats() {
+          lastStats = await api("/stats");
+          renderDashboard();
+        }
+
+        function renderDashboard() {
+          const s = lastStats;
+          if (!s) return;
+          $("dash-total").textContent = s.total;
+          $("dash-completed").textContent = s.completed;
+          $("dash-active").textContent = s.active;
+          $("dash-overdue").textContent = s.overdue;
+          $("dash-rate").textContent = formatRate(s.completion_rate);
+          renderTrend(s);
+          renderPriority(s);
+
+          const { eligible, on_time: onTime, rate } = s.due_compliance;
+          $("dash-compliance").textContent = rate === null ? "데이터 없음" : formatRate(rate);
+          $("dash-compliance-note").textContent = rate === null
+            ? "마감일이 있는 완료 항목이 아직 없습니다."
+            : `마감일이 있는 완료 ${eligible}개 중 ${onTime}개를 마감일까지 끝냈습니다.`;
+          $("dash-basis").textContent = `기준일 ${s.today} (Asia/Seoul) · 필터와 상관없이 전체 목록 기준`;
+        }
+
+        function renderTrend(s) {
+          document.querySelectorAll("[data-range]").forEach((btn) => {
+            const active = Number(btn.dataset.range) === dashRange;
+            btn.classList.toggle("active", active);
+            btn.setAttribute("aria-pressed", active);
+          });
+          const days = s.daily_completions.slice(-dashRange);
+          const max = Math.max(1, ...days.map((d) => d.count));
+          const labelEvery = dashRange === 7 ? 1 : 5;   // 30일은 5일마다 날짜를 적는다 (마지막 날은 항상)
+
+          $("dash-trend").replaceChildren(...days.map((d) => {
+            const col = el("div", { className: "dash-bar-col", title: `${d.date}: ${d.count}건` });
+            col.append(el("div", { className: "dash-bar" }));
+            col.firstChild.style.height = `${d.count / max * 100}%`;
+            return col;
+          }));
+          $("dash-axis").replaceChildren(...days.map((d, i) => el("span", {
+            textContent: (days.length - 1 - i) % labelEvery === 0 ? shortDate(d.date) : "",
+          })));
+
+          const total = dashRange === 7 ? s.completions_7d : s.completions_30d;
+          $("dash-trend-summary").textContent = `최근 ${dashRange}일 완료 ${total}건 (${days[0].date} ~ ${s.today})`;
+          $("dash-excluded").textContent = `완료 시각이 없어 추이에서 제외: ${s.trend_excluded}건`;
+          $("dash-table-caption").textContent = `최근 ${dashRange}일 일별 완료 건수`;
+          $("dash-trend-rows").replaceChildren(...days.map((d) => {
+            const tr = el("tr");
+            tr.append(el("td", { textContent: d.date }), el("td", { textContent: d.count }));
+            return tr;
+          }));
+        }
+
+        function renderPriority(s) {
+          const max = Math.max(1, ...Object.values(s.active_by_priority));
+          $("dash-priority").replaceChildren(...PRIORITIES.map((p) => {
+            const count = s.active_by_priority[p] ?? 0;
+            const li = el("li");
+            li.dataset.priority = p;
+            const track = el("div", { className: "dash-track" });
+            track.setAttribute("aria-hidden", "true");
+            track.append(el("div", { className: "dash-fill" }));
+            track.firstChild.style.width = `${count / max * 100}%`;
+            li.append(el("span", { textContent: p }), track, el("strong", { textContent: count }));
+            return li;
+          }));
+        }
+
+        document.querySelectorAll("[data-range]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            dashRange = Number(btn.dataset.range);
+            renderDashboard();
+          });
+        });
 
         // 통계는 필터와 상관없이 전체 목록 기준
         function renderStats(today) {
@@ -707,8 +905,8 @@
             dday.dataset.testid = "dday";
             meta.append(dday);
           }
-          if (todo.created_at) meta.append(el("span", { textContent: `생성: ${ymd(new Date(todo.created_at))}` }));
-          if (todo.completed && todo.completed_at) meta.append(el("span", { textContent: `완료: ${ymd(new Date(todo.completed_at))}` }));
+          if (todo.created_at) meta.append(el("span", { textContent: `생성: ${kstDate(todo.created_at)}` }));
+          if (todo.completed && todo.completed_at) meta.append(el("span", { textContent: `완료: ${kstDate(todo.completed_at)}` }));
 
           const content = el("div", { className: "content" });
           content.append(text, tags, meta, renderSubtasks(todo));

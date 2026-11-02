@@ -4,8 +4,9 @@ import io
 import json
 import os
 from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, get_args
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
@@ -34,7 +35,10 @@ UNDO_TTL = timedelta(seconds=30)                 # 삭제 후 복구할 수 있�
 BULK_MAX = 100                                   # 일괄 작업 한 번에 고를 수 있는 최대 건수
 UNDO_MAX = BULK_MAX                              # 복구 버퍼·복구 요청 최대 건수 — 일괄 삭제 한 번을 모두 되돌릴 수 있게
 SUBTASK_MAX = 20                                 # 할 일 하나에 둘 수 있는 하위 할 일 수
-KST = timezone(timedelta(hours=9), "KST")        # 내보내기 파일명 날짜 기준 (tzdata 없이 고정 오프셋)
+# 날짜 기준 (통계·내보내기 파일명). Asia/Seoul 은 서머타임이 없어 tzdata 없이 고정 오프셋과 같다
+KST = timezone(timedelta(hours=9), "KST")
+TREND_DAYS = 30                                  # 완료 추이는 오늘 포함 최근 30일 (7일은 그 끝부분)
+WEEK_DAYS = 7
 ExportFormat = Literal["json", "csv"]
 # CSV 고정 헤더 — 값은 JSON 과 같은 표기, 서버 내부용 next_spawned 는 뺀다
 CSV_COLUMNS = ["id", "title", "description", "completed", "priority", "due_date", "tags",
@@ -150,12 +154,50 @@ class DeletedEntry(BaseModel):                   # 복구 버퍼 항목 — 원�
     deleted_at: datetime
 
 
+class DailyCount(BaseModel):                     # 하루 완료 건수 (Asia/Seoul 날짜)
+    date: date
+    count: int
+
+
+class DueCompliance(BaseModel):                  # 마감일 준수 — 분모가 0 이면 rate 는 null
+    eligible: int
+    on_time: int
+    rate: float | None
+
+
+class StatsOut(BaseModel):                       # 통계 대시보드 — 상위 할 일 기준, 읽기 전용
+    today: date
+    timezone: Literal["Asia/Seoul"] = "Asia/Seoul"
+    total: int
+    completed: int
+    active: int
+    overdue: int
+    completion_rate: float
+    daily_completions: list[DailyCount]          # 오래된 날부터 오늘까지 TREND_DAYS 개
+    completions_7d: int
+    completions_30d: int
+    trend_excluded: int                          # 완료인데 completed_at 이 없어 추이에서 뺀 수
+    active_by_priority: dict[Priority, int]
+    due_compliance: DueCompliance
+
+
 # 삭제 직후 복구용 메모리 버퍼 (id → 항목, 오래된 것부터). 재시작하면 비워진다
 RECENTLY_DELETED: dict[int, DeletedEntry] = {}
 
 
 def now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def kst_date(moment: datetime) -> date:
+    # 시간대가 없는 시각(예전 데이터)은 UTC 로 본다
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(KST).date()
+
+
+def today_kst() -> date:
+    return kst_date(now())
 
 
 def prune_deleted() -> None:
@@ -338,6 +380,52 @@ def export_todos(export_format: Annotated[ExportFormat, Query(alias="format")]) 
         media_type = "text/csv; charset=utf-8"
     return Response(body.encode("utf-8"), media_type=media_type,
                     headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+# ---------- 통계 대시보드 — 읽기 전용, 날짜는 Asia/Seoul 기준 ----------
+
+def percent(part: int, whole: int) -> float | None:
+    # 소수 1자리, 반올림은 사사오입 (파이썬 round 의 은행가 반올림을 쓰지 않는다)
+    if whole == 0:
+        return None
+    return float((Decimal(part * 100) / Decimal(whole)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
+def compute_stats(todos: list[TodoItem], today: date) -> StatsOut:
+    completed = [t for t in todos if t.completed]
+    active = [t for t in todos if not t.completed]
+
+    # 완료 추이 — completed_at 이 있는 완료 항목만, 완료 시각의 Asia/Seoul 날짜로 센다
+    days = [today - timedelta(days=n) for n in range(TREND_DAYS - 1, -1, -1)]
+    counts = dict.fromkeys(days, 0)
+    for todo in completed:
+        if todo.completed_at is not None and (day := kst_date(todo.completed_at)) in counts:
+            counts[day] += 1
+
+    # 마감일 준수 — 마감일과 완료 시각이 모두 있는 완료 항목 중 마감일 당일까지 끝낸 비율
+    eligible = [t for t in completed if t.due_date is not None and t.completed_at is not None]
+    on_time = sum(kst_date(t.completed_at) <= t.due_date for t in eligible)
+
+    return StatsOut(
+        today=today,
+        total=len(todos),
+        completed=len(completed),
+        active=len(active),
+        overdue=sum(t.due_date is not None and t.due_date < today for t in active),
+        completion_rate=percent(len(completed), len(todos)) or 0.0,
+        daily_completions=[DailyCount(date=d, count=c) for d, c in counts.items()],
+        completions_7d=sum(list(counts.values())[-WEEK_DAYS:]),
+        completions_30d=sum(counts.values()),
+        trend_excluded=sum(t.completed_at is None for t in completed),
+        active_by_priority={p: sum(t.priority == p for t in active) for p in get_args(Priority)},
+        due_compliance=DueCompliance(eligible=len(eligible), on_time=on_time,
+                                     rate=percent(on_time, len(eligible))),
+    )
+
+
+@app.get("/stats")                               # 통계 — 저장 파일·복구 버퍼를 바꾸지 않는다
+def get_stats() -> StatsOut:
+    return compute_stats(load_todos(), today_kst())
 
 
 @app.post("/todos/restore", responses={404: {"description": "복구할 수 없는 항목이 있음"}})  # 삭제 실행 취소

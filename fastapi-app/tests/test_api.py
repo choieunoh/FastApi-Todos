@@ -211,7 +211,7 @@ def test_a22_real_todo_file_untouched():
 def test_index_served():
     res = client.get("/")
     assert res.status_code == 200
-    assert "Version 5.0.0" in res.text
+    assert "Version 6.0.0" in res.text
 
 
 # ---------- 5.0.0 1단계: 즐겨찾기 ----------
@@ -1084,3 +1084,163 @@ def test_export_route_does_not_shadow_todo_routes():
     todo_id = create().json()["id"]
     assert put(todo_id, title="수정").status_code == 200
     assert client.delete(f"/todos/{todo_id}").status_code == 204
+
+
+# ---------- 6.0.0 1단계: 통계 대시보드 (/stats) ----------
+
+STATS_NOW = datetime(2026, 10, 12, 3, 0, tzinfo=main.timezone.utc)   # 한국 시간 2026-10-12 12:00
+
+
+@pytest.fixture
+def stats_at(monkeypatch, isolated_file):
+    # 서버 시계를 고정하고, 원본 dict 그대로 파일에 넣은 뒤 /stats 를 부른다
+    def call(items: list[dict], at: datetime = STATS_NOW) -> dict:
+        monkeypatch.setattr(main, "now", lambda: at)
+        isolated_file.write_text(json_module.dumps(items, ensure_ascii=False), encoding="utf-8")
+        res = client.get("/stats")
+        assert res.status_code == 200
+        return res.json()
+    return call
+
+
+def raw(id: int, **fields) -> dict:
+    return {"id": id, "title": f"할 일 {id}", "description": "", "completed": False, **fields}
+
+
+def raw_done(id: int, completed_at: str | None, **fields) -> dict:
+    return raw(id, completed=True, completed_at=completed_at, **fields)
+
+
+def trend(stats: dict) -> dict[str, int]:
+    return {d["date"]: d["count"] for d in stats["daily_completions"] if d["count"]}
+
+
+def test_stats_empty_list(stats_at):
+    stats = stats_at([])
+    assert stats["today"] == "2026-10-12"
+    assert stats["timezone"] == "Asia/Seoul"
+    assert (stats["total"], stats["completed"], stats["active"], stats["overdue"]) == (0, 0, 0, 0)
+    assert stats["completion_rate"] == 0.0
+    assert len(stats["daily_completions"]) == 30
+    assert stats["daily_completions"][0]["date"] == "2026-09-13"
+    assert stats["daily_completions"][-1]["date"] == "2026-10-12"
+    assert (stats["completions_7d"], stats["completions_30d"], stats["trend_excluded"]) == (0, 0, 0)
+    assert stats["active_by_priority"] == {"높음": 0, "보통": 0, "낮음": 0}
+    assert stats["due_compliance"] == {"eligible": 0, "on_time": 0, "rate": None}   # 분모 0 → 데이터 없음
+
+
+def test_stats_counts_and_rate_one_decimal(stats_at):
+    stats = stats_at([raw_done(1, "2026-10-12T01:00:00+00:00"), raw(2), raw(3)])
+    assert (stats["total"], stats["completed"], stats["active"]) == (3, 1, 2)
+    assert stats["completion_rate"] == 33.3
+    stats = stats_at([raw_done(1, "2026-10-12T01:00:00+00:00"), raw_done(2, "2026-10-12T01:00:00+00:00"), raw(3)])
+    assert stats["completion_rate"] == 66.7
+
+
+def test_stats_rate_rounds_half_up(stats_at):
+    # 1/16 = 6.25 → 6.3 (파이썬 round 의 은행가 반올림이면 6.2)
+    stats = stats_at([raw_done(1, "2026-10-12T01:00:00+00:00")] + [raw(i) for i in range(2, 17)])
+    assert stats["completion_rate"] == 6.3
+
+
+def test_stats_overdue_uses_kst_today(stats_at):
+    items = [raw(1, due_date="2026-10-11"), raw(2, due_date="2026-10-12"), raw(3),
+             raw_done(4, "2026-10-12T01:00:00+00:00", due_date="2026-10-01")]
+    assert stats_at(items)["overdue"] == 1                           # 오늘 마감·마감일 없음·완료는 아니다
+    # UTC 로는 아직 10-11 이지만 한국 시간으로 10-12 가 되면 10-11 마감은 기한 초과다
+    kst_midnight = datetime(2026, 10, 11, 15, 0, tzinfo=main.timezone.utc)
+    assert stats_at([raw(1, due_date="2026-10-11")], at=kst_midnight)["overdue"] == 1
+    assert stats_at([raw(1, due_date="2026-10-11")], at=kst_midnight - main.timedelta(seconds=1))["overdue"] == 0
+
+
+def test_stats_trend_midnight_boundary(stats_at):
+    stats = stats_at([
+        raw_done(1, "2026-10-10T14:59:59+00:00"),                   # 한국 10-10 23:59:59
+        raw_done(2, "2026-10-10T15:00:00+00:00"),                   # 한국 10-11 00:00:00
+        raw_done(3, "2026-10-11T00:30:00+09:00"),                   # 이미 한국 시간으로 적힌 값
+    ])
+    assert trend(stats) == {"2026-10-10": 1, "2026-10-11": 2}
+
+
+def test_stats_trend_window_edges(stats_at):
+    stats = stats_at([
+        raw_done(1, "2026-09-13T00:00:00+09:00"),                   # 29일 전 — 30일 창 안
+        raw_done(2, "2026-09-12T23:59:59+09:00"),                   # 30일 전 — 창 밖
+        raw_done(3, "2026-10-06T00:00:00+09:00"),                   # 6일 전 — 7일 창 안
+        raw_done(4, "2026-10-05T23:59:59+09:00"),                   # 7일 전 — 7일 창 밖
+        raw_done(5, "2026-10-13T00:00:00+09:00"),                   # 미래 시각 — 창 밖
+    ])
+    assert trend(stats) == {"2026-09-13": 1, "2026-10-05": 1, "2026-10-06": 1}
+    assert (stats["completions_7d"], stats["completions_30d"]) == (1, 3)
+
+
+def test_stats_missing_completed_at_excluded_from_trend(stats_at):
+    stats = stats_at([raw_done(1, None), raw_done(2, None, due_date="2026-10-01"),
+                      {"id": 3, "title": "v1 완료", "description": "", "completed": True},   # 필드 자체가 없음
+                      raw_done(4, "2026-10-12T01:00:00+00:00")])
+    assert stats["completed"] == 4                                   # 완료 수에는 들어간다
+    assert stats["trend_excluded"] == 3                              # 추이에서는 빠지고 따로 센다
+    assert stats["completions_30d"] == 1
+    assert stats["due_compliance"]["eligible"] == 0                  # 완료 시각이 없으면 준수율 분모에서도 빠진다
+
+
+def test_stats_naive_datetime_treated_as_utc(stats_at):
+    # 시간대가 없는 예전 시각은 UTC 로 본다: 15:00 UTC = 한국 다음 날 00:00
+    stats = stats_at([raw_done(1, "2026-10-10T14:59:59"), raw_done(2, "2026-10-10T15:00:00")])
+    assert trend(stats) == {"2026-10-10": 1, "2026-10-11": 1}
+    assert stats["trend_excluded"] == 0
+
+
+def test_stats_active_by_priority(stats_at):
+    stats = stats_at([raw(1, priority="높음"), raw(2, priority="높음"), raw(3),
+                      raw(4, priority="낮음"), raw_done(5, None, priority="높음")])
+    assert stats["active_by_priority"] == {"높음": 2, "보통": 1, "낮음": 1}   # 완료 항목은 세지 않는다
+    assert list(stats["active_by_priority"]) == ["높음", "보통", "낮음"]
+
+
+def test_stats_due_compliance(stats_at):
+    stats = stats_at([
+        raw_done(1, "2026-10-05T14:59:59+00:00", due_date="2026-10-05"),  # 한국 10-05 23:59:59 — 당일 완료는 준수
+        raw_done(2, "2026-10-05T15:00:00+00:00", due_date="2026-10-05"),  # 한국 10-06 00:00 — 미준수
+        raw_done(3, "2026-10-01T00:00:00+00:00", due_date="2026-10-05"),  # 일찍 완료 — 준수
+        raw_done(4, "2026-10-01T00:00:00+00:00"),                         # 마감일 없음 — 분모 제외
+        raw(5, due_date="2026-10-01"),                                    # 미완료 — 분모 제외
+    ])
+    assert stats["due_compliance"] == {"eligible": 3, "on_time": 2, "rate": 66.7}
+
+
+def test_stats_ignores_subtasks(stats_at):
+    stats = stats_at([raw(1, subtasks=[{"id": 1, "title": "하위", "completed": True}])])
+    assert (stats["total"], stats["completed"], stats["completion_rate"]) == (1, 0, 0.0)
+
+
+def test_stats_v1_to_v3_data(stats_at):
+    stats = stats_at([{"id": 1, "title": "v1", "description": "", "completed": False},
+                      {"id": 2, "title": "v3", "description": "", "completed": False, "due_date": "",
+                       "priority": "높음", "tags": ["a"]}])
+    assert (stats["total"], stats["active"], stats["overdue"]) == (2, 2, 0)
+    assert stats["active_by_priority"] == {"높음": 1, "보통": 1, "낮음": 0}
+
+
+def test_stats_matches_api_flow(monkeypatch):
+    # 실제 API 로 만든 데이터도 같은 규칙으로 센다 (completed_at 은 서버가 매긴다)
+    monkeypatch.setattr(main, "now", lambda: STATS_NOW)
+    create(title="완료", completed=True, due_date="2026-10-12")
+    create(title="초과", due_date="2026-10-01", priority="낮음")
+    stats = client.get("/stats").json()
+    assert (stats["total"], stats["completed"], stats["overdue"], stats["completion_rate"]) == (2, 1, 1, 50.0)
+    assert trend(stats) == {"2026-10-12": 1}
+    assert stats["due_compliance"] == {"eligible": 1, "on_time": 1, "rate": 100.0}
+
+
+def test_stats_is_read_only(isolated_file):
+    seed_rich_data()
+    deleted = create(title="지움").json()["id"]
+    delete(deleted)
+    before = isolated_file.read_bytes()
+    buffer_before = dict(main.RECENTLY_DELETED)
+    assert client.get("/stats").status_code == 200
+    assert isolated_file.read_bytes() == before
+    assert main.RECENTLY_DELETED == buffer_before
+    assert not main.TEMPLATE_FILE.exists()
+    assert restore(deleted).status_code == 200

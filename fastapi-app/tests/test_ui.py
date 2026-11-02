@@ -288,7 +288,7 @@ def test_b21_overdue_style(page: Page, seed):
 
 def test_b22_version(page: Page, seed):
     open_app(page)
-    expect(page.get_by_text("Version 5.0.0")).to_be_visible()
+    expect(page.get_by_text("Version 6.0.0")).to_be_visible()
 
 
 # ---------- 5.0.0 1단계: 즐겨찾기 ----------
@@ -1400,3 +1400,209 @@ def test_calendar_bulk_and_undo_on_day_list(page: Page, seed):
     page.get_by_test_id("undo-button").click()
     expect(page.locator(ITEM)).to_have_count(5)
     expect(day(page, "2026-10-15").locator(".calendar-more")).to_have_text("+2")
+
+
+# ---------- 6.0.0 1단계: Asia/Seoul 날짜 기준 (D-day·기한 초과·캘린더·생성/완료일) ----------
+
+KST_ZONE = tz(td(hours=9))
+
+
+@pytest.fixture
+def la_page(browser, base_url):
+    # 브라우저 시간대가 한국이 아니어도 날짜는 Asia/Seoul 기준이어야 한다
+    context = browser.new_context(base_url=base_url, timezone_id="America/Los_Angeles")
+    yield context.new_page()
+    context.close()
+
+
+def test_kst_today_regardless_of_browser_timezone(la_page: Page, seed):
+    # 2026-10-12 16:00 UTC = 로스앤젤레스 10-12 09:00, 한국 10-13 01:00 → 오늘은 10-13
+    la_page.clock.set_fixed_time(dt(2026, 10, 12, 16, 0, tzinfo=tz.utc))
+    seed([todo(1, "오늘", due_date="2026-10-13"), todo(2, "어제", due_date="2026-10-12"),
+          todo(3, "모레", due_date="2026-10-15"),
+          todo(4, "생성 시각", created_at="2026-10-12T16:00:00+00:00",
+               completed=True, completed_at="2026-10-12T15:30:00")])           # 시간대 없는 값은 UTC
+    open_app(la_page)
+    expect(item(la_page, "오늘").get_by_test_id("dday")).to_have_text("오늘 마감")
+    expect(item(la_page, "어제").get_by_test_id("dday")).to_have_text("D+1")
+    expect(item(la_page, "어제")).to_contain_text("⚠ 기한 초과")
+    expect(item(la_page, "모레").get_by_test_id("dday")).to_have_text("D-2")
+    expect(item(la_page, "생성 시각").locator(".meta")).to_contain_text("생성: 2026-10-13")
+    expect(item(la_page, "생성 시각").locator(".meta")).to_contain_text("완료: 2026-10-13")
+    expect(la_page.get_by_test_id("stat-overdue")).to_have_text("1")
+
+    open_calendar(la_page)
+    expect(cal_title(la_page)).to_have_text("2026년 10월")
+    expect(la_page.locator(".calendar-day.today")).to_have_attribute("data-date", "2026-10-13")
+
+
+def test_kst_calendar_month_boundary(la_page: Page, seed):
+    # 2026-10-31 15:30 UTC = 로스앤젤레스 10-31, 한국 11-01 → 캘린더는 11월에서 시작한다
+    la_page.clock.set_fixed_time(dt(2026, 10, 31, 15, 30, tzinfo=tz.utc))
+    seed([todo(1, "11월 첫날", due_date="2026-11-01")])
+    open_app(la_page)
+    open_calendar(la_page)
+    expect(cal_title(la_page)).to_have_text("2026년 11월")
+    expect(la_page.locator(".calendar-day.today")).to_have_attribute("data-date", "2026-11-01")
+    go(la_page, "이전")
+    expect(cal_title(la_page)).to_have_text("2026년 10월")
+    go(la_page, "오늘")
+    expect(cal_title(la_page)).to_have_text("2026년 11월")
+
+
+# ---------- 6.0.0 1단계: 통계 대시보드 ----------
+# 집계는 서버(/stats)가 실제 시계로 하므로, 데이터는 지금 한국 날짜를 기준으로 만든다
+
+def kst_today():
+    return dt.now(KST_ZONE).date()
+
+
+def kst_noon(days_ago: int = 0) -> str:
+    # days_ago 일 전 한국 시간 정오 (자정 경계에서 멀리 둔다)
+    return dt.combine(kst_today() - td(days=days_ago), dt.min.time(), KST_ZONE).replace(hour=12).isoformat()
+
+
+def due(days_from_today: int) -> str:
+    return (kst_today() + td(days=days_from_today)).isoformat()
+
+
+def dashboard(page: Page):
+    return page.get_by_test_id("view-stats")
+
+
+def open_stats(page: Page) -> None:
+    page.get_by_test_id("view-toggle").get_by_role("button", name="통계").click()
+    expect(dashboard(page)).to_be_visible()
+
+
+def dash(page: Page) -> tuple[str, ...]:
+    return tuple(page.get_by_test_id(f"dash-{k}").inner_text()
+                 for k in ("total", "completed", "active", "overdue", "rate"))
+
+
+def priority_counts(page: Page) -> dict[str, str]:
+    rows = page.get_by_test_id("dash-priority").locator("li")
+    return {rows.nth(i).get_attribute("data-priority"): rows.nth(i).locator("strong").inner_text()
+            for i in range(rows.count())}
+
+
+DASH_TODOS = [
+    todo(1, "끝냄", completed=True, completed_at=kst_noon(0), due_date=due(0)),
+    todo(2, "밀림", priority="높음", due_date=due(-2)),
+    todo(3, "보통 일"),
+    todo(4, "나중", priority="낮음", due_date=due(3)),
+]
+
+
+@pytest.fixture
+def live_clock(page: Page):
+    # 기존 통계 바(브라우저 계산)와 대시보드(서버 실제 시계)를 비교할 때는 브라우저 시계도 지금으로 맞춘다
+    page.clock.set_fixed_time(dt.now(tz.utc))
+
+
+def test_dashboard_toggle_and_cards(page: Page, seed, live_clock):
+    seed(DASH_TODOS)
+    open_app(page)
+    expect(dashboard(page)).to_be_hidden()
+    open_stats(page)
+    toggle = page.get_by_test_id("view-toggle")
+    expect(toggle.get_by_role("button", name="통계")).to_have_attribute("aria-pressed", "true")
+    expect(page.get_by_test_id("dash-rate")).to_have_text("25.0%")              # 대시보드는 소수 1자리
+    assert dash(page) == ("4", "1", "3", "1", "25.0%")
+    assert stats(page) == ("4", "1", "3", "1", "25%")                            # 기존 통계 바는 정수 % 그대로
+    assert priority_counts(page) == {"높음": "1", "보통": "1", "낮음": "1"}
+    expect(page.get_by_test_id("dash-compliance")).to_have_text("100.0%")
+    expect(page.get_by_test_id("dash-basis")).to_contain_text(f"기준일 {kst_today()} (Asia/Seoul)")
+    expect(page.locator(ITEM)).to_have_count(0)                                  # 통계 보기에는 항목 목록이 없다
+    expect(page.get_by_test_id("bulk-bar")).to_be_hidden()
+
+    toggle.get_by_role("button", name="목록").click()                            # 목록으로 돌아오면 원래 화면
+    expect(dashboard(page)).to_be_hidden()
+    expect(page.get_by_test_id("bulk-bar")).to_be_visible()
+    assert titles(page) == ["끝냄", "밀림", "보통 일", "나중"]
+
+
+def test_dashboard_matches_stats_api(page: Page, seed):
+    seed(DASH_TODOS)
+    open_app(page)
+    open_stats(page)
+    expect(page.get_by_test_id("dash-total")).to_have_text("4")
+    api = page.request.get("/stats").json()                                      # 화면 값은 서버 집계 그대로
+    assert dash(page) == (str(api["total"]), str(api["completed"]), str(api["active"]),
+                          str(api["overdue"]), f"{api['completion_rate']:.1f}%")
+    assert priority_counts(page) == {p: str(n) for p, n in api["active_by_priority"].items()}
+
+
+def test_dashboard_trend_ranges_and_table(page: Page, seed):
+    seed([
+        todo(1, "오늘 1", completed=True, completed_at=kst_noon(0)),
+        todo(2, "오늘 2", completed=True, completed_at=kst_noon(0)),
+        todo(3, "6일 전", completed=True, completed_at=kst_noon(6)),
+        todo(4, "10일 전", completed=True, completed_at=kst_noon(10)),
+        todo(5, "40일 전", completed=True, completed_at=kst_noon(40)),           # 30일 밖
+        todo(6, "시각 없음", completed=True),                                    # 추이에서 제외
+    ])
+    open_app(page)
+    open_stats(page)
+    summary = page.get_by_test_id("dash-trend-summary")
+    expect(summary).to_contain_text("최근 7일 완료 3건")
+    expect(page.locator("[data-range='7']")).to_have_attribute("aria-pressed", "true")
+    expect(page.get_by_test_id("dash-trend").locator(".dash-bar-col")).to_have_count(7)
+    expect(page.get_by_test_id("dash-excluded")).to_have_text("완료 시각이 없어 추이에서 제외: 1건")
+
+    rows = page.get_by_test_id("dash-trend-table").locator("tbody tr")           # 표 요약 (접근성)
+    expect(rows).to_have_count(7)
+    expect(rows.last.locator("td")).to_have_text([kst_today().isoformat(), "2"])
+    expect(rows.first.locator("td")).to_have_text([due(-6), "1"])
+    expect(page.get_by_test_id("dash-trend").locator(".dash-bar-col").last).to_have_attribute(
+        "title", f"{kst_today()}: 2건")
+
+    page.get_by_role("button", name="최근 30일").click()
+    expect(summary).to_contain_text("최근 30일 완료 4건")
+    expect(page.locator("[data-range='30']")).to_have_attribute("aria-pressed", "true")
+    expect(page.get_by_test_id("dash-trend").locator(".dash-bar-col")).to_have_count(30)
+    expect(rows).to_have_count(30)
+    page.get_by_text("표로 보기").click()
+    expect(page.get_by_test_id("dash-trend-table")).to_be_visible()
+
+
+def test_dashboard_empty_and_no_compliance_data(page: Page, seed):
+    open_app(page)
+    open_stats(page)
+    expect(page.get_by_test_id("dash-rate")).to_have_text("0.0%")
+    assert dash(page) == ("0", "0", "0", "0", "0.0%")
+    expect(page.get_by_test_id("dash-compliance")).to_have_text("데이터 없음")     # 분모 0
+    expect(page.get_by_test_id("dash-trend-summary")).to_contain_text("최근 7일 완료 0건")
+    assert priority_counts(page) == {"높음": "0", "보통": "0", "낮음": "0"}
+
+
+def test_dashboard_compliance_rate(page: Page, seed):
+    seed([
+        todo(1, "제때", completed=True, completed_at=kst_noon(3), due_date=due(-3)),
+        todo(2, "늦게", completed=True, completed_at=kst_noon(1), due_date=due(-3)),
+        todo(3, "마감 없음", completed=True, completed_at=kst_noon(1)),
+    ])
+    open_app(page)
+    open_stats(page)
+    expect(page.get_by_test_id("dash-compliance")).to_have_text("50.0%")
+    expect(dashboard(page)).to_contain_text("마감일이 있는 완료 2개 중 1개를 마감일까지 끝냈습니다.")
+
+
+def test_dashboard_refreshes_after_change_and_ignores_filters(page: Page, seed):
+    seed(DASH_TODOS)
+    open_app(page)
+    page.locator("#search").fill("없는 검색어")
+    page.locator("[data-filter=completed]").click()
+    open_stats(page)
+    expect(page.get_by_test_id("dash-total")).to_have_text("4")                  # 필터와 상관없이 전체
+    page.locator("#title").fill("새 할 일")                                       # 통계 보기에서도 추가 폼은 그대로
+    page.get_by_role("button", name="Add To-Do").click()
+    expect(page.get_by_test_id("dash-total")).to_have_text("5")
+    expect(page.get_by_test_id("dash-rate")).to_have_text("20.0%")
+
+
+def test_dashboard_error_shown(page: Page, seed):
+    open_app(page)
+    page.route("**/stats", lambda route: route.fulfill(status=500, body="boom"))
+    page.get_by_test_id("view-toggle").get_by_role("button", name="통계").click()
+    expect(page.locator("#error")).to_contain_text("통계 불러오기 실패")
