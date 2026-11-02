@@ -198,6 +198,53 @@
           clip: rect(0 0 0 0);
           white-space: nowrap;
         }
+        .notify-bar { display: flex; justify-content: flex-end; margin: -1rem 0 .8rem; }
+        .notify-bell { display: inline-flex; align-items: center; gap: .3rem; padding: .3rem .7rem; cursor: pointer; }
+        .notify-badge {
+          min-width: 1.2rem;
+          padding: 0 .35rem;
+          font-size: .75rem;
+          font-weight: bold;
+          line-height: 1.2rem;
+          text-align: center;
+          color: #fff;
+          background: var(--danger);
+          border-radius: 999px;
+        }
+        .notify-badge[hidden] { display: none; }
+        .notify-panel { padding: .6rem .8rem; margin-bottom: 1rem; border: 1px solid var(--border); border-radius: 6px; }
+        .notify-panel[hidden] { display: none; }
+        .notify-head { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+        .notify-head h2 { flex: 1; margin: 0; font-size: 1rem; }
+        .notify-note { margin: .3rem 0 .4rem; font-size: .8rem; color: var(--text-muted); }
+        .notify-list { margin: 0; }
+        .notify-list li { padding: 0; border-bottom: 1px solid var(--border); }
+        .notify-list .notify-empty { padding: .4rem 0; font-size: .85rem; color: var(--text-muted); border: none; }
+        .notify-item {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: .2rem .5rem;
+          width: 100%;
+          padding: .45rem .2rem;
+          font: inherit;
+          text-align: left;
+          background: none;
+          border: none;
+          cursor: pointer;
+        }
+        .notify-item:hover { background: var(--surface-muted); }
+        .notify-item.unread .notify-title { font-weight: bold; }
+        .notify-item.read { color: var(--text-muted); }
+        .notify-category { padding: 0 .4rem; font-size: .75rem; border: 1px solid currentColor; border-radius: 4px; }
+        .notify-category.overdue { color: var(--danger); font-weight: normal; }
+        .notify-category.today { color: var(--accent); }
+        .notify-category.tomorrow { color: var(--text-muted); }
+        .notify-title { flex: 1 1 8rem; min-width: 0; overflow-wrap: anywhere; }
+        .notify-due { font-size: .8rem; color: var(--text-muted); }
+        .notify-new { font-size: .75rem; font-weight: bold; color: var(--danger); }
+        li.flash { outline: 3px solid var(--accent); outline-offset: 2px; }
+
         @media (max-width: 560px) {
           .kanban-columns { grid-template-columns: minmax(0, 1fr); }   /* 좁은 화면에서는 열을 세로로 쌓는다 */
         }
@@ -307,6 +354,23 @@
 <body>
     <h1>To-Do List</h1>
     <p class="version">Version 6.0.0</p>
+    <!-- 마감일 알림 센터 — 앱 안에서만 보인다. 읽음 표시는 이 브라우저(localStorage)에만 저장한다 -->
+    <div class="notify-bar">
+      <button type="button" id="notification-bell" class="notify-bell" data-testid="notification-bell"
+              aria-expanded="false" aria-controls="notification-panel">
+        🔔 알림 <span id="notification-badge" class="notify-badge" data-testid="notification-badge" hidden>0</span>
+      </button>
+    </div>
+    <section id="notification-panel" class="notify-panel" data-testid="notification-panel" aria-labelledby="notification-title" hidden>
+      <div class="notify-head">
+        <h2 id="notification-title">알림</h2>
+        <button type="button" id="notification-read-all" data-testid="notification-read-all">모두 읽음</button>
+        <button type="button" id="notification-close">닫기</button>
+      </div>
+      <p class="notify-note">미완료 할 일 중 내일 마감·오늘 마감·기한 초과 (Asia/Seoul 기준). 읽음 표시는 이 브라우저에만 저장됩니다.</p>
+      <ul id="notification-list" class="notify-list" aria-labelledby="notification-title"></ul>
+    </section>
+    <p id="notification-live" class="visually-hidden" data-testid="notification-live" role="status" aria-live="polite"></p>
     <form id="todo-form">
       <input
         type="text"
@@ -512,6 +576,7 @@
         const CALENDAR_CHIPS = 3;                // 날짜 칸에 보여줄 최대 항목 수 (나머지는 +N)
         const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"];
         let favoriteOnly = false;                // 즐겨찾기만 보기 (다른 필터와 AND)
+        let renderedDay = null;                  // 마지막으로 그린 날짜 (Asia/Seoul) — 자정·탭 복귀 때 비교한다
 
         const UNDO_MS = 5000;                    // 실행 취소 토스트를 보여주는 시간 (서버 보관은 30초)
         let undoIds = [];                        // 마지막 삭제에서 지운 id들
@@ -599,9 +664,16 @@
         const isOverdue = (todo, today) =>
           Boolean(todo.due_date) && todo.due_date < today && !todo.completed;
 
-        function ddayLabel(dueDate, today) {
+        const DAY_MS = 24 * 60 * 60 * 1000;
+
+        // 오늘부터 마감일까지 남은 일수 (지났으면 음수)
+        function daysUntil(dueDate, today) {
           const toUtc = (s) => { const [y, m, d] = s.split("-").map(Number); return Date.UTC(y, m - 1, d); };
-          const days = Math.round((toUtc(dueDate) - toUtc(today)) / 86400000);
+          return Math.round((toUtc(dueDate) - toUtc(today)) / DAY_MS);
+        }
+
+        function ddayLabel(dueDate, today) {
+          const days = daysUntil(dueDate, today);
           if (days > 0) return `D-${days}`;
           if (days === 0) return "오늘 마감";
           return `D+${-days}`;
@@ -610,6 +682,7 @@
         // 목록이 바뀔 때마다 부른다 — 통계 보기면 대시보드도 서버 값으로 다시 그린다
         const load = () => run("목록 불러오기", async () => {
           allTodos = await api("/todos");
+          notifyLoaded = true;                   // 실제 목록을 받은 뒤에만 알림 읽음 기록을 정리한다
           renderTagOptions();
           applyFilters();
           if (currentView === "stats") await loadStats();
@@ -626,26 +699,29 @@
           tagFilterEl.value = tags.includes(selected) ? selected : "";
         }
 
-        function applyFilters() {
+        // 검색·상태·태그·즐겨찾기 필터 (모두 AND)
+        function matchesFilters(todo) {
           const keyword = searchEl.value.trim().toLowerCase();
           const tag = tagFilterEl.value;
 
-          const filtered = allTodos.filter((todo) => {
-            const matchesSearch =
-              todo.title.toLowerCase().includes(keyword) ||
-              todo.description.toLowerCase().includes(keyword);
+          const matchesSearch =
+            todo.title.toLowerCase().includes(keyword) ||
+            todo.description.toLowerCase().includes(keyword);
 
-            const matchesFilter =
-              currentFilter === "all" ||
-              (currentFilter === "active" && !todo.completed) ||
-              (currentFilter === "completed" && todo.completed);
+          const matchesFilter =
+            currentFilter === "all" ||
+            (currentFilter === "active" && !todo.completed) ||
+            (currentFilter === "completed" && todo.completed);
 
-            const matchesTag = !tag || todo.tags.includes(tag);
+          const matchesTag = !tag || todo.tags.includes(tag);
 
-            const matchesFavorite = !favoriteOnly || todo.favorite;
+          const matchesFavorite = !favoriteOnly || todo.favorite;
 
-            return matchesSearch && matchesFilter && matchesTag && matchesFavorite;
-          });
+          return matchesSearch && matchesFilter && matchesTag && matchesFavorite;
+        }
+
+        function applyFilters() {
+          const filtered = allTodos.filter(matchesFilters);
 
           // 정렬
           if (sortEl.value === "priority") {
@@ -682,7 +758,9 @@
           for (const id of [...selectedIds]) if (!visibleIds.includes(id)) selectedIds.delete(id);
 
           const today = todayStr();
+          renderedDay = today;
           renderStats(today);
+          renderNotifications(today);
           renderViewToggle();
           renderCalendar(filtered, today);
           renderKanban(filtered, today);
@@ -1020,6 +1098,165 @@
           });
         }
 
+        // ---------- 마감일 알림 센터 — 서버 변경 없이 allTodos 로 계산, 읽음 표시는 localStorage(이 브라우저만) ----------
+        // 분류와 표시 순서 (기한 초과 → 오늘 → 내일)
+        const NOTIFY_CATEGORIES = { overdue: "기한 초과", today: "오늘 마감", tomorrow: "내일 마감" };
+        const NOTIFY_ORDER = Object.keys(NOTIFY_CATEGORIES);
+        const NOTIFY_STORAGE_KEY = "todo.v6.notifications.read";
+        const bellEl = $("notification-bell"), notifyPanelEl = $("notification-panel");
+        let notifications = [];
+        let notifyLoaded = false;                // 목록을 받기 전(빈 목록)에 읽음 기록을 지우지 않게
+        let lastUnread = null;                   // 읽지 않은 수가 바뀔 때만 스크린리더에 알린다
+        let readKeys = loadReadKeys();           // 읽은 알림 키 — 저장이 안 되는 환경이면 이 화면에서만 유지
+
+        function loadReadKeys() {
+          try {
+            const keys = JSON.parse(localStorage.getItem(NOTIFY_STORAGE_KEY) || "[]");
+            return new Set(Array.isArray(keys) ? keys.filter((k) => typeof k === "string") : []);
+          } catch {
+            return new Set();                    // 깨진 값·접근 불가 → 모두 읽지 않음으로 시작
+          }
+        }
+
+        function saveReadKeys() {
+          try {
+            localStorage.setItem(NOTIFY_STORAGE_KEY, JSON.stringify([...readKeys]));
+          } catch {
+            // 저장할 수 없어도 알림 센터는 동작한다 (새로고침하면 읽음 표시가 사라진다)
+          }
+        }
+
+        // 미완료이고 마감일이 있는 항목만: 마감일이 내일·오늘이거나 이미 지났을 때.
+        // 키 (todo_id, due_date, 분류) — 다시 그려도 같은 알림은 하나, 날짜·분류가 바뀌면 새 알림이다
+        function computeNotifications(todos, today) {
+          const byKey = new Map();
+          for (const todo of todos) {
+            if (todo.completed || !todo.due_date) continue;
+            const days = daysUntil(todo.due_date, today);
+            const category = days < 0 ? "overdue" : days === 0 ? "today" : days === 1 ? "tomorrow" : null;
+            if (!category) continue;
+            const key = `${todo.id}|${todo.due_date}|${category}`;
+            byKey.set(key, { key, todoId: todo.id, title: todo.title, dueDate: todo.due_date, category });
+          }
+          return [...byKey.values()].sort((a, b) =>
+            NOTIFY_ORDER.indexOf(a.category) - NOTIFY_ORDER.indexOf(b.category) ||
+            a.dueDate.localeCompare(b.dueDate) || a.todoId - b.todoId);
+        }
+
+        function renderNotifications(today) {
+          notifications = computeNotifications(allTodos, today);
+          if (notifyLoaded) {                    // 지금 유효하지 않은 키(완료·삭제·마감일 변경·분류 변경)는 정리한다
+            const valid = new Set(notifications.map((n) => n.key));
+            const kept = new Set([...readKeys].filter((key) => valid.has(key)));
+            if (kept.size !== readKeys.size) {
+              readKeys = kept;
+              saveReadKeys();
+            }
+          }
+
+          const unread = notifications.filter((n) => !readKeys.has(n.key)).length;
+          const badge = $("notification-badge");
+          badge.textContent = unread;
+          badge.hidden = unread === 0;
+          bellEl.setAttribute("aria-label", unread ? `알림, 읽지 않은 알림 ${unread}개` : "알림, 읽지 않은 알림 없음");
+          $("notification-read-all").disabled = unread === 0;
+          if (notifyLoaded && unread !== lastUnread) {
+            $("notification-live").textContent = unread ? `읽지 않은 마감일 알림 ${unread}개` : "";
+            lastUnread = unread;
+          }
+
+          $("notification-list").replaceChildren(...(notifications.length
+            ? notifications.map((n) => renderNotification(n, today))
+            : [el("li", { className: "notify-empty", textContent: "알림이 없습니다." })]));
+        }
+
+        function renderNotification(n, today) {
+          const read = readKeys.has(n.key);
+          const item = button("", () => openNotification(n));
+          item.className = `notify-item ${read ? "read" : "unread"}`;
+          item.dataset.testid = "notification-item";
+          item.dataset.category = n.category;
+          item.dataset.todoId = n.todoId;
+          item.append(
+            el("span", { className: `notify-category ${n.category}`, textContent: NOTIFY_CATEGORIES[n.category] }),
+            el("span", { className: "notify-title", textContent: n.title }),
+            el("span", { className: "notify-due", textContent: `마감 ${n.dueDate} (${ddayLabel(n.dueDate, today)})` }),
+          );
+          if (!read) item.append(el("span", { className: "notify-new", textContent: "새 알림" }));   // 색 외에 글자로도
+          const li = el("li");
+          li.append(item);
+          return li;
+        }
+
+        function setNotificationsOpen(open, restoreFocus = true) {
+          notifyPanelEl.hidden = !open;
+          bellEl.setAttribute("aria-expanded", open);
+          if (open) (notifyPanelEl.querySelector(".notify-item") || $("notification-close")).focus();
+          else if (restoreFocus) bellEl.focus();
+        }
+
+        // 알림을 누르면 읽음으로 하고, 목록 보기에서 그 할 일을 보여준다 (필터에 가려져 있으면 필터를 푼다)
+        function openNotification(n) {
+          readKeys.add(n.key);
+          saveReadKeys();
+          setNotificationsOpen(false, false);
+          const todo = allTodos.find((t) => t.id === n.todoId);
+          currentView = "list";
+          if (todo && !matchesFilters(todo)) {
+            searchEl.value = "";
+            currentFilter = "all";
+            tagFilterEl.value = "";
+            favoriteOnly = false;
+          }
+          applyFilters();
+          const li = listEl.querySelector(`[data-id="${n.todoId}"]`);
+          if (!li) return;
+          li.tabIndex = -1;
+          li.classList.add("flash");
+          li.scrollIntoView({ block: "center" });
+          li.focus();
+          setTimeout(() => li.classList.remove("flash"), 2000);
+        }
+
+        bellEl.onclick = () => setNotificationsOpen(notifyPanelEl.hidden);
+        $("notification-close").onclick = () => setNotificationsOpen(false);
+        notifyPanelEl.addEventListener("keydown", (event) => {
+          if (event.key === "Escape") setNotificationsOpen(false);
+        });
+        $("notification-read-all").onclick = () => {
+          for (const n of notifications) readKeys.add(n.key);
+          saveReadKeys();
+          renderNotifications(todayStr());
+          $("notification-close").focus();       // 누른 버튼이 비활성화되므로 포커스를 패널 안에 둔다
+        };
+
+        // 날짜가 바뀌면(자정, 탭 복귀) 오늘 기준 화면을 다시 그린다 — 주기적 폴링 없이 다음 자정에 타이머 하나
+        let midnightTimer = null;
+
+        function refreshDay() {
+          if (todayStr() === renderedDay) return;
+          applyFilters();                        // 알림·D-day·기한 초과·캘린더 오늘·통계 바
+          if (currentView === "stats") run("통계 불러오기", loadStats);
+        }
+
+        function scheduleMidnight() {
+          clearTimeout(midnightTimer);
+          const now = Date.now();
+          const nextMidnight = (Math.floor((now + KST_OFFSET_MS) / DAY_MS) + 1) * DAY_MS - KST_OFFSET_MS;
+          midnightTimer = setTimeout(() => {
+            refreshDay();
+            scheduleMidnight();
+          }, nextMidnight - now + 50);
+        }
+
+        document.addEventListener("visibilitychange", () => {
+          if (document.hidden) return;
+          refreshDay();
+          scheduleMidnight();                    // 백그라운드에서 늦춰진 타이머를 다시 맞춘다
+        });
+        window.addEventListener("focus", refreshDay);
+        scheduleMidnight();
+
         // 통계는 필터와 상관없이 전체 목록 기준
         function renderStats(today) {
           const total = allTodos.length;
@@ -1112,6 +1349,7 @@
           content.append(text, tags, meta, renderSubtasks(todo));
 
           li.dataset.testid = "todo-item";
+          li.dataset.id = todo.id;                 // 알림에서 이 항목으로 이동할 때 찾는다
           li.append(pick, check, star, content, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
           return li;
         }

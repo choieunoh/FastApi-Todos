@@ -1302,3 +1302,39 @@ def test_kanban_move_missing_todo_404():
     client.delete(f"/todos/{todo_id}")
     payload = {"title": "할 일", "completed": True}
     assert client.put(f"/todos/{todo_id}", json=payload).status_code == 404
+
+
+# ---------- 6.0.0 3단계: 알림 센터 — 서버 API·저장 필드 없음 (계산은 화면, 읽음은 localStorage) ----------
+# 알림 분류·중복 키·읽음 저장은 tests/test_ui.py 에서 브라우저로 검증한다. 여기서는 API 계약이 그대로인지 고정한다
+
+V6_ROUTES = {
+    ("GET", "/"), ("GET", "/metrics"), ("GET", "/stats"),
+    ("GET", "/todos"), ("POST", "/todos"), ("PUT", "/todos/{todo_id}"), ("DELETE", "/todos/{todo_id}"),
+    ("GET", "/todos/export"), ("POST", "/todos/bulk"), ("POST", "/todos/restore"),
+    ("POST", "/todos/{todo_id}/subtasks"), ("PUT", "/todos/{todo_id}/subtasks/{subtask_id}"),
+    ("DELETE", "/todos/{todo_id}/subtasks/{subtask_id}"),
+    ("GET", "/task-templates"), ("POST", "/task-templates"),
+    ("PUT", "/task-templates/{template_id}"), ("DELETE", "/task-templates/{template_id}"),
+}
+TODO_RESPONSE_FIELDS = {"id", "title", "description", "completed", "priority", "due_date", "tags", "favorite",
+                        "recurrence", "created_at", "completed_at", "subtasks", "next_spawned"}
+
+
+def test_v6_routes_are_v5_plus_stats_only():
+    from fastapi.routing import APIRoute
+    routes = {(m, r.path) for r in app.routes if isinstance(r, APIRoute) for m in r.methods}
+    assert routes == V6_ROUTES                                       # 알림용 경로는 없다
+
+
+def test_todo_response_has_no_notification_fields():
+    create(title="마감", due_date="2026-10-12")
+    assert set(client.get("/todos").json()[0]) == TODO_RESPONSE_FIELDS
+    assert set(TodoItem.model_fields) == TODO_RESPONSE_FIELDS        # 저장 구조도 그대로
+
+
+def test_todo_ignores_client_notification_state(isolated_file):
+    # 화면의 읽음 상태 같은 값이 본문에 섞여 와도 저장되지 않는다 (todo.json 구조 유지)
+    todo_id = create(title="마감", due_date="2026-10-12", read=True, notification="x").json()["id"]
+    put(todo_id, title="마감", due_date="2026-10-13", read=True)
+    saved = json_module.loads(isolated_file.read_text(encoding="utf-8"))[0]
+    assert set(saved) == TODO_RESPONSE_FIELDS
