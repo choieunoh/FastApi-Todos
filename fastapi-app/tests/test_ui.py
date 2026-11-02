@@ -2169,3 +2169,287 @@ def test_notify_mobile(mobile_page: Page, seed):
     notify_item(mobile_page, "오늘 마감 일").tap()
     expect(mobile_page.locator(f"{ITEM}[data-id='2']")).to_be_in_viewport()
     expect(notify_badge(mobile_page)).to_have_text("3")
+
+
+# ---------- 6.0.0 4단계: 테마·반응형·접근성 ----------
+
+THEME_KEY = "todo.v6.theme"
+NO_HSCROLL = "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+THEME_TODOS = [
+    todo(1, "보고서 제출", description="3장까지", priority="높음", due_date="2026-10-10", tags=["학교", "과제"], favorite=True),
+    todo(2, "운동", due_date="2026-10-12", recurrence="daily", tags=["건강"],
+         subtasks=[{"id": 1, "title": "스트레칭", "completed": True}, {"id": 2, "title": "달리기", "completed": False}]),
+    todo(3, "장보기", due_date="2026-10-13", priority="낮음"),
+    todo(4, "책 읽기", completed=True, due_date="2026-10-05",
+         created_at="2026-10-01T03:00:00Z", completed_at="2026-10-04T03:00:00Z"),
+    todo(5, "마감 없는 일", description="언젠가"),
+]
+VIEWS = ("목록", "캘린더", "칸반", "통계")
+
+# 화면에 보이는 글자마다 글자색과 실제 배경색(반투명이면 겹쳐서 계산)의 대비를 잰다.
+# 비활성 컨트롤(WCAG 예외)·스크린리더 전용 글자·반투명 처리 중 카드는 뺀다. 4.5:1 미만만 돌려준다
+CONTRAST_JS = r"""() => {
+  const parse = (c) => {
+    const m = c.match(/rgba?\(([^)]+)\)/);
+    if (!m) return null;
+    const [r, g, b, a = 1] = m[1].split(/[\s,\/]+/).filter(Boolean).map(Number);
+    return { r, g, b, a };
+  };
+  const over = (top, under) => ({
+    r: top.r * top.a + under.r * (1 - top.a), g: top.g * top.a + under.g * (1 - top.a),
+    b: top.b * top.a + under.b * (1 - top.a), a: 1,
+  });
+  const lum = ({ r, g, b }) => {
+    const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+  };
+  const background = (node) => {
+    const layers = [];
+    for (let n = node; n; n = n.parentElement) {
+      const c = parse(getComputedStyle(n).backgroundColor);
+      if (c && c.a > 0) { layers.push(c); if (c.a >= 1) break; }
+    }
+    let color = { r: 255, g: 255, b: 255, a: 1 };
+    for (const layer of layers.reverse()) color = over(layer, color);
+    return color;
+  };
+  const fails = [];
+  for (const node of document.body.querySelectorAll("*")) {
+    const own = [...node.childNodes].filter((c) => c.nodeType === 3).map((c) => c.textContent.trim()).join("");
+    if (!own || !node.checkVisibility({ opacityProperty: true, visibilityProperty: true })) continue;
+    if (node.closest(":disabled, .visually-hidden, option, select, .pending, .dragging")) continue;
+    const fg = parse(getComputedStyle(node).color);
+    const bg = background(node);
+    const [hi, lo] = [lum(over(fg, bg)), lum(bg)].sort((a, b) => b - a);
+    const ratio = (hi + 0.05) / (lo + 0.05);
+    if (ratio < 4.5) fails.push({ text: own.slice(0, 30), ratio: Math.round(ratio * 100) / 100,
+                                  color: getComputedStyle(node).color, cls: String(node.className) });
+  }
+  return fails;
+}"""
+
+# 색 토큰 두 개의 대비 (차트 막대처럼 글자가 아닌 그래픽은 3:1 이상)
+TOKEN_RATIO_JS = r"""([a, b]) => {
+  const probe = (v) => {
+    const d = document.createElement("div");
+    d.style.color = `var(${v})`;
+    document.body.append(d);
+    const c = getComputedStyle(d).color;
+    d.remove();
+    return c;
+  };
+  const lum = (c) => {
+    const [r, g, bl] = c.match(/\d+/g).map(Number).map((v) => {
+      v /= 255;
+      return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  const [x, y] = [lum(probe(a)), lum(probe(b))].sort((p, q) => q - p);
+  return (x + 0.05) / (y + 0.05);
+}"""
+
+LIGHT_BG, DARK_BG = "rgb(255, 255, 255)", "rgb(21, 23, 26)"
+
+
+def body_background(page: Page) -> str:
+    return page.evaluate("getComputedStyle(document.body).backgroundColor")
+
+
+def choose_theme(page: Page, label: str) -> None:
+    page.get_by_test_id("theme-select").select_option(label=label)
+
+
+def test_theme_default_follows_system(page: Page, seed):
+    page.emulate_media(color_scheme="dark")
+    open_app(page)
+    expect(page.get_by_test_id("theme-select")).to_have_value("system")         # 기본은 시스템
+    assert page.evaluate("document.documentElement.dataset.theme") is None
+    assert body_background(page) == DARK_BG
+    page.emulate_media(color_scheme="light")                                      # OS 설정이 바뀌면 바로 따라간다
+    assert body_background(page) == LIGHT_BG
+
+
+def test_theme_choice_persists_and_overrides_system(page: Page, seed):
+    page.emulate_media(color_scheme="dark")
+    open_app(page)
+    choose_theme(page, "라이트")
+    expect(page.locator("html")).to_have_attribute("data-theme", "light")
+    assert body_background(page) == LIGHT_BG                                      # 시스템이 다크여도 라이트
+    assert page.evaluate(f"localStorage.getItem('{THEME_KEY}')") == "light"
+    expect(page.get_by_test_id("status-message")).to_have_text("테마: 라이트")
+    page.reload()
+    expect(page.get_by_test_id("theme-select")).to_have_value("light")           # 새로고침 후에도 유지
+    assert body_background(page) == LIGHT_BG
+
+    page.emulate_media(color_scheme="light")
+    choose_theme(page, "다크")
+    assert body_background(page) == DARK_BG
+    page.reload()
+    assert body_background(page) == DARK_BG
+    choose_theme(page, "시스템")                                                 # 시스템으로 되돌리면 OS 설정
+    assert page.evaluate("document.documentElement.dataset.theme") is None
+    assert body_background(page) == LIGHT_BG
+    assert page.evaluate(f"localStorage.getItem('{THEME_KEY}')") == "system"
+
+
+def test_theme_applied_before_first_paint(page: Page, seed):
+    # <head> 에서 테마를 정하므로 <body> 가 생기는 순간 이미 다크다 (깜빡임 없음)
+    page.add_init_script(f"""
+      localStorage.setItem('{THEME_KEY}', 'dark');
+      new MutationObserver((_, observer) => {{
+        if (!document.body) return;
+        window.themeAtBody = document.documentElement.dataset.theme;
+        observer.disconnect();
+      }}).observe(document, {{ childList: true, subtree: true }});
+    """)
+    open_app(page)
+    assert page.evaluate("window.themeAtBody") == "dark"
+
+
+def test_theme_unknown_value_falls_back_to_system(page: Page, seed):
+    page.add_init_script(f"localStorage.setItem('{THEME_KEY}', 'purple')")
+    page.emulate_media(color_scheme="light")
+    open_app(page)
+    expect(page.get_by_test_id("theme-select")).to_have_value("system")
+    assert page.evaluate("document.documentElement.dataset.theme") is None
+    assert body_background(page) == LIGHT_BG
+
+
+def test_theme_works_when_storage_unavailable(page: Page, seed):
+    page.add_init_script("""
+      Storage.prototype.getItem = () => { throw new Error("blocked"); };
+      Storage.prototype.setItem = () => { throw new Error("blocked"); };
+    """)
+    page.emulate_media(color_scheme="light")
+    open_app(page)
+    expect(page.get_by_test_id("theme-select")).to_have_value("system")
+    choose_theme(page, "다크")                                                   # 이 화면에서는 고른 테마가 유지된다
+    assert body_background(page) == DARK_BG
+    expect(page.locator("#error")).to_be_hidden()
+
+
+def test_theme_and_read_state_sync_across_tabs(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    page.emulate_media(color_scheme="light")
+    open_app(page)
+    other = page.context.new_page()
+    other.clock.set_fixed_time(f"{TODAY}T12:00:00")
+    other.emulate_media(color_scheme="light")
+    open_app(other)
+    choose_theme(page, "다크")
+    expect(other.locator("html")).to_have_attribute("data-theme", "dark")       # 다른 탭에도 반영된다
+    expect(other.get_by_test_id("theme-select")).to_have_value("dark")
+    expect(notify_badge(other)).to_have_text("4")
+    read_all(page)
+    expect(notify_badge(other)).to_be_hidden()                                   # 알림 읽음도 같은 브라우저 안에서 맞춘다
+    other.close()
+
+
+def open_every_view(page: Page):
+    """목록(하위 펼침) → 캘린더(날짜 선택) → 칸반 → 통계 → 알림 패널 순서로 열며 화면 이름을 돌려준다."""
+    page.locator("[data-testid=subtask-toggle]").nth(1).click()
+    yield "목록"
+    for view in VIEWS[1:]:
+        page.get_by_test_id("view-toggle").get_by_role("button", name=view).click()
+        if view == "캘린더":
+            page.locator("[data-date='2026-10-12']").click()
+        if view == "통계":
+            expect(page.get_by_test_id("dash-total")).to_have_text("5")
+        yield view
+    page.get_by_test_id("view-toggle").get_by_role("button", name="목록").click()
+    open_notifications(page)
+    yield "알림"
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_contrast_in_every_view(page: Page, seed, theme):
+    seed(THEME_TODOS)
+    page.emulate_media(color_scheme=theme)
+    open_app(page)
+    item(page, "장보기").locator("[data-testid=bulk-select]").check()            # 선택한 행의 배경도 잰다
+    for view in open_every_view(page):
+        assert page.evaluate(CONTRAST_JS) == [], f"{theme} {view}"
+    for pair in (["--chart-bar", "--chart-track"], ["--chart-bar", "--surface"], ["--focus", "--bg"]):
+        assert page.evaluate(TOKEN_RATIO_JS, pair) >= 3, pair                    # 그래픽·포커스 표시는 3:1 이상
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_mobile_375_every_view(mobile_page: Page, seed, theme):
+    seed(THEME_TODOS)
+    mobile_page.emulate_media(color_scheme=theme)
+    open_app(mobile_page)
+    for view in open_every_view(mobile_page):
+        assert mobile_page.evaluate(NO_HSCROLL), f"{theme} {view} 가로 스크롤"
+    # 핵심 조작이 화면 안에 있다 (테마·알림·보기 전환·추가)
+    for locator in (mobile_page.get_by_test_id("theme-select"), bell(mobile_page),
+                    mobile_page.get_by_test_id("view-toggle"), mobile_page.get_by_role("button", name="Add To-Do")):
+        box = locator.bounding_box()
+        assert box["x"] >= 0 and box["x"] + box["width"] <= 375
+    item(mobile_page, "운동").get_by_role("button", name="Edit").tap()           # 수정 폼도 넘치지 않는다
+    expect(mobile_page.get_by_test_id("edit-form")).to_be_visible()
+    assert mobile_page.evaluate(NO_HSCROLL)
+
+
+def test_keyboard_theme_and_focus_visible(page: Page, seed):
+    page.emulate_media(color_scheme="light")
+    open_app(page)
+    page.keyboard.press("Tab")                                                   # 첫 Tab 은 테마 선택
+    select = page.get_by_test_id("theme-select")
+    expect(select).to_be_focused()
+    outline = select.evaluate("e => [getComputedStyle(e).outlineStyle, getComputedStyle(e).outlineWidth]")
+    assert outline == ["solid", "3px"]                                           # 키보드 포커스가 보인다
+    page.keyboard.press("ArrowDown")                                             # 시스템 → 라이트
+    expect(select).to_have_value("light")
+    page.keyboard.press("ArrowDown")                                             # 라이트 → 다크
+    expect(page.locator("html")).to_have_attribute("data-theme", "dark")
+    page.keyboard.press("Tab")
+    expect(bell(page)).to_be_focused()
+    assert bell(page).evaluate("e => getComputedStyle(e).outlineStyle") == "solid"
+
+
+def test_non_color_status_cues(page: Page, seed):
+    seed(THEME_TODOS)
+    open_app(page)
+    expect(item(page, "보고서 제출")).to_contain_text("⚠ 기한 초과")               # 목록: 글자
+    expect(page.locator("[data-filter=all]")).to_have_attribute("aria-pressed", "true")
+    page.get_by_test_id("view-toggle").get_by_role("button", name="칸반").click()
+    expect(card(page, "보고서 제출")).to_contain_text("⚠ 기한 초과")              # 칸반: 글자
+    expect(page.get_by_test_id("view-toggle").get_by_role("button", name="칸반")).to_have_attribute("aria-pressed", "true")
+    open_calendar(page)
+    chip = chips(page, "2026-10-10")                                             # 캘린더: ⚠ 기호
+    assert chip.evaluate("e => getComputedStyle(e, '::before').content") == '"⚠ "'
+    done = chips(page, "2026-10-05")
+    assert done.evaluate("e => getComputedStyle(e).textDecorationLine") == "line-through"
+
+
+def test_success_and_failure_messages(page: Page, seed):
+    open_app(page)
+    status = page.get_by_test_id("status-message")
+    expect(status).to_have_attribute("role", "status")
+    page.locator("#title").fill("새 일")
+    page.get_by_role("button", name="Add To-Do").click()
+    expect(status).to_have_text("할 일을 추가했습니다.")                          # 성공은 상태 메시지
+    expect(status).to_have_text("", timeout=6000)                                # 잠시 뒤 사라진다
+    item(page, "새 일").locator(DONE_BOX).check()
+    expect(status).to_have_text("변경을 저장했습니다.")
+    page.route("**/todos/*", lambda route: route.fulfill(status=500, body="down"))
+    item(page, "새 일").get_by_test_id("favorite-toggle").click()
+    expect(page.locator("#error")).to_contain_text("수정 실패")                   # 실패는 기존 #error (role=alert)
+    expect(status).to_have_text("")
+
+
+def test_notify_focus_kept_when_redrawn_at_midnight(clock_page: Page, seed):
+    clock_page.clock.install(time=dt(2026, 10, 12, 23, 59, 30, tzinfo=KST_ZONE))
+    seed(NOTIFY_TODOS)
+    open_app(clock_page)
+    open_notifications(clock_page)
+    notify_item(clock_page, "오늘 마감 일").focus()
+    clock_page.clock.run_for("01:00")                                            # 패널이 열린 채 자정을 넘긴다
+    expect(notify_item(clock_page, "오늘 마감 일")).to_have_attribute("data-category", "overdue")
+    expect(notify_item(clock_page, "오늘 마감 일")).to_be_focused()              # 같은 할 일의 알림에 포커스가 남는다
+    expect(clock_page.get_by_test_id("notification-panel")).to_be_visible()
+
+    notify_item(clock_page, "지난 일").focus()                                   # 포커스한 알림이 사라지면 같은 자리로
+    clock_page.evaluate("allTodos = allTodos.filter((t) => t.id !== 3); applyFilters()")
+    expect(clock_page.get_by_test_id("notification-item").nth(1)).to_be_focused()

@@ -3,42 +3,147 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light dark">
     <title>To-Do List</title>
+    <script>
+      // 테마는 그리기 전에 정한다 (깜빡임 방지). "system" 이면 data-theme 을 두지 않고 OS 설정(prefers-color-scheme)을 따른다
+      const THEME_KEY = "todo.v6.theme";
+      const THEMES = ["system", "light", "dark"];
+
+      function storedTheme() {
+        try {
+          const theme = localStorage.getItem(THEME_KEY);
+          return THEMES.includes(theme) ? theme : "system";
+        } catch {
+          return "system";                       // 저장소를 쓸 수 없으면 시스템 테마
+        }
+      }
+
+      function applyTheme(theme) {
+        if (theme === "system") delete document.documentElement.dataset.theme;
+        else document.documentElement.dataset.theme = theme;
+      }
+
+      applyTheme(storedTheme());
+    </script>
     <style>
-        /* 색 토큰 — 새 화면(6.0.0)부터 이 변수를 쓴다 (테마는 4단계에서 여기에 덧붙인다) */
+        /* 색 토큰 — 모든 색은 여기서만 정한다. 다크 값은 아래 두 곳(시스템 다크, 직접 고른 다크)에 같은 값으로 둔다 */
         :root {
+          color-scheme: light;
+          --bg: #fff;
+          --text: #1f1f1f;
           --surface: #fff;
           --surface-muted: #f5f5f5;
-          --text-muted: #666;
+          --text-muted: #5f5f5f;
           --border: #e5e5e5;
           --accent: #2a4a8a;
+          --accent-soft: #eef3fc;
+          --accent-border: #c8d6f0;
+          --selected: #f3f7ff;
           --danger: #b00020;
+          --on-danger: #fff;
+          --pressed-bg: #333;
+          --pressed-text: #fff;
+          --recurrence: #6a4c93;
+          --favorite: #8a6d00;
+          --toast-bg: #333;
+          --toast-text: #fff;
+          --toast-action: #ffd54f;
+          --focus: #1a5fd0;
           --chart-bar: #2a4a8a;
           --chart-track: #eef3fc;
         }
-        body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+        @media (prefers-color-scheme: dark) {
+          :root:not([data-theme="light"]) {
+            color-scheme: dark;
+            --bg: #15171a;
+            --text: #e6e8eb;
+            --surface: #1e2126;
+            --surface-muted: #262a30;
+            --text-muted: #a8aeb8;
+            --border: #3a3f47;
+            --accent: #9db8ff;
+            --accent-soft: #22304d;
+            --accent-border: #3d5486;
+            --selected: #1f2a40;
+            --danger: #ff7b88;
+            --on-danger: #15171a;
+            --pressed-bg: #e6e8eb;
+            --pressed-text: #15171a;
+            --recurrence: #c9a8ff;
+            --favorite: #f2c94c;
+            --toast-bg: #3a3f47;
+            --toast-text: #fff;
+            --toast-action: #ffd54f;
+            --focus: #9db8ff;
+            --chart-bar: #9db8ff;
+            --chart-track: #22304d;
+          }
+        }
+        :root[data-theme="dark"] {
+          color-scheme: dark;
+          --bg: #15171a;
+          --text: #e6e8eb;
+          --surface: #1e2126;
+          --surface-muted: #262a30;
+          --text-muted: #a8aeb8;
+          --border: #3a3f47;
+          --accent: #9db8ff;
+          --accent-soft: #22304d;
+          --accent-border: #3d5486;
+          --selected: #1f2a40;
+          --danger: #ff7b88;
+          --on-danger: #15171a;
+          --pressed-bg: #e6e8eb;
+          --pressed-text: #15171a;
+          --recurrence: #c9a8ff;
+          --favorite: #f2c94c;
+          --toast-bg: #3a3f47;
+          --toast-text: #fff;
+          --toast-action: #ffd54f;
+          --focus: #9db8ff;
+          --chart-bar: #9db8ff;
+          --chart-track: #22304d;
+        }
+        body {
+          max-width: 640px;
+          margin: 2rem auto;
+          padding: 0 1rem;
+          font-family: system-ui, sans-serif;
+          color: var(--text);
+          background: var(--bg);
+        }
+        /* 키보드 포커스는 테마와 상관없이 잘 보이게 */
+        :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+        a { color: var(--accent); }
+        .app-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .3rem .8rem; }
+        .app-head h1 { margin: .67em 0; }
+        .theme-picker { display: flex; align-items: center; gap: .3rem; font-size: .85rem; }
+        .theme-picker select { padding: .25rem; }
+        #status-message { margin: .3rem 0; color: var(--text-muted); font-size: .9rem; }
+        #status-message:empty { display: none; }
         form { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
         input[type="text"] { flex: 1 1 12rem; padding: .5rem; }
         textarea { flex: 1 1 100%; min-height: 3.2rem; padding: .5rem; font: inherit; }
         .template-panel {
           padding: .6rem .8rem;
           margin-bottom: 1rem;
-          border: 1px dashed #c8d6f0;
+          border: 1px dashed var(--accent-border);
           border-radius: 6px;
         }
         .template-row { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-bottom: .4rem; }
         .template-row:last-child { margin-bottom: 0; }
         ul { list-style: none; padding: 0; }
-        li { display: flex; align-items: center; gap: .5rem; padding: .4rem 0; border-bottom: 1px solid #e5e5e5; }
+        li { display: flex; align-items: center; gap: .5rem; padding: .4rem 0; border-bottom: 1px solid var(--border); }
         .content { flex: 1; display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
-        .done { text-decoration: line-through; color: #888; }
+        .done { text-decoration: line-through; color: var(--text-muted); }
         .version {
-          color: #666;
+          color: var(--text-muted);
           font-size: 0.9rem;
           margin-top: -1rem;
           margin-bottom: 1.5rem;
         }
-        #error { color: #b00020; }
+        #error { color: var(--danger); }
         .controls {
           margin-bottom: 1rem;
         }
@@ -50,6 +155,7 @@
         }
         .filter-buttons {
           display: flex;
+          flex-wrap: wrap;
           gap: .5rem;
           margin-top: .5rem;
         }
@@ -59,9 +165,9 @@
           cursor: pointer;
         }
         .filter-buttons button.active {
-          background: #333;
-          color: #fff;
-          border-color: #333;
+          background: var(--pressed-bg);
+          color: var(--pressed-text);
+          border-color: var(--pressed-bg);
         }
         .sort-controls {
           display: flex;
@@ -75,16 +181,16 @@
           padding: .4rem;
         }
 
-        .view-toggle { display: flex; gap: .5rem; margin-top: .8rem; }
+        .view-toggle { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .8rem; }
         .view-toggle button { padding: .4rem .8rem; cursor: pointer; }
-        .view-toggle button.active { color: #fff; background: #333; border-color: #333; }
+        .view-toggle button.active { color: var(--pressed-text); background: var(--pressed-bg); border-color: var(--pressed-bg); }
 
         .calendar { margin-bottom: 1rem; }
         .calendar[hidden] { display: none; }
-        .calendar-nav { display: flex; align-items: center; gap: .5rem; margin-bottom: .5rem; }
+        .calendar-nav { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-bottom: .5rem; }
         .calendar-nav strong { flex: 1; text-align: center; }
         .calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 2px; }
-        .calendar-weekday { padding: .2rem 0; font-size: .8rem; text-align: center; color: #666; }
+        .calendar-weekday { padding: .2rem 0; font-size: .8rem; text-align: center; color: var(--text-muted); }
         .calendar-day {
           display: flex;
           flex-direction: column;
@@ -95,26 +201,28 @@
           overflow: hidden;
           font: inherit;
           text-align: left;
-          background: #fff;
-          border: 1px solid #e5e5e5;
+          color: var(--text);
+          background: var(--surface);
+          border: 1px solid var(--border);
           cursor: pointer;
         }
-        .calendar-day.today { border-color: #2a4a8a; box-shadow: inset 0 0 0 1px #2a4a8a; }
-        .calendar-day.today .calendar-date { color: #2a4a8a; font-weight: bold; }
-        .calendar-day.selected { background: #f3f7ff; }
+        .calendar-day.today { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+        .calendar-day.today .calendar-date { color: var(--accent); font-weight: bold; }
+        .calendar-day.selected { background: var(--selected); }
         .calendar-date { font-size: .8rem; }
         .calendar-chip {
           overflow: hidden;
           font-size: .72rem;
           white-space: nowrap;
           text-overflow: ellipsis;
-          color: #333;
+          color: var(--text);
         }
         .calendar-chip.high { font-weight: bold; }
-        .calendar-chip.done { color: #888; text-decoration: line-through; }
-        .calendar-chip.overdue { color: #b00020; }
-        .calendar-more { font-size: .72rem; color: #666; }
-        .calendar-selected { margin: .5rem 0 0; font-size: .9rem; color: #555; }
+        .calendar-chip.done { color: var(--text-muted); text-decoration: line-through; }
+        .calendar-chip.overdue { color: var(--danger); }
+        .calendar-chip.overdue::before { content: "⚠ "; }   /* 색 외에 기호로도 기한 초과를 표시 */
+        .calendar-more { font-size: .72rem; color: var(--text-muted); }
+        .calendar-selected { margin: .5rem 0 0; font-size: .9rem; color: var(--text-muted); }
 
         .dashboard { display: flex; flex-direction: column; gap: .8rem; margin-bottom: 1rem; }
         .dashboard[hidden] { display: none; }
@@ -134,7 +242,7 @@
         .dash-panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem; }
         .dash-range { display: flex; gap: .3rem; }
         .dash-range button { padding: .25rem .6rem; cursor: pointer; }
-        .dash-range button.active { color: #fff; background: #333; border-color: #333; }
+        .dash-range button.active { color: var(--pressed-text); background: var(--pressed-bg); border-color: var(--pressed-bg); }
         .dash-summary { margin: .4rem 0; font-size: .9rem; }
         .dash-note { margin: .4rem 0 0; font-size: .8rem; color: var(--text-muted); }
         /* 일별 막대 — 막대 사이 2px, 위쪽만 4px 둥글게, 마우스를 올리면 칸 전체가 툴팁 대상 */
@@ -207,7 +315,7 @@
           font-weight: bold;
           line-height: 1.2rem;
           text-align: center;
-          color: #fff;
+          color: var(--on-danger);
           background: var(--danger);
           border-radius: 999px;
         }
@@ -247,19 +355,23 @@
 
         @media (max-width: 560px) {
           .kanban-columns { grid-template-columns: minmax(0, 1fr); }   /* 좁은 화면에서는 열을 세로로 쌓는다 */
+          /* 목록 항목: 내용이 한 글자 폭으로 눌리지 않게 Edit/Delete 를 다음 줄(오른쪽)로 넘긴다 */
+          #todo-list > li { flex-wrap: wrap; }
+          #todo-list > li > .content { flex: 1 1 calc(100% - 6.5rem); }   /* 체크박스 2개 + ☆ 를 뺀 나머지 폭 */
+          #todo-list > li > .content + button { margin-left: auto; }
         }
 
-        .export-links { display: flex; align-items: center; gap: .5rem; margin-top: .8rem; font-size: .9rem; }
+        .export-links { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .8rem; font-size: .9rem; }
         .export-links a {
           padding: .3rem .7rem;
-          color: #2a4a8a;
+          color: var(--accent);
           text-decoration: none;
-          border: 1px solid #c8d6f0;
+          border: 1px solid var(--accent-border);
           border-radius: 4px;
         }
 
         .overdue {
-          color: #b00020;
+          color: var(--danger);
           font-weight: bold;
         }
 
@@ -269,7 +381,7 @@
           gap: .4rem 1rem;
           padding: .6rem .8rem;
           margin-bottom: 1rem;
-          background: #f5f5f5;
+          background: var(--surface-muted);
           border-radius: 6px;
         }
 
@@ -278,18 +390,18 @@
         .tag {
           padding: .1rem .5rem;
           font-size: .8rem;
-          border: 1px solid #c8d6f0;
+          border: 1px solid var(--accent-border);
           border-radius: 999px;
-          background: #eef3fc;
-          color: #2a4a8a;
+          background: var(--accent-soft);
+          color: var(--accent);
           cursor: pointer;
         }
 
-        .meta { display: flex; flex-wrap: wrap; gap: .6rem; font-size: .8rem; color: #777; }
+        .meta { display: flex; flex-wrap: wrap; gap: .6rem; font-size: .8rem; color: var(--text-muted); }
         .meta:empty { display: none; }
-        .dday { font-weight: bold; color: #2a4a8a; }
-        .recurrence { font-weight: bold; color: #6a4c93; }
-        .dday.overdue { color: #b00020; }
+        .dday { font-weight: bold; color: var(--accent); }
+        .recurrence { font-weight: bold; color: var(--recurrence); }
+        .dday.overdue { color: var(--danger); }
 
         .edit-form { flex: 1; margin: 0; }
 
@@ -300,29 +412,31 @@
           gap: .5rem;
           padding: .4rem .6rem;
           margin-bottom: .5rem;
-          border: 1px solid #e5e5e5;
+          border: 1px solid var(--border);
           border-radius: 6px;
         }
-        .bulk-bar #bulk-count { margin-right: auto; font-size: .9rem; color: #555; }
-        li.selected { background: #f3f7ff; }
+        .bulk-bar #bulk-count { margin-right: auto; font-size: .9rem; color: var(--text-muted); }
+        li.selected { background: var(--selected); }
 
         .undo-toast {
           position: fixed;
           left: 50%;
           bottom: 1.5rem;
           transform: translateX(-50%);
+          max-width: calc(100% - 2rem);
+          box-sizing: border-box;
           display: flex;
           align-items: center;
           gap: .8rem;
           padding: .6rem 1rem;
-          color: #fff;
-          background: #333;
+          color: var(--toast-text);
+          background: var(--toast-bg);
           border-radius: 6px;
           box-shadow: 0 2px 8px rgba(0, 0, 0, .25);
         }
         .undo-toast[hidden] { display: none; }
         .undo-toast button {
-          color: #ffd54f;
+          color: var(--toast-action);
           font-weight: bold;
           background: none;
           border: none;
@@ -330,10 +444,10 @@
         }
 
         .subtask-head { display: flex; align-items: center; gap: .6rem; font-size: .85rem; }
-        .subtask-toggle { padding: 0; color: #2a4a8a; background: none; border: none; cursor: pointer; }
-        .subtask-progress { display: inline-flex; align-items: center; gap: .3rem; color: #555; }
+        .subtask-toggle { padding: 0; color: var(--accent); background: none; border: none; cursor: pointer; }
+        .subtask-progress { display: inline-flex; align-items: center; gap: .3rem; color: var(--text-muted); }
         .subtask-progress progress { width: 5rem; height: .6rem; }
-        .subtasks { margin-top: .2rem; padding-left: .6rem; border-left: 2px solid #e5e5e5; }
+        .subtasks { margin-top: .2rem; padding-left: .6rem; border-left: 2px solid var(--border); }
         .subtasks ul { margin: 0; }
         .subtasks li { padding: .15rem 0; border-bottom: none; font-size: .9rem; }
         .subtasks li span { flex: 1; min-width: 0; }
@@ -344,7 +458,7 @@
           padding: 0 .2rem;
           font-size: 1.2rem;
           line-height: 1;
-          color: #c9a400;
+          color: var(--favorite);
           background: none;
           border: none;
           cursor: pointer;
@@ -352,7 +466,17 @@
      </style>
 </head>
 <body>
-    <h1>To-Do List</h1>
+    <header class="app-head">
+      <h1>To-Do List</h1>
+      <!-- 테마 — 시스템(기본)/라이트/다크, 이 브라우저(localStorage)에 저장한다 -->
+      <label class="theme-picker">테마
+        <select id="theme-select" data-testid="theme-select">
+          <option value="system">시스템</option>
+          <option value="light">라이트</option>
+          <option value="dark">다크</option>
+        </select>
+      </label>
+    </header>
     <p class="version">Version 6.0.0</p>
     <!-- 마감일 알림 센터 — 앱 안에서만 보인다. 읽음 표시는 이 브라우저(localStorage)에만 저장한다 -->
     <div class="notify-bar">
@@ -543,6 +667,7 @@
       <button type="button" id="bulk-delete" data-testid="bulk-delete" disabled>삭제</button>
     </div>
     <p id="error" role="alert" hidden></p>
+    <p id="status-message" data-testid="status-message" role="status" aria-live="polite"></p>
     <ul id="todo-list"></ul>
     <div id="undo-toast" class="undo-toast" data-testid="undo-toast" role="status" hidden>
       <span id="undo-message"></span>
@@ -598,14 +723,25 @@
           return res.status === 204 ? null : res.json();
         }
 
-        // 작업을 실행하고, 실패하면 화면에 이유를 띄운다
-        async function run(what, job) {
+        // 작업을 실행하고, 실패하면 화면에 이유를 띄운다. done 을 주면 성공했을 때 상태 메시지로 알린다
+        const STATUS_MS = 4000;
+        let statusTimer = null;
+
+        function showStatus(text) {
+          $("status-message").textContent = text;
+          clearTimeout(statusTimer);
+          if (text) statusTimer = setTimeout(() => showStatus(""), STATUS_MS);
+        }
+
+        async function run(what, job, done) {
           try {
             await job();
             errorEl.hidden = true;
+            if (done) showStatus(done);
           } catch (e) {
             errorEl.textContent = `${what} 실패: ${e.message}`;
             errorEl.hidden = false;
+            if (done) showStatus("");
           }
         }
 
@@ -1165,9 +1301,19 @@
             lastUnread = unread;
           }
 
-          $("notification-list").replaceChildren(...(notifications.length
+          // 패널이 열린 채 다시 그리면(자정 등) 포커스가 사라지지 않게 같은 할 일 → 같은 자리 → [닫기] 순으로 돌려준다
+          const list = $("notification-list");
+          const items = () => [...list.querySelectorAll(".notify-item")];
+          const focused = !notifyPanelEl.hidden && list.contains(document.activeElement) ? document.activeElement : null;
+          const focusIndex = focused ? items().indexOf(focused) : -1;
+          list.replaceChildren(...(notifications.length
             ? notifications.map((n) => renderNotification(n, today))
             : [el("li", { className: "notify-empty", textContent: "알림이 없습니다." })]));
+          if (focused) {
+            const next = items();
+            (next.find((b) => b.dataset.todoId === focused.dataset.todoId) ||
+              next[Math.min(focusIndex, next.length - 1)] || $("notification-close")).focus();
+          }
         }
 
         function renderNotification(n, today) {
@@ -1223,6 +1369,18 @@
         notifyPanelEl.addEventListener("keydown", (event) => {
           if (event.key === "Escape") setNotificationsOpen(false);
         });
+        // 다른 탭에서 바꾼 테마·알림 읽음 표시를 이 탭에도 반영한다
+        window.addEventListener("storage", (event) => {
+          if (event.key === THEME_KEY || event.key === null) {
+            applyTheme(storedTheme());
+            syncThemeSelect();
+          }
+          if (event.key === NOTIFY_STORAGE_KEY || event.key === null) {
+            readKeys = loadReadKeys();
+            renderNotifications(todayStr());
+          }
+        });
+
         $("notification-read-all").onclick = () => {
           for (const n of notifications) readKeys.add(n.key);
           saveReadKeys();
@@ -1286,7 +1444,7 @@
         const save = (todo, overrides) => run("수정", async () => {
           await api(`/todos/${todo.id}`, "PUT", toPayload(todo, overrides));
           await load();
-        });
+        }, "변경을 저장했습니다.");
 
         function render(todos, today) {
           listEl.replaceChildren(...todos.map((todo) =>
@@ -1518,7 +1676,7 @@
               }));
               editingId = null;
               await load();
-            });
+            }, "할 일을 수정했습니다.");
           };
 
           const li = el("li");
@@ -1554,7 +1712,7 @@
             selectedIds.clear();
             if (result.deleted.length) showUndo(result.deleted);
             await load();
-          });
+          }, action === "delete" ? "" : `${ids.length}개를 ${action === "complete" ? "완료" : "미완료"}로 바꿨습니다.`);
         }
 
         $("bulk-complete").onclick = () => bulk("complete");
@@ -1587,7 +1745,7 @@
           run("실행 취소", async () => {
             await api("/todos/restore", "POST", { ids });
             await load();
-          });
+          }, `${ids.length}개를 복구했습니다.`);
         };
 
         priorityOptions($("priority"), DEFAULT_PRIORITY);
@@ -1614,7 +1772,7 @@
               event.target.reset();
               await load();
             }
-          });
+          }, "할 일을 추가했습니다.");
         };
 
         // ---------- 작업 템플릿 — 불러오면 추가 폼을 채우고, 생성은 위 추가 흐름을 그대로 쓴다 ----------
@@ -1687,7 +1845,7 @@
               });
               editingTemplateId = null;
               await fetchTemplates();
-            });
+            }, "템플릿을 수정했습니다.");
           };
           return form;
         }
@@ -1711,7 +1869,7 @@
             { name: $("template-name").value.trim(), ...formTemplateFields() });
           $("template-name").value = "";
           await fetchTemplates(created.id);
-        });
+        }, "템플릿을 저장했습니다.");
 
         $("template-edit").onclick = () => {
           editingTemplateId = selectedTemplate()?.id ?? null;
@@ -1725,8 +1883,27 @@
           run("템플릿 삭제", async () => {
             await api(`/task-templates/${t.id}`, "DELETE");
             await fetchTemplates("");
-          });
+          }, "템플릿을 삭제했습니다.");
         };
+
+        // ---------- 테마 — 시스템(기본)/라이트/다크. 그리기 전 적용은 <head> 의 applyTheme() ----------
+        const themeSelectEl = $("theme-select");
+
+        function syncThemeSelect() {
+          themeSelectEl.value = storedTheme();
+        }
+
+        themeSelectEl.onchange = () => {
+          const theme = themeSelectEl.value;
+          applyTheme(theme);
+          try {
+            localStorage.setItem(THEME_KEY, theme);
+          } catch {
+            // 저장할 수 없어도 이 화면에서는 고른 테마가 유지된다
+          }
+          showStatus(`테마: ${themeSelectEl.selectedOptions[0].textContent}`);
+        };
+        syncThemeSelect();
 
         load();
         run("템플릿 목록 불러오기", () => fetchTemplates());

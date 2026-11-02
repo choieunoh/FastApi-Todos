@@ -289,6 +289,15 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 라이트/다크/시스템 테마(기본 시스템), 선택은 localStorage에 저장한다. 색은 `:root` CSS 변수(토큰)로 정의한다.
 - 375px 너비에서 가로 스크롤 없이 핵심 조작이 된다. 칸반 열은 좁은 화면에서 세로로 쌓는다.
 - `aria-label`, focus visible, 색 외의 상태 표시, 키보드 조작. 기존 v5 기능·버튼을 없애거나 숨기지 않는다.
+- 구현 세부:
+  - 테마 select(`시스템/라이트/다크`)는 제목 옆에 둔다. localStorage `todo.v6.theme` = `system|light|dark`, 모르는 값·저장소 불가는 시스템이다. 저장할 수 없어도 그 화면에서는 고른 테마가 유지된다.
+  - `<head>`의 인라인 스크립트가 그리기 전에 `<html data-theme>`를 정한다(시스템이면 속성 없음 → `prefers-color-scheme`). 다크 토큰은 `@media (prefers-color-scheme: dark) :root:not([data-theme="light"])`와 `:root[data-theme="dark"]` 두 곳에 같은 값으로 둔다. `color-scheme`으로 기본 입력·버튼도 테마를 따른다.
+  - 모든 색은 `:root` 토큰이다(그림자 제외). 화면에 보이는 글자는 두 테마 모두 4.5:1 이상, 차트 막대·포커스 표시는 3:1 이상이다(비활성 컨트롤은 WCAG 예외).
+  - 다른 탭에서 바꾼 테마와 알림 읽음 표시는 `storage` 이벤트로 이 탭에도 반영한다.
+  - 키보드 포커스는 `:focus-visible` 3px 윤곽선. 색 외 표시: 목록·칸반 `⚠ 기한 초과` 글자, 캘린더 기한 초과 칩 앞 `⚠`, 완료는 취소선, 선택된 필터·보기는 `aria-pressed`.
+  - 성공 메시지는 `#status-message`(`role="status"`)에 4초 보여준다(추가·수정·체크·일괄 완료/미완료·복구·템플릿·테마). 실패는 기존 `#error`(`role="alert"`)이고, 이때 성공 메시지는 지운다.
+  - 560px 이하: 칸반 열 세로 배치, 목록 항목의 Edit/Delete는 다음 줄 오른쪽. 툴바·필터·보기·캘린더 이동 버튼은 줄바꿈된다.
+  - 알림 패널이 열린 채 다시 그려지면(자정 등) 포커스를 같은 할 일의 알림 → 같은 자리의 알림 → [닫기] 순으로 돌려준다.
 
 ## 배포 설정 (현재 명세)
 | 항목 | 값 |
@@ -342,7 +351,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - **테스트용 선택자**: UI 테스트 대상 요소에는 `data-testid`를 붙인다.
   - v4: `todo-item`, `todo-tag`, `tag-filter`, `edit-form`, `edit-save`, `edit-cancel`, `stat-total`, `stat-completed`, `stat-active`, `stat-overdue`, `stat-rate`, `dday`
   - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-toggle`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `template-load`, `template-edit`, `template-delete`, `template-name`, `template-save`, `template-edit-form`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`, `calendar-chip`
-  - v6: `view-stats`, `dash-total`, `dash-completed`, `dash-active`, `dash-overdue`, `dash-rate`, `dash-trend`, `dash-trend-summary`, `dash-trend-table`, `dash-excluded`, `dash-priority`, `dash-compliance`, `dash-basis`, `kanban`, `kanban-column`(`data-status="active"|"completed"`), `kanban-count`, `kanban-card`(`data-id`), `kanban-move`, `kanban-status`, `notification-bell`, `notification-badge`, `notification-panel`, `notification-item`(`data-category`, `data-todo-id`), `notification-read-all`, `notification-live` (이후 단계에서 테마 testid를 추가한다). 목록 항목(`todo-item`)에는 `data-id`가 있다. 칸반 카드 안의 태그·배지·진행률·D-day·즐겨찾기는 목록과 같은 testid(`todo-tag`, `recurrence-badge`, `subtask-progress`, `dday`, `favorite-toggle`)를 쓴다.
+  - v6: `view-stats`, `dash-total`, `dash-completed`, `dash-active`, `dash-overdue`, `dash-rate`, `dash-trend`, `dash-trend-summary`, `dash-trend-table`, `dash-excluded`, `dash-priority`, `dash-compliance`, `dash-basis`, `kanban`, `kanban-column`(`data-status="active"|"completed"`), `kanban-count`, `kanban-card`(`data-id`), `kanban-move`, `kanban-status`, `notification-bell`, `notification-badge`, `notification-panel`, `notification-item`(`data-category`, `data-todo-id`), `notification-read-all`, `notification-live` `theme-select`, `status-message`. 목록 항목(`todo-item`)에는 `data-id`가 있다. 칸반 카드 안의 태그·배지·진행률·D-day·즐겨찾기는 목록과 같은 testid(`todo-tag`, `recurrence-badge`, `subtask-progress`, `dday`, `favorite-toggle`)를 쓴다.
 - **커밋**: Conventional Commits 형식이다 (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
   - 기능 커밋 예: `feat: add favorites for Version 5.0.0`
 
@@ -397,7 +406,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - [x] 2-2. UI 칸반: 2열·카드 내용, 드래그 양방향·같은 열 무시, 키보드 이동과 포커스, 실패 롤백(드래그·버튼), 동시 클릭 PUT 1회, 반복 다음 카드, 필터·정렬, 다른 보기(목록·캘린더·통계)와 일치, 375px 터치(세로 배치, 가로 스크롤 없음).
 - [x] 3-1. API: 라우트가 v5 + `/stats` 그대로(알림 경로 없음), 응답·저장 필드에 알림 필드 없음, 본문에 섞인 읽음 값은 저장되지 않음.
 - [x] 3-2. UI 알림: 분류·순서·배지, 경계(연말·윤년·월말, 완료·마감일 없음·이틀 뒤 제외, 중복 키), 읽음 유지(새로고침), 재렌더 중복 없음, 완료·삭제 정리와 실행 취소, 마감일 변경 시 새 알림, 자정 넘김(가짜 시계), 탭 복귀, 항목으로 이동(가린 필터 해제), 키보드·스크린리더, 빈 상태, 깨진/막힌 저장소, 불러오기 실패 시 읽음 보존, 목록·칸반·캘린더·통계 바·대시보드와 같은 기준, 375px 터치.
-- [ ] 4. 테마 유지, 375px, 키보드 접근성.
+- [x] 4. 테마(시스템 기본·선택 유지·그리기 전 적용·저장소 불가·탭 간 반영), 모든 보기 라이트/다크 명도 대비, 375px 모든 보기 가로 스크롤 없음, 키보드 조작·포커스 표시, 색 외 상태 표시, 성공/실패 메시지, 자정 재렌더 시 알림 포커스 유지.
 - [ ] 5. 전체 pytest, Docker 이미지 빌드·실행, README/CLAUDE.md/릴리스 노트.
 
 ## 회귀 기준 (v4.0.0) — 5.0.0의 모든 단계에서 계속 통과해야 한다
