@@ -263,6 +263,13 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 카드: 제목, 우선순위, 마감일, 태그, 하위 작업 진행률, 반복 배지, 즐겨찾기.
 - 드래그 앤 드롭 + 키보드·터치용 '완료로 이동/진행 중으로 이동' 버튼. 상태 변경은 기존 `PUT /todos/{id}` + `toPayload`로 한다(다른 필드 보존). 완료 시각·반복 생성은 서버 규칙(§3, §15)을 따른다.
 - 실패하면 이전 상태로 되돌리고 `#error`를 보여준다. 처리 중인 카드는 중복 요청하지 않는다. 성공하면 `load()`로 목록·캘린더·통계·알림을 함께 갱신한다.
+- **새 API 없음.** 서버와 저장 구조는 바뀌지 않는다. 화면의 `TODO_FIELDS`는 서버 `TodoIn` 필드와 같아야 한다(테스트로 확인).
+- 보기 전환에 [칸반](목록·캘린더·칸반·통계 순서). 칸반 보기에서는 항목 목록과 일괄 작업 바를 숨긴다(카드는 일괄 선택 대상이 아니다). 다른 보기로 가면 카드를 DOM에서 비운다.
+- 카드 순서는 지금 고른 정렬을 따른다. 검색·태그·즐겨찾기 필터는 그대로 적용하고, 상태 필터가 '진행 중'/'완료'이면 반대쪽 열에 '상태 필터로 숨김'을 보여준다. 열 제목 옆에 카드 수 `(N)`.
+- 카드 표시: ☆/★ 토글(기존 PUT), 제목(완료는 취소선), `우선순위 X`, `마감 YYYY-MM-DD`, D-day, 기한 초과는 왼쪽 빨간 테두리와 `⚠ 기한 초과` 글자(색만으로 구분하지 않는다), 반복 배지, 하위 진행률, 태그 칩(누르면 태그 필터). 카드 편집·삭제는 목록 보기에서 한다.
+- 드래그: 다른 열에서 끌어온, 요청 중이 아닌 카드만 놓을 수 있다(같은 열에 놓으면 요청 없음). 이동 버튼은 항상 보이며 `aria-label`은 `<제목> 완료로 이동`/`<제목> 진행 중으로 이동`. 버튼으로 옮기면 포커스가 옮긴 카드의 버튼을 따라간다. 결과는 `role="status"` 영역에 알린다.
+- 낙관적 업데이트: 누르는 즉시 열을 옮기고 카드를 '처리 중'(버튼 비활성, 드래그 불가)으로 둔다.
+- 560px 이하에서는 열을 세로로 쌓는다.
 
 ### 23. 마감일 알림 센터 (3단계)
 - 앱을 열었을 때/실행 중에 보이는 앱 내부 알림만 한다. 미완료이고 마감일이 있는 항목만 대상이다: 오늘+1 '내일 마감', 오늘 '오늘 마감', 오늘 이전 '기한 초과'.
@@ -326,7 +333,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - **테스트용 선택자**: UI 테스트 대상 요소에는 `data-testid`를 붙인다.
   - v4: `todo-item`, `todo-tag`, `tag-filter`, `edit-form`, `edit-save`, `edit-cancel`, `stat-total`, `stat-completed`, `stat-active`, `stat-overdue`, `stat-rate`, `dday`
   - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-toggle`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `template-load`, `template-edit`, `template-delete`, `template-name`, `template-save`, `template-edit-form`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`, `calendar-chip`
-  - v6: `view-stats`, `dash-total`, `dash-completed`, `dash-active`, `dash-overdue`, `dash-rate`, `dash-trend`, `dash-trend-summary`, `dash-trend-table`, `dash-excluded`, `dash-priority`, `dash-compliance`, `dash-basis` (이후 단계에서 칸반·알림·테마 testid를 추가한다)
+  - v6: `view-stats`, `dash-total`, `dash-completed`, `dash-active`, `dash-overdue`, `dash-rate`, `dash-trend`, `dash-trend-summary`, `dash-trend-table`, `dash-excluded`, `dash-priority`, `dash-compliance`, `dash-basis`, `kanban`, `kanban-column`(`data-status="active"|"completed"`), `kanban-count`, `kanban-card`(`data-id`), `kanban-move`, `kanban-status` (이후 단계에서 알림·테마 testid를 추가한다). 칸반 카드 안의 태그·배지·진행률·D-day·즐겨찾기는 목록과 같은 testid(`todo-tag`, `recurrence-badge`, `subtask-progress`, `dday`, `favorite-toggle`)를 쓴다.
 - **커밋**: Conventional Commits 형식이다 (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
   - 기능 커밋 예: `feat: add favorites for Version 5.0.0`
 
@@ -377,7 +384,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - [x] 1-1. API `/stats`: 빈 목록, 완료율 1자리·사사오입, 기한 초과(KST 자정), 추이 자정 경계·7/30일 창 끝, 완료일 누락(`trend_excluded`), 시간대 없는 시각(UTC), 우선순위 분포, 준수율(당일·분모 0), 하위 할 일 무시, v1~v3 데이터, 읽기 전용.
 - [x] 1-2. 날짜 기준: 브라우저 시간대가 달라도(LA) D-day·기한 초과·캘린더 오늘·처음 달·생성/완료일이 Asia/Seoul 날짜. 기존 v5 날짜 테스트(B15~B17, B21, 캘린더) 통과.
 - [x] 1-3. UI 대시보드: 카드·추이(7/30일)·표 요약·제외 수·우선순위·준수율('데이터 없음')이 `/stats`와 같고, 기존 통계 바는 정수 %, 필터 무관, 변경 후 갱신, 실패 시 `#error`.
-- [ ] 2. 칸반: 상태 변경·롤백·중복 방지·필드 보존(반복·즐겨찾기·태그)·모바일 대체 조작.
+- [x] 2-1. API(칸반 계약): `TODO_FIELDS` = `TodoIn` 필드, `toPayload`식 PUT으로 옮겨도 다른 필드·하위 할 일·`created_at` 보존, 완료 시각 규칙, 반복 항목은 다음 일정 1회만, 없는 id 404.
+- [x] 2-2. UI 칸반: 2열·카드 내용, 드래그 양방향·같은 열 무시, 키보드 이동과 포커스, 실패 롤백(드래그·버튼), 동시 클릭 PUT 1회, 반복 다음 카드, 필터·정렬, 다른 보기(목록·캘린더·통계)와 일치, 375px 터치(세로 배치, 가로 스크롤 없음).
 - [ ] 3. 알림: 날짜 분류·중복 방지·읽음 유지·삭제 정리·자정 재계산.
 - [ ] 4. 테마 유지, 375px, 키보드 접근성.
 - [ ] 5. 전체 pytest, Docker 이미지 빌드·실행, README/CLAUDE.md/릴리스 노트.

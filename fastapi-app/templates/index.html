@@ -156,6 +156,52 @@
         details summary { margin-top: .4rem; font-size: .85rem; cursor: pointer; }
         .bulk-bar[hidden] { display: none; }
 
+        .kanban { margin-bottom: 1rem; }
+        .kanban[hidden] { display: none; }
+        .kanban-help { margin: 0 0 .5rem; font-size: .8rem; color: var(--text-muted); }
+        .kanban-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6rem; }
+        .kanban-column {
+          min-width: 0;
+          padding: .5rem;
+          background: var(--surface-muted);
+          border: 2px dashed transparent;
+          border-radius: 6px;
+        }
+        .kanban-column.drop-target { border-color: var(--accent); }
+        .kanban-column h2 { margin: 0 0 .4rem; font-size: .95rem; }
+        .kanban-count { font-weight: normal; color: var(--text-muted); }
+        .kanban-cards { display: flex; flex-direction: column; gap: .4rem; min-height: 3rem; margin: 0; }
+        .kanban-card {
+          display: flex;
+          flex-direction: column;
+          align-items: stretch;
+          gap: .3rem;
+          padding: .5rem .6rem;
+          background: var(--surface);
+          border: 1px solid var(--border);
+          border-radius: 6px;
+          cursor: grab;
+        }
+        .kanban-card.dragging { opacity: .5; }
+        .kanban-card.pending { opacity: .6; cursor: progress; }
+        .kanban-card.kanban-overdue { border-left: 4px solid var(--danger); }   /* 전역 .overdue(빨간 굵은 글씨)와 구분 */
+        .kanban-card-head { display: flex; align-items: flex-start; gap: .3rem; }
+        .kanban-card-title { flex: 1; min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
+        .kanban-card .meta { gap: .4rem; }
+        .kanban-move { align-self: flex-start; padding: .2rem .6rem; font-size: .8rem; cursor: pointer; }
+        .kanban-empty { margin: 0; padding: .4rem 0; font-size: .8rem; color: var(--text-muted); border: none; }
+        .visually-hidden {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          overflow: hidden;
+          clip: rect(0 0 0 0);
+          white-space: nowrap;
+        }
+        @media (max-width: 560px) {
+          .kanban-columns { grid-template-columns: minmax(0, 1fr); }   /* 좁은 화면에서는 열을 세로로 쌓는다 */
+        }
+
         .export-links { display: flex; align-items: center; gap: .5rem; margin-top: .8rem; font-size: .9rem; }
         .export-links a {
           padding: .3rem .7rem;
@@ -355,6 +401,7 @@
       <div class="view-toggle" data-testid="view-toggle" role="group" aria-label="보기">
         <button type="button" data-view="list">목록</button>
         <button type="button" data-view="calendar">캘린더</button>
+        <button type="button" data-view="kanban">칸반</button>
         <button type="button" data-view="stats">통계</button>
       </div>
     </div>
@@ -409,6 +456,21 @@
       <div class="calendar-grid" id="calendar-grid"></div>
       <p class="calendar-selected" id="calendar-selected"></p>
     </section>
+    <!-- 칸반 — completed 하나로 2열. 상태 변경은 기존 PUT(toPayload) 만 쓴다 -->
+    <section id="kanban" class="kanban" data-testid="kanban" aria-label="칸반 보드" hidden>
+      <p class="kanban-help" id="kanban-help">카드를 다른 열로 끌어 놓거나, 카드의 이동 버튼(키보드·터치)으로 상태를 바꿉니다.</p>
+      <div class="kanban-columns">
+        <section class="kanban-column" data-testid="kanban-column" data-status="active" aria-labelledby="kanban-title-active">
+          <h2 id="kanban-title-active">진행 중 <span class="kanban-count" data-testid="kanban-count"></span></h2>
+          <ul class="kanban-cards" aria-labelledby="kanban-title-active"></ul>
+        </section>
+        <section class="kanban-column" data-testid="kanban-column" data-status="completed" aria-labelledby="kanban-title-completed">
+          <h2 id="kanban-title-completed">완료 <span class="kanban-count" data-testid="kanban-count"></span></h2>
+          <ul class="kanban-cards" aria-labelledby="kanban-title-completed"></ul>
+        </section>
+      </div>
+      <p class="visually-hidden" id="kanban-status" data-testid="kanban-status" role="status" aria-live="polite"></p>
+    </section>
     <div class="bulk-bar" id="bulk-bar" data-testid="bulk-bar" aria-label="일괄 작업">
       <span id="bulk-count" aria-live="polite">0개 선택</span>
       <button type="button" id="bulk-select-all" data-testid="bulk-select-all">보이는 항목 전체 선택</button>
@@ -444,7 +506,7 @@
         let allTodos = [];
         let currentFilter = "all";
 
-        let currentView = "list";                // "list" | "calendar" | "stats"
+        let currentView = "list";                // "list" | "calendar" | "kanban" | "stats"
         let calendarMonth = null;                // 캘린더에 보이는 달 { year, month(0~11) } — 처음 열 때 이번 달
         let selectedDate = null;                 // 캘린더에서 고른 날짜 (YYYY-MM-DD)
         const CALENDAR_CHIPS = 3;                // 날짜 칸에 보여줄 최대 항목 수 (나머지는 +N)
@@ -610,7 +672,7 @@
           favoriteFilterEl.setAttribute("aria-pressed", favoriteOnly);
 
           // 캘린더 보기에서는 고른 날짜의 항목만 목록에 보인다 (일괄 작업도 이 목록 기준)
-          // 통계 보기에는 항목 목록이 없다
+          // 칸반·통계 보기에는 항목 목록이 없다 (칸반 카드는 일괄 선택 대상이 아니다)
           const visible = currentView === "list" ? filtered
             : currentView === "calendar" ? filtered.filter((todo) => selectedDate && todo.due_date === selectedDate)
             : [];
@@ -623,6 +685,7 @@
           renderStats(today);
           renderViewToggle();
           renderCalendar(filtered, today);
+          renderKanban(filtered, today);
           render(visible, today);
           renderBulkBar();
         }
@@ -644,9 +707,11 @@
             btn.setAttribute("aria-pressed", active);
           });
           $("calendar").hidden = currentView !== "calendar";
+          $("kanban").hidden = currentView !== "kanban";
           $("dashboard").hidden = currentView !== "stats";
-          listEl.hidden = currentView === "stats";
-          $("bulk-bar").hidden = currentView === "stats";
+          const noList = currentView === "kanban" || currentView === "stats";
+          listEl.hidden = noList;
+          $("bulk-bar").hidden = noList;
         }
 
         function setCalendarMonth(year, month) {
@@ -811,6 +876,150 @@
           });
         });
 
+        // ---------- 칸반 — 진행 중/완료 2열. 상태 변경은 PUT(toPayload) 이라 다른 필드는 그대로 남는다 ----------
+        const KANBAN_COLUMNS = { active: false, completed: true };   // 열 → completed 값
+        const kanbanColumns = document.querySelectorAll(".kanban-column");
+        const pendingMoves = new Set();          // 요청 중인 카드 (중복 요청 방지)
+        let draggedId = null;
+        let kanbanFocus = null;                  // 버튼으로 옮긴 카드 { id } — 다시 그린 뒤 이동 버튼에 포커스를 돌려준다
+
+        // 카드 순서는 지금 고른 정렬, 검색·태그·즐겨찾기 필터는 그대로, 상태 필터는 해당 열을 숨긴다
+        function renderKanban(filtered, today) {
+          if (currentView !== "kanban") {        // 숨은 보기의 카드가 다른 보기의 선택자에 걸리지 않게 비운다
+            kanbanColumns.forEach((column) => column.querySelector(".kanban-cards").replaceChildren());
+            return;
+          }
+          for (const column of kanbanColumns) {
+            const completed = KANBAN_COLUMNS[column.dataset.status];
+            const hidden = currentFilter !== "all" && (currentFilter === "completed") !== completed;
+            const cards = filtered.filter((todo) => todo.completed === completed);
+            column.querySelector(".kanban-count").textContent = hidden ? "" : `(${cards.length})`;
+            const empty = hidden ? "상태 필터로 숨김" : cards.length ? "" : "항목 없음";
+            column.querySelector(".kanban-cards").replaceChildren(...(empty
+              ? [el("li", { className: "kanban-empty", textContent: empty })]
+              : cards.map((todo) => renderCard(todo, today))));
+          }
+          const move = kanbanFocus && $("kanban").querySelector(`[data-id="${kanbanFocus.id}"] [data-testid=kanban-move]`);
+          if (move && !move.disabled) move.focus();
+        }
+
+        function renderCard(todo, today) {
+          const pending = pendingMoves.has(todo.id);
+          const overdue = isOverdue(todo, today);
+          const card = el("li", { className: "kanban-card", draggable: !pending });
+          card.classList.toggle("pending", pending);
+          card.classList.toggle("kanban-overdue", overdue);
+          card.dataset.testid = "kanban-card";
+          card.dataset.id = todo.id;
+          if (pending) card.setAttribute("aria-busy", "true");
+
+          const star = button(todo.favorite ? "★" : "☆", () => save(todo, { favorite: !todo.favorite }));
+          star.className = "favorite";
+          star.dataset.testid = "favorite-toggle";
+          star.setAttribute("aria-label", todo.favorite ? "즐겨찾기 해제" : "즐겨찾기 등록");
+          star.setAttribute("aria-pressed", todo.favorite);
+          const title = el("span", { className: todo.completed ? "kanban-card-title done" : "kanban-card-title", textContent: todo.title });
+          const head = el("div", { className: "kanban-card-head" });
+          head.append(star, title);
+
+          const meta = el("div", { className: "meta" });
+          meta.append(el("span", { textContent: `우선순위 ${todo.priority || DEFAULT_PRIORITY}` }));
+          if (todo.due_date) meta.append(el("span", { textContent: `마감 ${todo.due_date}` }));
+          if (todo.due_date && !todo.completed) {
+            const dday = el("span", { className: overdue ? "dday overdue" : "dday", textContent: ddayLabel(todo.due_date, today) });
+            dday.dataset.testid = "dday";
+            meta.append(dday);
+          }
+          if (overdue) meta.append(el("span", { className: "overdue", textContent: "⚠ 기한 초과" }));
+          const badge = recurrenceBadge(todo);
+          if (badge) meta.append(badge);
+          const progress = subtaskProgress(todo);
+          if (progress) meta.append(progress);
+
+          // 드래그를 못 쓰는 키보드·터치용 — 항상 보인다
+          const toCompleted = !todo.completed;
+          const move = button(toCompleted ? "완료로 이동 →" : "← 진행 중으로 이동", () => {
+            // 마지막으로 다시 그릴 때까지 포커스가 카드를 따라가게 두고, 이 이동이 끝나면 놓는다
+            const focus = { id: todo.id };
+            kanbanFocus = focus;
+            moveCard(todo, toCompleted).then(() => { if (kanbanFocus === focus) kanbanFocus = null; });
+          });
+          move.className = "kanban-move";
+          move.dataset.testid = "kanban-move";
+          move.disabled = pending;
+          move.setAttribute("aria-label", `${todo.title} ${toCompleted ? "완료로" : "진행 중으로"} 이동`);
+
+          card.addEventListener("dragstart", (event) => {
+            draggedId = todo.id;
+            event.dataTransfer.setData("text/plain", String(todo.id));
+            event.dataTransfer.effectAllowed = "move";
+            card.classList.add("dragging");
+          });
+          card.addEventListener("dragend", () => {
+            draggedId = null;
+            card.classList.remove("dragging");
+            clearDropTargets();
+          });
+
+          card.append(head, meta, tagChips(todo), move);
+          return card;
+        }
+
+        function clearDropTargets() {
+          kanbanColumns.forEach((column) => column.classList.remove("drop-target"));
+        }
+
+        // 다른 열에서 끌어온, 요청 중이 아닌 카드만 놓을 수 있다
+        function draggedTodo(completed) {
+          const todo = allTodos.find((t) => t.id === draggedId);
+          return todo && todo.completed !== completed && !pendingMoves.has(todo.id) ? todo : null;
+        }
+
+        kanbanColumns.forEach((column) => {
+          const completed = KANBAN_COLUMNS[column.dataset.status];
+          column.addEventListener("dragover", (event) => {
+            if (!draggedTodo(completed)) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "move";
+            column.classList.add("drop-target");
+          });
+          column.addEventListener("dragleave", (event) => {
+            if (!column.contains(event.relatedTarget)) column.classList.remove("drop-target");
+          });
+          column.addEventListener("drop", (event) => {
+            event.preventDefault();
+            const todo = draggedTodo(completed);
+            draggedId = null;
+            clearDropTargets();
+            if (todo) moveCard(todo, completed);
+          });
+        });
+
+        // 화면에서 먼저 옮기고 PUT 한다. 실패하면 원래 열로 되돌리고, 성공하면 load() 로 목록·캘린더·통계를 서버 값에 맞춘다
+        // (완료 시각·다음 반복 일정은 서버 규칙 그대로)
+        function moveCard(todo, completed) {
+          if (pendingMoves.has(todo.id) || todo.completed === completed) return Promise.resolve();
+          const payload = toPayload(todo, { completed });
+          const previous = todo.completed;
+          pendingMoves.add(todo.id);
+          todo.completed = completed;
+          applyFilters();
+          return run("상태 변경", async () => {
+            try {
+              await api(`/todos/${todo.id}`, "PUT", payload);
+            } catch (e) {
+              todo.completed = previous;
+              $("kanban-status").textContent = `'${todo.title}' 이동 실패 — 원래 열로 되돌렸습니다.`;
+              throw e;
+            } finally {
+              pendingMoves.delete(todo.id);
+              applyFilters();
+            }
+            $("kanban-status").textContent = `'${todo.title}'을(를) ${completed ? "완료" : "진행 중"}(으)로 옮겼습니다.`;
+            await load();
+          });
+        }
+
         // 통계는 필터와 상관없이 전체 목록 기준
         function renderStats(today) {
           const total = allTodos.length;
@@ -886,20 +1095,11 @@
             className: todo.completed ? "done" : overdue ? "overdue" : "",
           });
 
-          const tags = el("div", { className: "tags" });
-          tags.append(...todo.tags.map((tag) => {
-            const chip = button(`#${tag}`, () => { tagFilterEl.value = tag; applyFilters(); });
-            chip.className = "tag";
-            chip.dataset.testid = "todo-tag";
-            return chip;
-          }));
+          const tags = tagChips(todo);
 
           const meta = el("div", { className: "meta" });
-          if (todo.recurrence && todo.recurrence !== DEFAULT_RECURRENCE) {
-            const badge = el("span", { className: "recurrence", textContent: `🔁 ${RECURRENCES[todo.recurrence]}` });
-            badge.dataset.testid = "recurrence-badge";
-            meta.append(badge);
-          }
+          const badge = recurrenceBadge(todo);
+          if (badge) meta.append(badge);
           if (todo.due_date && !todo.completed) {
             const dday = el("span", { className: overdue ? "dday overdue" : "dday", textContent: ddayLabel(todo.due_date, today) });
             dday.dataset.testid = "dday";
@@ -916,6 +1116,37 @@
           return li;
         }
 
+        // ---------- 목록 항목·칸반 카드 공용 조각 ----------
+        function tagChips(todo) {
+          const tags = el("div", { className: "tags" });
+          tags.append(...todo.tags.map((tag) => {
+            const chip = button(`#${tag}`, () => { tagFilterEl.value = tag; applyFilters(); });
+            chip.className = "tag";
+            chip.dataset.testid = "todo-tag";
+            return chip;
+          }));
+          return tags;
+        }
+
+        function recurrenceBadge(todo) {
+          if (!todo.recurrence || todo.recurrence === DEFAULT_RECURRENCE) return null;
+          const badge = el("span", { className: "recurrence", textContent: `🔁 ${RECURRENCES[todo.recurrence]}` });
+          badge.dataset.testid = "recurrence-badge";
+          return badge;
+        }
+
+        // 하위 진행률 `1/2 (50%)` — 하위가 없으면 null (숨김)
+        function subtaskProgress(todo) {
+          const total = todo.subtasks.length;
+          if (!total) return null;
+          const done = todo.subtasks.filter((s) => s.completed).length;
+          const progress = el("span", { className: "subtask-progress" });
+          progress.dataset.testid = "subtask-progress";
+          progress.append(el("progress", { max: total, value: done }),
+            `${done}/${total} (${Math.round(done / total * 100)}%)`);
+          return progress;
+        }
+
         // 하위 할 일 — 상위 completed 와 연동하지 않고 진행률만 보여준다
         const subtaskUrl = (todoId, id) => `/todos/${todoId}/subtasks${id ? `/${id}` : ""}`;
 
@@ -925,7 +1156,6 @@
 
         function renderSubtasks(todo) {
           const total = todo.subtasks.length;
-          const done = todo.subtasks.filter((s) => s.completed).length;
           const expanded = expandedSubtasks.has(todo.id);
 
           const toggle = button(`${expanded ? "▾" : "▸"} 하위 작업 (${total})`, () => {
@@ -938,13 +1168,8 @@
 
           const head = el("div", { className: "subtask-head" });
           head.append(toggle);
-          if (total) {                           // 하위가 없으면 진행률을 숨긴다
-            const progress = el("span", { className: "subtask-progress" });
-            progress.dataset.testid = "subtask-progress";
-            progress.append(el("progress", { max: total, value: done }),
-              `${done}/${total} (${Math.round(done / total * 100)}%)`);
-            head.append(progress);
-          }
+          const progress = subtaskProgress(todo);
+          if (progress) head.append(progress);
 
           const wrap = el("div");
           wrap.append(head);

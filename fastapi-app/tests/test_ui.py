@@ -1606,3 +1606,239 @@ def test_dashboard_error_shown(page: Page, seed):
     page.route("**/stats", lambda route: route.fulfill(status=500, body="boom"))
     page.get_by_test_id("view-toggle").get_by_role("button", name="통계").click()
     expect(page.locator("#error")).to_contain_text("통계 불러오기 실패")
+
+
+# ---------- 6.0.0 2단계: 칸반 보드 ----------
+
+KANBAN_TODOS = [
+    todo(1, "보고서", priority="높음", due_date="2026-10-15", tags=["학교"], favorite=True,
+         subtasks=[sub(1, "초안", True), sub(2, "검토")]),
+    todo(2, "주간 회의", due_date="2026-10-12", recurrence="weekly", tags=["팀"]),
+    todo(3, "밀린 일", priority="낮음", due_date="2026-10-10"),
+    todo(4, "끝난 일", completed=True, completed_at="2026-10-11T03:00:00+00:00"),
+]
+
+
+def open_kanban(page: Page) -> None:
+    page.get_by_test_id("view-toggle").get_by_role("button", name="칸반").click()
+    expect(page.get_by_test_id("kanban")).to_be_visible()
+
+
+def column(page: Page, status: str):
+    return page.locator(f"[data-testid=kanban-column][data-status={status}]")
+
+
+def column_titles(page: Page, status: str):
+    return column(page, status).locator(".kanban-card-title")
+
+
+def card(page: Page, title: str):
+    return page.get_by_test_id("kanban-card").filter(has=page.locator(".kanban-card-title", has_text=title))
+
+
+def server_todo(page: Page, todo_id: int) -> dict:
+    return next(t for t in page.request.get("/todos").json() if t["id"] == todo_id)
+
+
+def test_kanban_columns_and_card_content(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    expect(page.get_by_test_id("kanban")).to_be_hidden()
+    open_kanban(page)
+    expect(page.get_by_test_id("view-toggle").get_by_role("button", name="칸반")).to_have_attribute("aria-pressed", "true")
+    expect(page.get_by_test_id("kanban-column")).to_have_count(2)
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+    expect(column_titles(page, "completed")).to_have_text(["끝난 일"])
+    expect(page.get_by_test_id("kanban-count")).to_have_text(["(3)", "(1)"])
+
+    report = card(page, "보고서")
+    expect(report).to_contain_text("우선순위 높음")
+    expect(report).to_contain_text("마감 2026-10-15")
+    expect(report.get_by_test_id("dday")).to_have_text("D-3")
+    expect(report.get_by_test_id("todo-tag")).to_have_text(["#학교"])
+    expect(report.get_by_test_id("subtask-progress")).to_have_text("1/2 (50%)")
+    expect(report.get_by_test_id("favorite-toggle")).to_have_text("★")
+    expect(card(page, "주간 회의").get_by_test_id("recurrence-badge")).to_have_text("🔁 매주")
+    expect(card(page, "밀린 일")).to_contain_text("⚠ 기한 초과")                  # 색 외에도 글자로 표시
+    expect(card(page, "끝난 일").locator(".kanban-card-title")).to_have_class(re.compile(r"\bdone\b"))
+    expect(page.locator(ITEM)).to_have_count(0)                                  # 칸반 보기에는 항목 목록이 없다
+    expect(page.get_by_test_id("bulk-bar")).to_be_hidden()
+    assert stats(page) == ("4", "1", "3", "1", "25%")
+
+    page.get_by_test_id("view-toggle").get_by_role("button", name="목록").click()
+    expect(page.locator(ITEM)).to_have_count(4)
+    expect(page.get_by_test_id("kanban-card")).to_have_count(0)                  # 숨은 칸반 카드는 남기지 않는다
+
+
+def test_kanban_drag_and_drop_both_ways(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    card(page, "보고서").drag_to(column(page, "completed"))
+    expect(column_titles(page, "completed")).to_have_text(["보고서", "끝난 일"])
+    expect(column_titles(page, "active")).to_have_text(["주간 회의", "밀린 일"])
+    expect(page.get_by_test_id("stat-completed")).to_have_text("2")
+    saved = server_todo(page, 1)
+    assert saved["completed"] is True and saved["completed_at"] is not None
+    # 기존 PUT 전체 교체여도 다른 필드는 그대로
+    assert (saved["priority"], saved["due_date"], saved["tags"], saved["favorite"], len(saved["subtasks"])) == \
+        ("높음", "2026-10-15", ["학교"], True, 2)
+
+    card(page, "보고서").drag_to(column(page, "active"))
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+    expect(page.get_by_test_id("stat-completed")).to_have_text("1")
+    assert server_todo(page, 1)["completed_at"] is None
+
+
+def test_kanban_drop_on_same_column_does_nothing(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    puts = []
+    page.on("request", lambda r: puts.append(r.url) if r.method == "PUT" else None)
+    card(page, "보고서").drag_to(column(page, "active"))
+    page.wait_for_timeout(300)
+    assert puts == []
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+
+
+def test_kanban_keyboard_move_buttons(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    move = page.get_by_role("button", name="밀린 일 완료로 이동")                   # 키보드·스크린리더용 이름
+    move.focus()
+    page.keyboard.press("Enter")
+    expect(column_titles(page, "completed")).to_have_text(["밀린 일", "끝난 일"])
+    back = page.get_by_role("button", name="밀린 일 진행 중으로 이동")
+    expect(back).to_be_focused()                                                 # 옮긴 카드의 버튼으로 포커스가 따라간다
+    expect(page.get_by_test_id("kanban-status")).to_have_text("'밀린 일'을(를) 완료(으)로 옮겼습니다.")
+    page.keyboard.press("Space")
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+    expect(page.get_by_role("button", name="밀린 일 완료로 이동")).to_be_focused()
+
+
+def test_kanban_failure_rolls_back(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    page.route("**/todos/1", lambda route: route.fulfill(status=500, body="boom")
+               if route.request.method == "PUT" else route.continue_())
+    card(page, "보고서").drag_to(column(page, "completed"))
+    expect(page.locator("#error")).to_contain_text("상태 변경 실패")
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])   # 원래 열로 돌아온다
+    expect(column_titles(page, "completed")).to_have_text(["끝난 일"])
+    expect(page.get_by_test_id("kanban-status")).to_contain_text("원래 열로 되돌렸습니다")
+    expect(page.get_by_test_id("stat-completed")).to_have_text("1")
+    assert server_todo(page, 1)["completed"] is False
+
+    card(page, "보고서").get_by_test_id("kanban-move").click()                    # 버튼으로 옮겨도 같다
+    expect(page.locator("#error")).to_contain_text("상태 변경 실패")
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+    expect(card(page, "보고서").get_by_test_id("kanban-move")).to_be_enabled()
+
+
+def test_kanban_no_duplicate_requests(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    puts = []
+    page.on("request", lambda r: puts.append(r.url) if r.method == "PUT" else None)
+    # 같은 순간 두 번 눌러도 요청은 한 번 (처리 중인 카드는 무시)
+    card(page, "보고서").get_by_test_id("kanban-move").evaluate("b => { b.click(); b.click(); }")
+    expect(column_titles(page, "completed")).to_have_text(["보고서", "끝난 일"])
+    page.wait_for_load_state("networkidle")
+    assert len(puts) == 1
+    assert server_todo(page, 1)["completed"] is True
+
+
+def test_kanban_recurring_creates_next_card(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    card(page, "주간 회의").drag_to(column(page, "completed"))
+    expect(column_titles(page, "completed")).to_have_text(["주간 회의", "끝난 일"])
+    expect(column_titles(page, "active")).to_have_text(["보고서", "밀린 일", "주간 회의"])   # 다음 일정은 목록 끝
+    nxt = column(page, "active").get_by_test_id("kanban-card").last
+    expect(nxt).to_contain_text("마감 2026-10-19")
+    expect(nxt.get_by_test_id("recurrence-badge")).to_have_text("🔁 매주")
+    expect(nxt.get_by_test_id("todo-tag")).to_have_text(["#팀"])
+    expect(page.get_by_test_id("stat-total")).to_have_text("5")
+
+
+def test_kanban_filters_and_sort(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    page.locator("#search").fill("보고")
+    expect(page.get_by_test_id("kanban-card")).to_have_count(1)
+    expect(column(page, "completed")).to_contain_text("항목 없음")
+    page.locator("#search").fill("")
+
+    page.get_by_test_id("favorite-filter").click()
+    expect(column_titles(page, "active")).to_have_text(["보고서"])
+    page.get_by_test_id("favorite-filter").click()
+
+    page.get_by_test_id("tag-filter").select_option("팀")
+    expect(column_titles(page, "active")).to_have_text(["주간 회의"])
+    page.get_by_test_id("tag-filter").select_option("")
+
+    page.locator("[data-filter=active]").click()
+    expect(column(page, "completed")).to_contain_text("상태 필터로 숨김")
+    expect(column(page, "completed").get_by_test_id("kanban-card")).to_have_count(0)
+    expect(column_titles(page, "active")).to_have_count(3)
+    page.locator("[data-filter=completed]").click()
+    expect(column(page, "active")).to_contain_text("상태 필터로 숨김")
+    expect(column_titles(page, "completed")).to_have_text(["끝난 일"])
+    page.locator("[data-filter=all]").click()
+
+    page.locator("#sort").select_option("due-date")                              # 카드 순서는 지금 고른 정렬
+    expect(column_titles(page, "active")).to_have_text(["밀린 일", "주간 회의", "보고서"])
+    page.locator("#sort").select_option("priority")
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+
+
+def test_kanban_changes_reflect_in_other_views(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    card(page, "보고서").get_by_test_id("kanban-move").click()
+    expect(column_titles(page, "completed")).to_have_text(["보고서", "끝난 일"])
+    card(page, "주간 회의").get_by_test_id("favorite-toggle").click()           # 카드의 즐겨찾기도 기존 PUT
+    expect(card(page, "주간 회의").get_by_test_id("favorite-toggle")).to_have_text("★")
+    assert server_todo(page, 2)["favorite"] is True
+    assert server_todo(page, 2)["recurrence"] == "weekly"
+
+    page.get_by_test_id("view-toggle").get_by_role("button", name="목록").click()
+    expect(item(page, "보고서").locator(DONE_BOX)).to_be_checked()
+    expect(item(page, "보고서").locator(".meta")).to_contain_text("완료:")
+
+    open_calendar(page)
+    expect(chips(page, "2026-10-15")).to_have_class(re.compile(r"\bdone\b"))
+
+    open_stats(page)
+    expect(page.get_by_test_id("dash-completed")).to_have_text("2")
+    assert stats(page)[1] == "2"
+
+
+@pytest.fixture
+def mobile_page(browser, base_url):
+    context = browser.new_context(base_url=base_url, timezone_id="Asia/Seoul", viewport={"width": 375, "height": 800},
+                                  has_touch=True, is_mobile=True)
+    page = context.new_page()
+    page.clock.set_fixed_time(f"{TODAY}T12:00:00")
+    yield page
+    context.close()
+
+
+def test_kanban_mobile_touch(mobile_page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(mobile_page)
+    mobile_page.get_by_test_id("view-toggle").get_by_role("button", name="칸반").tap()
+    expect(mobile_page.get_by_test_id("kanban")).to_be_visible()
+    active, done_col = column(mobile_page, "active").bounding_box(), column(mobile_page, "completed").bounding_box()
+    assert done_col["y"] >= active["y"] + active["height"]                     # 좁은 화면에서는 세로로 쌓인다
+    assert mobile_page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+    card(mobile_page, "보고서").get_by_test_id("kanban-move").tap()             # 터치는 이동 버튼으로
+    expect(column_titles(mobile_page, "completed")).to_have_text(["보고서", "끝난 일"])
+    assert mobile_page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")

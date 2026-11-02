@@ -1,3 +1,4 @@
+import re
 from datetime import date, datetime
 
 import pytest
@@ -1244,3 +1245,60 @@ def test_stats_is_read_only(isolated_file):
     assert main.RECENTLY_DELETED == buffer_before
     assert not main.TEMPLATE_FILE.exists()
     assert restore(deleted).status_code == 200
+
+
+# ---------- 6.0.0 2단계: 칸반 — 새 API 없이 기존 PUT(전체 교체) 만 쓴다 ----------
+# 화면의 toPayload(todo, {completed}) 와 같은 본문: GET 응답에서 클라이언트 필드만 골라 completed 만 바꾼다
+
+def js_todo_fields() -> list[str]:
+    html = main.INDEX_FILE.read_text(encoding="utf-8")
+    match = re.search(r"const TODO_FIELDS = \[([^\]]*)\]", html)
+    return re.findall(r'"(\w+)"', match.group(1))
+
+
+def kanban_move(todo_id: int, completed: bool):
+    todo = next(t for t in client.get("/todos").json() if t["id"] == todo_id)
+    return client.put(f"/todos/{todo_id}", json={**{k: todo[k] for k in js_todo_fields()}, "completed": completed})
+
+
+def test_kanban_payload_fields_match_server_model():
+    # 화면이 보내는 필드 목록이 서버 TodoIn 과 같아야 PUT 전체 교체에서 값이 지워지지 않는다
+    assert set(js_todo_fields()) == set(main.TodoIn.model_fields)
+
+
+def test_kanban_move_preserves_all_fields():
+    todo_id = create(title="칸반", description="설명", priority="높음", due_date="2026-10-20",
+                     tags=["학교", "과제"], favorite=True).json()["id"]
+    client.post(f"/todos/{todo_id}/subtasks", json={"title": "하위"})
+    before = client.get("/todos").json()[0]
+    moved = kanban_move(todo_id, True).json()
+    for key in ("title", "description", "priority", "due_date", "tags", "favorite", "recurrence",
+                "subtasks", "created_at"):
+        assert moved[key] == before[key], key
+    assert moved["completed"] is True
+    assert moved["completed_at"] is not None
+    back = kanban_move(todo_id, False).json()
+    assert back["completed"] is False
+    assert back["completed_at"] is None                              # 완료 시각 규칙(§3) 그대로
+    assert {k: back[k] for k in ("tags", "favorite", "subtasks")} == {k: before[k] for k in ("tags", "favorite", "subtasks")}
+
+
+def test_kanban_move_recurring_spawns_next_once():
+    todo_id = create(title="주간", due_date="2026-10-12", recurrence="weekly", favorite=True, tags=["팀"]).json()["id"]
+    assert kanban_move(todo_id, True).status_code == 200
+    todos = client.get("/todos").json()
+    assert len(todos) == 2
+    spawned = todos[1]
+    assert (spawned["due_date"], spawned["recurrence"], spawned["favorite"], spawned["tags"]) == \
+        ("2026-10-19", "weekly", True, ["팀"])
+    assert todos[0]["recurrence"] == "weekly" and todos[0]["next_spawned"] is True
+    kanban_move(todo_id, False)                                      # 진행 중으로 되돌렸다가
+    kanban_move(todo_id, True)                                       # 다시 완료해도
+    assert len(client.get("/todos").json()) == 2                     # 다음 일정은 하나뿐
+
+
+def test_kanban_move_missing_todo_404():
+    todo_id = create().json()["id"]
+    client.delete(f"/todos/{todo_id}")
+    payload = {"title": "할 일", "completed": True}
+    assert client.put(f"/todos/{todo_id}", json=payload).status_code == 404
