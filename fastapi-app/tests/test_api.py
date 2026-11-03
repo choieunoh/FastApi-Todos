@@ -1,3 +1,4 @@
+import re
 from datetime import date, datetime
 
 import pytest
@@ -211,7 +212,7 @@ def test_a22_real_todo_file_untouched():
 def test_index_served():
     res = client.get("/")
     assert res.status_code == 200
-    assert "Version 5.0.0" in res.text
+    assert "Version 6.0.0" in res.text
 
 
 # ---------- 5.0.0 1단계: 즐겨찾기 ----------
@@ -1084,3 +1085,256 @@ def test_export_route_does_not_shadow_todo_routes():
     todo_id = create().json()["id"]
     assert put(todo_id, title="수정").status_code == 200
     assert client.delete(f"/todos/{todo_id}").status_code == 204
+
+
+# ---------- 6.0.0 1단계: 통계 대시보드 (/stats) ----------
+
+STATS_NOW = datetime(2026, 10, 12, 3, 0, tzinfo=main.timezone.utc)   # 한국 시간 2026-10-12 12:00
+
+
+@pytest.fixture
+def stats_at(monkeypatch, isolated_file):
+    # 서버 시계를 고정하고, 원본 dict 그대로 파일에 넣은 뒤 /stats 를 부른다
+    def call(items: list[dict], at: datetime = STATS_NOW) -> dict:
+        monkeypatch.setattr(main, "now", lambda: at)
+        isolated_file.write_text(json_module.dumps(items, ensure_ascii=False), encoding="utf-8")
+        res = client.get("/stats")
+        assert res.status_code == 200
+        return res.json()
+    return call
+
+
+def raw(id: int, **fields) -> dict:
+    return {"id": id, "title": f"할 일 {id}", "description": "", "completed": False, **fields}
+
+
+def raw_done(id: int, completed_at: str | None, **fields) -> dict:
+    return raw(id, completed=True, completed_at=completed_at, **fields)
+
+
+def trend(stats: dict) -> dict[str, int]:
+    return {d["date"]: d["count"] for d in stats["daily_completions"] if d["count"]}
+
+
+def test_stats_empty_list(stats_at):
+    stats = stats_at([])
+    assert stats["today"] == "2026-10-12"
+    assert stats["timezone"] == "Asia/Seoul"
+    assert (stats["total"], stats["completed"], stats["active"], stats["overdue"]) == (0, 0, 0, 0)
+    assert stats["completion_rate"] == 0.0
+    assert len(stats["daily_completions"]) == 30
+    assert stats["daily_completions"][0]["date"] == "2026-09-13"
+    assert stats["daily_completions"][-1]["date"] == "2026-10-12"
+    assert (stats["completions_7d"], stats["completions_30d"], stats["trend_excluded"]) == (0, 0, 0)
+    assert stats["active_by_priority"] == {"높음": 0, "보통": 0, "낮음": 0}
+    assert stats["due_compliance"] == {"eligible": 0, "on_time": 0, "rate": None}   # 분모 0 → 데이터 없음
+
+
+def test_stats_counts_and_rate_one_decimal(stats_at):
+    stats = stats_at([raw_done(1, "2026-10-12T01:00:00+00:00"), raw(2), raw(3)])
+    assert (stats["total"], stats["completed"], stats["active"]) == (3, 1, 2)
+    assert stats["completion_rate"] == 33.3
+    stats = stats_at([raw_done(1, "2026-10-12T01:00:00+00:00"), raw_done(2, "2026-10-12T01:00:00+00:00"), raw(3)])
+    assert stats["completion_rate"] == 66.7
+
+
+def test_stats_rate_rounds_half_up(stats_at):
+    # 1/16 = 6.25 → 6.3 (파이썬 round 의 은행가 반올림이면 6.2)
+    stats = stats_at([raw_done(1, "2026-10-12T01:00:00+00:00")] + [raw(i) for i in range(2, 17)])
+    assert stats["completion_rate"] == 6.3
+
+
+def test_stats_overdue_uses_kst_today(stats_at):
+    items = [raw(1, due_date="2026-10-11"), raw(2, due_date="2026-10-12"), raw(3),
+             raw_done(4, "2026-10-12T01:00:00+00:00", due_date="2026-10-01")]
+    assert stats_at(items)["overdue"] == 1                           # 오늘 마감·마감일 없음·완료는 아니다
+    # UTC 로는 아직 10-11 이지만 한국 시간으로 10-12 가 되면 10-11 마감은 기한 초과다
+    kst_midnight = datetime(2026, 10, 11, 15, 0, tzinfo=main.timezone.utc)
+    assert stats_at([raw(1, due_date="2026-10-11")], at=kst_midnight)["overdue"] == 1
+    assert stats_at([raw(1, due_date="2026-10-11")], at=kst_midnight - main.timedelta(seconds=1))["overdue"] == 0
+
+
+def test_stats_trend_midnight_boundary(stats_at):
+    stats = stats_at([
+        raw_done(1, "2026-10-10T14:59:59+00:00"),                   # 한국 10-10 23:59:59
+        raw_done(2, "2026-10-10T15:00:00+00:00"),                   # 한국 10-11 00:00:00
+        raw_done(3, "2026-10-11T00:30:00+09:00"),                   # 이미 한국 시간으로 적힌 값
+    ])
+    assert trend(stats) == {"2026-10-10": 1, "2026-10-11": 2}
+
+
+def test_stats_trend_window_edges(stats_at):
+    stats = stats_at([
+        raw_done(1, "2026-09-13T00:00:00+09:00"),                   # 29일 전 — 30일 창 안
+        raw_done(2, "2026-09-12T23:59:59+09:00"),                   # 30일 전 — 창 밖
+        raw_done(3, "2026-10-06T00:00:00+09:00"),                   # 6일 전 — 7일 창 안
+        raw_done(4, "2026-10-05T23:59:59+09:00"),                   # 7일 전 — 7일 창 밖
+        raw_done(5, "2026-10-13T00:00:00+09:00"),                   # 미래 시각 — 창 밖
+    ])
+    assert trend(stats) == {"2026-09-13": 1, "2026-10-05": 1, "2026-10-06": 1}
+    assert (stats["completions_7d"], stats["completions_30d"]) == (1, 3)
+
+
+def test_stats_missing_completed_at_excluded_from_trend(stats_at):
+    stats = stats_at([raw_done(1, None), raw_done(2, None, due_date="2026-10-01"),
+                      {"id": 3, "title": "v1 완료", "description": "", "completed": True},   # 필드 자체가 없음
+                      raw_done(4, "2026-10-12T01:00:00+00:00")])
+    assert stats["completed"] == 4                                   # 완료 수에는 들어간다
+    assert stats["trend_excluded"] == 3                              # 추이에서는 빠지고 따로 센다
+    assert stats["completions_30d"] == 1
+    assert stats["due_compliance"]["eligible"] == 0                  # 완료 시각이 없으면 준수율 분모에서도 빠진다
+
+
+def test_stats_naive_datetime_treated_as_utc(stats_at):
+    # 시간대가 없는 예전 시각은 UTC 로 본다: 15:00 UTC = 한국 다음 날 00:00
+    stats = stats_at([raw_done(1, "2026-10-10T14:59:59"), raw_done(2, "2026-10-10T15:00:00")])
+    assert trend(stats) == {"2026-10-10": 1, "2026-10-11": 1}
+    assert stats["trend_excluded"] == 0
+
+
+def test_stats_active_by_priority(stats_at):
+    stats = stats_at([raw(1, priority="높음"), raw(2, priority="높음"), raw(3),
+                      raw(4, priority="낮음"), raw_done(5, None, priority="높음")])
+    assert stats["active_by_priority"] == {"높음": 2, "보통": 1, "낮음": 1}   # 완료 항목은 세지 않는다
+    assert list(stats["active_by_priority"]) == ["높음", "보통", "낮음"]
+
+
+def test_stats_due_compliance(stats_at):
+    stats = stats_at([
+        raw_done(1, "2026-10-05T14:59:59+00:00", due_date="2026-10-05"),  # 한국 10-05 23:59:59 — 당일 완료는 준수
+        raw_done(2, "2026-10-05T15:00:00+00:00", due_date="2026-10-05"),  # 한국 10-06 00:00 — 미준수
+        raw_done(3, "2026-10-01T00:00:00+00:00", due_date="2026-10-05"),  # 일찍 완료 — 준수
+        raw_done(4, "2026-10-01T00:00:00+00:00"),                         # 마감일 없음 — 분모 제외
+        raw(5, due_date="2026-10-01"),                                    # 미완료 — 분모 제외
+    ])
+    assert stats["due_compliance"] == {"eligible": 3, "on_time": 2, "rate": 66.7}
+
+
+def test_stats_ignores_subtasks(stats_at):
+    stats = stats_at([raw(1, subtasks=[{"id": 1, "title": "하위", "completed": True}])])
+    assert (stats["total"], stats["completed"], stats["completion_rate"]) == (1, 0, 0.0)
+
+
+def test_stats_v1_to_v3_data(stats_at):
+    stats = stats_at([{"id": 1, "title": "v1", "description": "", "completed": False},
+                      {"id": 2, "title": "v3", "description": "", "completed": False, "due_date": "",
+                       "priority": "높음", "tags": ["a"]}])
+    assert (stats["total"], stats["active"], stats["overdue"]) == (2, 2, 0)
+    assert stats["active_by_priority"] == {"높음": 1, "보통": 1, "낮음": 0}
+
+
+def test_stats_matches_api_flow(monkeypatch):
+    # 실제 API 로 만든 데이터도 같은 규칙으로 센다 (completed_at 은 서버가 매긴다)
+    monkeypatch.setattr(main, "now", lambda: STATS_NOW)
+    create(title="완료", completed=True, due_date="2026-10-12")
+    create(title="초과", due_date="2026-10-01", priority="낮음")
+    stats = client.get("/stats").json()
+    assert (stats["total"], stats["completed"], stats["overdue"], stats["completion_rate"]) == (2, 1, 1, 50.0)
+    assert trend(stats) == {"2026-10-12": 1}
+    assert stats["due_compliance"] == {"eligible": 1, "on_time": 1, "rate": 100.0}
+
+
+def test_stats_is_read_only(isolated_file):
+    seed_rich_data()
+    deleted = create(title="지움").json()["id"]
+    delete(deleted)
+    before = isolated_file.read_bytes()
+    buffer_before = dict(main.RECENTLY_DELETED)
+    assert client.get("/stats").status_code == 200
+    assert isolated_file.read_bytes() == before
+    assert main.RECENTLY_DELETED == buffer_before
+    assert not main.TEMPLATE_FILE.exists()
+    assert restore(deleted).status_code == 200
+
+
+# ---------- 6.0.0 2단계: 칸반 — 새 API 없이 기존 PUT(전체 교체) 만 쓴다 ----------
+# 화면의 toPayload(todo, {completed}) 와 같은 본문: GET 응답에서 클라이언트 필드만 골라 completed 만 바꾼다
+
+def js_todo_fields() -> list[str]:
+    html = main.INDEX_FILE.read_text(encoding="utf-8")
+    match = re.search(r"const TODO_FIELDS = \[([^\]]*)\]", html)
+    return re.findall(r'"(\w+)"', match.group(1))
+
+
+def kanban_move(todo_id: int, completed: bool):
+    todo = next(t for t in client.get("/todos").json() if t["id"] == todo_id)
+    return client.put(f"/todos/{todo_id}", json={**{k: todo[k] for k in js_todo_fields()}, "completed": completed})
+
+
+def test_kanban_payload_fields_match_server_model():
+    # 화면이 보내는 필드 목록이 서버 TodoIn 과 같아야 PUT 전체 교체에서 값이 지워지지 않는다
+    assert set(js_todo_fields()) == set(main.TodoIn.model_fields)
+
+
+def test_kanban_move_preserves_all_fields():
+    todo_id = create(title="칸반", description="설명", priority="높음", due_date="2026-10-20",
+                     tags=["학교", "과제"], favorite=True).json()["id"]
+    client.post(f"/todos/{todo_id}/subtasks", json={"title": "하위"})
+    before = client.get("/todos").json()[0]
+    moved = kanban_move(todo_id, True).json()
+    for key in ("title", "description", "priority", "due_date", "tags", "favorite", "recurrence",
+                "subtasks", "created_at"):
+        assert moved[key] == before[key], key
+    assert moved["completed"] is True
+    assert moved["completed_at"] is not None
+    back = kanban_move(todo_id, False).json()
+    assert back["completed"] is False
+    assert back["completed_at"] is None                              # 완료 시각 규칙(§3) 그대로
+    assert {k: back[k] for k in ("tags", "favorite", "subtasks")} == {k: before[k] for k in ("tags", "favorite", "subtasks")}
+
+
+def test_kanban_move_recurring_spawns_next_once():
+    todo_id = create(title="주간", due_date="2026-10-12", recurrence="weekly", favorite=True, tags=["팀"]).json()["id"]
+    assert kanban_move(todo_id, True).status_code == 200
+    todos = client.get("/todos").json()
+    assert len(todos) == 2
+    spawned = todos[1]
+    assert (spawned["due_date"], spawned["recurrence"], spawned["favorite"], spawned["tags"]) == \
+        ("2026-10-19", "weekly", True, ["팀"])
+    assert todos[0]["recurrence"] == "weekly" and todos[0]["next_spawned"] is True
+    kanban_move(todo_id, False)                                      # 진행 중으로 되돌렸다가
+    kanban_move(todo_id, True)                                       # 다시 완료해도
+    assert len(client.get("/todos").json()) == 2                     # 다음 일정은 하나뿐
+
+
+def test_kanban_move_missing_todo_404():
+    todo_id = create().json()["id"]
+    client.delete(f"/todos/{todo_id}")
+    payload = {"title": "할 일", "completed": True}
+    assert client.put(f"/todos/{todo_id}", json=payload).status_code == 404
+
+
+# ---------- 6.0.0 3단계: 알림 센터 — 서버 API·저장 필드 없음 (계산은 화면, 읽음은 localStorage) ----------
+# 알림 분류·중복 키·읽음 저장은 tests/test_ui.py 에서 브라우저로 검증한다. 여기서는 API 계약이 그대로인지 고정한다
+
+V6_ROUTES = {
+    ("GET", "/"), ("GET", "/metrics"), ("GET", "/stats"),
+    ("GET", "/todos"), ("POST", "/todos"), ("PUT", "/todos/{todo_id}"), ("DELETE", "/todos/{todo_id}"),
+    ("GET", "/todos/export"), ("POST", "/todos/bulk"), ("POST", "/todos/restore"),
+    ("POST", "/todos/{todo_id}/subtasks"), ("PUT", "/todos/{todo_id}/subtasks/{subtask_id}"),
+    ("DELETE", "/todos/{todo_id}/subtasks/{subtask_id}"),
+    ("GET", "/task-templates"), ("POST", "/task-templates"),
+    ("PUT", "/task-templates/{template_id}"), ("DELETE", "/task-templates/{template_id}"),
+}
+TODO_RESPONSE_FIELDS = {"id", "title", "description", "completed", "priority", "due_date", "tags", "favorite",
+                        "recurrence", "created_at", "completed_at", "subtasks", "next_spawned"}
+
+
+def test_v6_routes_are_v5_plus_stats_only():
+    from fastapi.routing import APIRoute
+    routes = {(m, r.path) for r in app.routes if isinstance(r, APIRoute) for m in r.methods}
+    assert routes == V6_ROUTES                                       # 알림용 경로는 없다
+
+
+def test_todo_response_has_no_notification_fields():
+    create(title="마감", due_date="2026-10-12")
+    assert set(client.get("/todos").json()[0]) == TODO_RESPONSE_FIELDS
+    assert set(TodoItem.model_fields) == TODO_RESPONSE_FIELDS        # 저장 구조도 그대로
+
+
+def test_todo_ignores_client_notification_state(isolated_file):
+    # 화면의 읽음 상태 같은 값이 본문에 섞여 와도 저장되지 않는다 (todo.json 구조 유지)
+    todo_id = create(title="마감", due_date="2026-10-12", read=True, notification="x").json()["id"]
+    put(todo_id, title="마감", due_date="2026-10-13", read=True)
+    saved = json_module.loads(isolated_file.read_text(encoding="utf-8"))[0]
+    assert set(saved) == TODO_RESPONSE_FIELDS

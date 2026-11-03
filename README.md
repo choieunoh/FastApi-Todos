@@ -1,7 +1,7 @@
 # FastAPI To-Do List
 
 FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 데이터는 JSON 파일에 저장합니다.
-**5.0.0**을 단계별로 개발하고 있습니다 (화면 표시는 `Version 5.0.0`). 개발 명세는 [CLAUDE.md](CLAUDE.md)에 있습니다.
+**6.0.0** 릴리스 후보입니다(화면 표시는 `Version 6.0.0`, 아직 배포 전). 변경 내용은 [RELEASE_NOTES.md](RELEASE_NOTES.md), 개발 명세는 [CLAUDE.md](CLAUDE.md)에 있습니다.
 
 ## 기능 (4.0.0)
 - 할 일 추가·수정·삭제, 완료 체크
@@ -22,6 +22,17 @@ FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 데이터는 JSON 파�
 | 6 | 작업 템플릿 (현재 폼을 템플릿으로 저장, 불러오기로 추가 폼 채우기, 인라인 수정·삭제) | 완료 |
 | 7 | 데이터 내보내기 (CSV·JSON 다운로드, 전체 목록) | 완료 |
 | 8 | 캘린더 보기 (월 그리드, 이전·다음·오늘, 날짜별 항목, 필터 적용) | 완료 |
+
+## 6.0.0 진행 상황
+날짜 기준(D-day, 기한 초과, 캘린더의 오늘, 생성/완료일, 통계)은 브라우저 시간대와 상관없이 **Asia/Seoul**입니다. 시각은 계속 UTC로 저장합니다.
+
+| 단계 | 기능 | 상태 |
+|---|---|---|
+| 1 | 통계 대시보드 ([통계] 보기: 완료율 소수 1자리, 최근 7일/30일 일별 완료, 우선순위별 미완료, 마감일 준수율, 표 요약) | 완료 |
+| 2 | 2열 칸반 보드 ([칸반] 보기: 진행 중/완료, 드래그 앤 드롭과 키보드·터치용 이동 버튼, 실패하면 원래 열로 되돌림. 새 API 없이 기존 `PUT /todos/{id}` 사용) | 완료 |
+| 3 | 마감일 알림 센터 (제목 아래 🔔: 미완료 할 일의 내일 마감·오늘 마감·기한 초과, 읽지 않은 수 배지, 누르면 그 할 일로 이동, 자정·탭 복귀 때 다시 계산. 읽음 표시는 이 브라우저 localStorage에만 저장 — 서버·새 API 없음) | 완료 |
+| 4 | 라이트/다크/시스템 테마(제목 옆 [테마], 기본 시스템, 이 브라우저 localStorage에 저장·다른 탭에도 반영), 375px에서 가로 스크롤 없음(목록 항목·칸반 열 세로 배치), 키보드 포커스 표시·색 외 상태 표시(⚠·취소선)·성공 메시지(`role="status"`), 모든 화면 텍스트 명도 대비 4.5:1 이상 자동 검사 | 완료 |
+| 5 | 전체 테스트(332 passed), 런타임 의존성만으로 실행 확인, 릴리스 노트. **Docker 빌드·컨테이너 검증은 미완료** — 아래 "6.0.0 배포 전 확인" | 진행 중 |
 
 ## 실행
 
@@ -55,6 +66,7 @@ http://localhost:8000 에서 열립니다. 데이터 파일 위치는 환경변�
 | DELETE | `/todos/{id}/subtasks/{sid}` | 하위 할 일 삭제 (204). 없는 할 일·하위 할 일은 404 |
 | GET | `/todos/export?format=json` | 전체 목록을 JSON 파일로 다운로드 (`todos-YYYYMMDD.json`, 날짜는 한국 시간) |
 | GET | `/todos/export?format=csv` | 전체 목록을 CSV 파일로 다운로드 (`todos-YYYYMMDD.csv`, UTF-8 BOM). `format`이 없거나 다른 값이면 422 |
+| GET | `/stats` | 통계 대시보드 집계 (200, 읽기 전용). 전체/완료/미완료/기한 초과, 완료율(소수 1자리), 최근 30일 일별 완료(`daily_completions`), 7·30일 합계, 완료 시각이 없어 추이에서 뺀 수(`trend_excluded`), 우선순위별 미완료, 마감일 준수율(분모 0이면 `rate: null`). 날짜는 Asia/Seoul |
 | GET | `/task-templates` | 템플릿 목록 |
 | POST | `/task-templates` | `{"name", "title", "description", "priority", "tags", "recurrence", "subtasks": ["..."]}` — 템플릿 생성 (201). 이름이 겹치면 409 |
 | PUT | `/task-templates/{id}` | 템플릿 전체 수정 (200, 없으면 404, 이름이 겹치면 409) |
@@ -204,6 +216,41 @@ docker compose build fastapi-app
 docker compose up -d --no-deps fastapi-app            # 데이터는 볼륨에 남는다
 ```
 코드만 바꾼 재배포라면 데이터 이전이나 복구가 필요 없습니다. 그래도 큰 변경 전에는 백업을 먼저 해 두세요.
+
+### 6.0.0 배포 전 확인 (로컬 격리 환경)
+운영과 이름·포트·볼륨이 겹치지 않도록 임시 override 파일과 별도 프로젝트 이름으로 확인합니다. 운영 볼륨 `fastapi_todos_fastapi-data`와 컨테이너 `FastApi-app`은 건드리지 않습니다.
+```bash
+cat > /tmp/compose.v6test.yml <<'EOF'
+services:
+  fastapi-app:
+    image: fastapi-todos-v6test:6.0.0
+    container_name: FastApi-app-v6test
+    ports: !override
+      - "127.0.0.1:15001:8000"
+    restart: "no"
+volumes:
+  fastapi-data:
+    name: fastapi_v6test_data
+EOF
+T="docker compose -p fastapi-v6test -f docker-compose.yml -f /tmp/compose.v6test.yml"
+$T config fastapi-app | grep -E "container_name|published|name: fastapi"   # 운영 이름·5001이 없는지 먼저 확인
+
+$T build fastapi-app                                                         # C1 일부: 이미지 빌드
+docker run --rm fastapi-todos-v6test:6.0.0 sh -c 'ls -A /app; id; pip list 2>/dev/null | grep -iE "pytest|playwright|httpx|prometheus"'
+                                    # /app 에 tests·requirements-dev.txt 없음, uid 10001(appuser), 개발 도구 없음, prometheus 있음 (0-3)
+$T up -d --no-deps fastapi-app
+curl -s -o /dev/null -w "%{http_code}
+" http://127.0.0.1:15001/            # 200, 화면에 Version 6.0.0 (C2)
+curl -s http://127.0.0.1:15001/stats | head -c 120; echo                      # 200
+curl -s http://127.0.0.1:15001/metrics | grep -m1 http_requests_total         # /metrics
+curl -s -X POST http://127.0.0.1:15001/todos -H 'Content-Type: application/json' -d '{"title":"persist-check"}'
+$T up -d --no-deps --force-recreate fastapi-app                                # C5: 컨테이너 재생성
+curl -s http://127.0.0.1:15001/todos | grep -o persist-check                 # 남아 있어야 한다
+
+$T down                                                                       # 테스트 컨테이너·네트워크만 정리
+docker volume rm fastapi_v6test_data                                          # 테스트 볼륨만 삭제 (-v·prune 쓰지 않음)
+docker image rm fastapi-todos-v6test:6.0.0
+```
 
 ## 테스트
 ```bash

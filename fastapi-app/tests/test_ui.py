@@ -288,7 +288,7 @@ def test_b21_overdue_style(page: Page, seed):
 
 def test_b22_version(page: Page, seed):
     open_app(page)
-    expect(page.get_by_text("Version 5.0.0")).to_be_visible()
+    expect(page.get_by_text("Version 6.0.0")).to_be_visible()
 
 
 # ---------- 5.0.0 1단계: 즐겨찾기 ----------
@@ -1400,3 +1400,1056 @@ def test_calendar_bulk_and_undo_on_day_list(page: Page, seed):
     page.get_by_test_id("undo-button").click()
     expect(page.locator(ITEM)).to_have_count(5)
     expect(day(page, "2026-10-15").locator(".calendar-more")).to_have_text("+2")
+
+
+# ---------- 6.0.0 1단계: Asia/Seoul 날짜 기준 (D-day·기한 초과·캘린더·생성/완료일) ----------
+
+KST_ZONE = tz(td(hours=9))
+
+
+@pytest.fixture
+def la_page(browser, base_url):
+    # 브라우저 시간대가 한국이 아니어도 날짜는 Asia/Seoul 기준이어야 한다
+    context = browser.new_context(base_url=base_url, timezone_id="America/Los_Angeles")
+    yield context.new_page()
+    context.close()
+
+
+def test_kst_today_regardless_of_browser_timezone(la_page: Page, seed):
+    # 2026-10-12 16:00 UTC = 로스앤젤레스 10-12 09:00, 한국 10-13 01:00 → 오늘은 10-13
+    la_page.clock.set_fixed_time(dt(2026, 10, 12, 16, 0, tzinfo=tz.utc))
+    seed([todo(1, "오늘", due_date="2026-10-13"), todo(2, "어제", due_date="2026-10-12"),
+          todo(3, "모레", due_date="2026-10-15"),
+          todo(4, "생성 시각", created_at="2026-10-12T16:00:00+00:00",
+               completed=True, completed_at="2026-10-12T15:30:00")])           # 시간대 없는 값은 UTC
+    open_app(la_page)
+    expect(item(la_page, "오늘").get_by_test_id("dday")).to_have_text("오늘 마감")
+    expect(item(la_page, "어제").get_by_test_id("dday")).to_have_text("D+1")
+    expect(item(la_page, "어제")).to_contain_text("⚠ 기한 초과")
+    expect(item(la_page, "모레").get_by_test_id("dday")).to_have_text("D-2")
+    expect(item(la_page, "생성 시각").locator(".meta")).to_contain_text("생성: 2026-10-13")
+    expect(item(la_page, "생성 시각").locator(".meta")).to_contain_text("완료: 2026-10-13")
+    expect(la_page.get_by_test_id("stat-overdue")).to_have_text("1")
+
+    open_calendar(la_page)
+    expect(cal_title(la_page)).to_have_text("2026년 10월")
+    expect(la_page.locator(".calendar-day.today")).to_have_attribute("data-date", "2026-10-13")
+
+
+def test_kst_calendar_month_boundary(la_page: Page, seed):
+    # 2026-10-31 15:30 UTC = 로스앤젤레스 10-31, 한국 11-01 → 캘린더는 11월에서 시작한다
+    la_page.clock.set_fixed_time(dt(2026, 10, 31, 15, 30, tzinfo=tz.utc))
+    seed([todo(1, "11월 첫날", due_date="2026-11-01")])
+    open_app(la_page)
+    open_calendar(la_page)
+    expect(cal_title(la_page)).to_have_text("2026년 11월")
+    expect(la_page.locator(".calendar-day.today")).to_have_attribute("data-date", "2026-11-01")
+    go(la_page, "이전")
+    expect(cal_title(la_page)).to_have_text("2026년 10월")
+    go(la_page, "오늘")
+    expect(cal_title(la_page)).to_have_text("2026년 11월")
+
+
+# ---------- 6.0.0 1단계: 통계 대시보드 ----------
+# 집계는 서버(/stats)가 실제 시계로 하므로, 데이터는 지금 한국 날짜를 기준으로 만든다
+
+def kst_today():
+    return dt.now(KST_ZONE).date()
+
+
+def kst_noon(days_ago: int = 0) -> str:
+    # days_ago 일 전 한국 시간 정오 (자정 경계에서 멀리 둔다)
+    return dt.combine(kst_today() - td(days=days_ago), dt.min.time(), KST_ZONE).replace(hour=12).isoformat()
+
+
+def due(days_from_today: int) -> str:
+    return (kst_today() + td(days=days_from_today)).isoformat()
+
+
+def dashboard(page: Page):
+    return page.get_by_test_id("view-stats")
+
+
+def open_stats(page: Page) -> None:
+    page.get_by_test_id("view-toggle").get_by_role("button", name="통계").click()
+    expect(dashboard(page)).to_be_visible()
+
+
+def dash(page: Page) -> tuple[str, ...]:
+    return tuple(page.get_by_test_id(f"dash-{k}").inner_text()
+                 for k in ("total", "completed", "active", "overdue", "rate"))
+
+
+def priority_counts(page: Page) -> dict[str, str]:
+    rows = page.get_by_test_id("dash-priority").locator("li")
+    return {rows.nth(i).get_attribute("data-priority"): rows.nth(i).locator("strong").inner_text()
+            for i in range(rows.count())}
+
+
+DASH_TODOS = [
+    todo(1, "끝냄", completed=True, completed_at=kst_noon(0), due_date=due(0)),
+    todo(2, "밀림", priority="높음", due_date=due(-2)),
+    todo(3, "보통 일"),
+    todo(4, "나중", priority="낮음", due_date=due(3)),
+]
+
+
+@pytest.fixture
+def live_clock(page: Page):
+    # 기존 통계 바(브라우저 계산)와 대시보드(서버 실제 시계)를 비교할 때는 브라우저 시계도 지금으로 맞춘다
+    page.clock.set_fixed_time(dt.now(tz.utc))
+
+
+def test_dashboard_toggle_and_cards(page: Page, seed, live_clock):
+    seed(DASH_TODOS)
+    open_app(page)
+    expect(dashboard(page)).to_be_hidden()
+    open_stats(page)
+    toggle = page.get_by_test_id("view-toggle")
+    expect(toggle.get_by_role("button", name="통계")).to_have_attribute("aria-pressed", "true")
+    expect(page.get_by_test_id("dash-rate")).to_have_text("25.0%")              # 대시보드는 소수 1자리
+    assert dash(page) == ("4", "1", "3", "1", "25.0%")
+    assert stats(page) == ("4", "1", "3", "1", "25%")                            # 기존 통계 바는 정수 % 그대로
+    assert priority_counts(page) == {"높음": "1", "보통": "1", "낮음": "1"}
+    expect(page.get_by_test_id("dash-compliance")).to_have_text("100.0%")
+    expect(page.get_by_test_id("dash-basis")).to_contain_text(f"기준일 {kst_today()} (Asia/Seoul)")
+    expect(page.locator(ITEM)).to_have_count(0)                                  # 통계 보기에는 항목 목록이 없다
+    expect(page.get_by_test_id("bulk-bar")).to_be_hidden()
+
+    toggle.get_by_role("button", name="목록").click()                            # 목록으로 돌아오면 원래 화면
+    expect(dashboard(page)).to_be_hidden()
+    expect(page.get_by_test_id("bulk-bar")).to_be_visible()
+    assert titles(page) == ["끝냄", "밀림", "보통 일", "나중"]
+
+
+def test_dashboard_matches_stats_api(page: Page, seed):
+    seed(DASH_TODOS)
+    open_app(page)
+    open_stats(page)
+    expect(page.get_by_test_id("dash-total")).to_have_text("4")
+    api = page.request.get("/stats").json()                                      # 화면 값은 서버 집계 그대로
+    assert dash(page) == (str(api["total"]), str(api["completed"]), str(api["active"]),
+                          str(api["overdue"]), f"{api['completion_rate']:.1f}%")
+    assert priority_counts(page) == {p: str(n) for p, n in api["active_by_priority"].items()}
+
+
+def test_dashboard_trend_ranges_and_table(page: Page, seed):
+    seed([
+        todo(1, "오늘 1", completed=True, completed_at=kst_noon(0)),
+        todo(2, "오늘 2", completed=True, completed_at=kst_noon(0)),
+        todo(3, "6일 전", completed=True, completed_at=kst_noon(6)),
+        todo(4, "10일 전", completed=True, completed_at=kst_noon(10)),
+        todo(5, "40일 전", completed=True, completed_at=kst_noon(40)),           # 30일 밖
+        todo(6, "시각 없음", completed=True),                                    # 추이에서 제외
+    ])
+    open_app(page)
+    open_stats(page)
+    summary = page.get_by_test_id("dash-trend-summary")
+    expect(summary).to_contain_text("최근 7일 완료 3건")
+    expect(page.locator("[data-range='7']")).to_have_attribute("aria-pressed", "true")
+    expect(page.get_by_test_id("dash-trend").locator(".dash-bar-col")).to_have_count(7)
+    expect(page.get_by_test_id("dash-excluded")).to_have_text("완료 시각이 없어 추이에서 제외: 1건")
+
+    rows = page.get_by_test_id("dash-trend-table").locator("tbody tr")           # 표 요약 (접근성)
+    expect(rows).to_have_count(7)
+    expect(rows.last.locator("td")).to_have_text([kst_today().isoformat(), "2"])
+    expect(rows.first.locator("td")).to_have_text([due(-6), "1"])
+    expect(page.get_by_test_id("dash-trend").locator(".dash-bar-col").last).to_have_attribute(
+        "title", f"{kst_today()}: 2건")
+
+    page.get_by_role("button", name="최근 30일").click()
+    expect(summary).to_contain_text("최근 30일 완료 4건")
+    expect(page.locator("[data-range='30']")).to_have_attribute("aria-pressed", "true")
+    expect(page.get_by_test_id("dash-trend").locator(".dash-bar-col")).to_have_count(30)
+    expect(rows).to_have_count(30)
+    page.get_by_text("표로 보기").click()
+    expect(page.get_by_test_id("dash-trend-table")).to_be_visible()
+
+
+def test_dashboard_empty_and_no_compliance_data(page: Page, seed):
+    open_app(page)
+    open_stats(page)
+    expect(page.get_by_test_id("dash-rate")).to_have_text("0.0%")
+    assert dash(page) == ("0", "0", "0", "0", "0.0%")
+    expect(page.get_by_test_id("dash-compliance")).to_have_text("데이터 없음")     # 분모 0
+    expect(page.get_by_test_id("dash-trend-summary")).to_contain_text("최근 7일 완료 0건")
+    assert priority_counts(page) == {"높음": "0", "보통": "0", "낮음": "0"}
+
+
+def test_dashboard_compliance_rate(page: Page, seed):
+    seed([
+        todo(1, "제때", completed=True, completed_at=kst_noon(3), due_date=due(-3)),
+        todo(2, "늦게", completed=True, completed_at=kst_noon(1), due_date=due(-3)),
+        todo(3, "마감 없음", completed=True, completed_at=kst_noon(1)),
+    ])
+    open_app(page)
+    open_stats(page)
+    expect(page.get_by_test_id("dash-compliance")).to_have_text("50.0%")
+    expect(dashboard(page)).to_contain_text("마감일이 있는 완료 2개 중 1개를 마감일까지 끝냈습니다.")
+
+
+def test_dashboard_refreshes_after_change_and_ignores_filters(page: Page, seed):
+    seed(DASH_TODOS)
+    open_app(page)
+    page.locator("#search").fill("없는 검색어")
+    page.locator("[data-filter=completed]").click()
+    open_stats(page)
+    expect(page.get_by_test_id("dash-total")).to_have_text("4")                  # 필터와 상관없이 전체
+    page.locator("#title").fill("새 할 일")                                       # 통계 보기에서도 추가 폼은 그대로
+    page.get_by_role("button", name="Add To-Do").click()
+    expect(page.get_by_test_id("dash-total")).to_have_text("5")
+    expect(page.get_by_test_id("dash-rate")).to_have_text("20.0%")
+
+
+def test_dashboard_error_shown(page: Page, seed):
+    open_app(page)
+    page.route("**/stats", lambda route: route.fulfill(status=500, body="boom"))
+    page.get_by_test_id("view-toggle").get_by_role("button", name="통계").click()
+    expect(page.locator("#error")).to_contain_text("통계 불러오기 실패")
+
+
+# ---------- 6.0.0 2단계: 칸반 보드 ----------
+
+KANBAN_TODOS = [
+    todo(1, "보고서", priority="높음", due_date="2026-10-15", tags=["학교"], favorite=True,
+         subtasks=[sub(1, "초안", True), sub(2, "검토")]),
+    todo(2, "주간 회의", due_date="2026-10-12", recurrence="weekly", tags=["팀"]),
+    todo(3, "밀린 일", priority="낮음", due_date="2026-10-10"),
+    todo(4, "끝난 일", completed=True, completed_at="2026-10-11T03:00:00+00:00"),
+]
+
+
+def open_kanban(page: Page) -> None:
+    page.get_by_test_id("view-toggle").get_by_role("button", name="칸반").click()
+    expect(page.get_by_test_id("kanban")).to_be_visible()
+
+
+def column(page: Page, status: str):
+    return page.locator(f"[data-testid=kanban-column][data-status={status}]")
+
+
+def column_titles(page: Page, status: str):
+    return column(page, status).locator(".kanban-card-title")
+
+
+def card(page: Page, title: str):
+    return page.get_by_test_id("kanban-card").filter(has=page.locator(".kanban-card-title", has_text=title))
+
+
+def server_todo(page: Page, todo_id: int) -> dict:
+    return next(t for t in page.request.get("/todos").json() if t["id"] == todo_id)
+
+
+def test_kanban_columns_and_card_content(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    expect(page.get_by_test_id("kanban")).to_be_hidden()
+    open_kanban(page)
+    expect(page.get_by_test_id("view-toggle").get_by_role("button", name="칸반")).to_have_attribute("aria-pressed", "true")
+    expect(page.get_by_test_id("kanban-column")).to_have_count(2)
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+    expect(column_titles(page, "completed")).to_have_text(["끝난 일"])
+    expect(page.get_by_test_id("kanban-count")).to_have_text(["(3)", "(1)"])
+
+    report = card(page, "보고서")
+    expect(report).to_contain_text("우선순위 높음")
+    expect(report).to_contain_text("마감 2026-10-15")
+    expect(report.get_by_test_id("dday")).to_have_text("D-3")
+    expect(report.get_by_test_id("todo-tag")).to_have_text(["#학교"])
+    expect(report.get_by_test_id("subtask-progress")).to_have_text("1/2 (50%)")
+    expect(report.get_by_test_id("favorite-toggle")).to_have_text("★")
+    expect(card(page, "주간 회의").get_by_test_id("recurrence-badge")).to_have_text("🔁 매주")
+    expect(card(page, "밀린 일")).to_contain_text("⚠ 기한 초과")                  # 색 외에도 글자로 표시
+    expect(card(page, "끝난 일").locator(".kanban-card-title")).to_have_class(re.compile(r"\bdone\b"))
+    expect(page.locator(ITEM)).to_have_count(0)                                  # 칸반 보기에는 항목 목록이 없다
+    expect(page.get_by_test_id("bulk-bar")).to_be_hidden()
+    assert stats(page) == ("4", "1", "3", "1", "25%")
+
+    page.get_by_test_id("view-toggle").get_by_role("button", name="목록").click()
+    expect(page.locator(ITEM)).to_have_count(4)
+    expect(page.get_by_test_id("kanban-card")).to_have_count(0)                  # 숨은 칸반 카드는 남기지 않는다
+
+
+def test_kanban_drag_and_drop_both_ways(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    card(page, "보고서").drag_to(column(page, "completed"))
+    expect(column_titles(page, "completed")).to_have_text(["보고서", "끝난 일"])
+    expect(column_titles(page, "active")).to_have_text(["주간 회의", "밀린 일"])
+    expect(page.get_by_test_id("stat-completed")).to_have_text("2")
+    saved = server_todo(page, 1)
+    assert saved["completed"] is True and saved["completed_at"] is not None
+    # 기존 PUT 전체 교체여도 다른 필드는 그대로
+    assert (saved["priority"], saved["due_date"], saved["tags"], saved["favorite"], len(saved["subtasks"])) == \
+        ("높음", "2026-10-15", ["학교"], True, 2)
+
+    card(page, "보고서").drag_to(column(page, "active"))
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+    expect(page.get_by_test_id("stat-completed")).to_have_text("1")
+    assert server_todo(page, 1)["completed_at"] is None
+
+
+def test_kanban_drop_on_same_column_does_nothing(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    puts = []
+    page.on("request", lambda r: puts.append(r.url) if r.method == "PUT" else None)
+    card(page, "보고서").drag_to(column(page, "active"))
+    page.wait_for_timeout(300)
+    assert puts == []
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+
+
+def test_kanban_keyboard_move_buttons(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    move = page.get_by_role("button", name="밀린 일 완료로 이동")                   # 키보드·스크린리더용 이름
+    move.focus()
+    page.keyboard.press("Enter")
+    expect(column_titles(page, "completed")).to_have_text(["밀린 일", "끝난 일"])
+    back = page.get_by_role("button", name="밀린 일 진행 중으로 이동")
+    expect(back).to_be_focused()                                                 # 옮긴 카드의 버튼으로 포커스가 따라간다
+    expect(page.get_by_test_id("kanban-status")).to_have_text("'밀린 일'을(를) 완료(으)로 옮겼습니다.")
+    page.keyboard.press("Space")
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+    expect(page.get_by_role("button", name="밀린 일 완료로 이동")).to_be_focused()
+
+
+def test_kanban_failure_rolls_back(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    page.route("**/todos/1", lambda route: route.fulfill(status=500, body="boom")
+               if route.request.method == "PUT" else route.continue_())
+    card(page, "보고서").drag_to(column(page, "completed"))
+    expect(page.locator("#error")).to_contain_text("상태 변경 실패")
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])   # 원래 열로 돌아온다
+    expect(column_titles(page, "completed")).to_have_text(["끝난 일"])
+    expect(page.get_by_test_id("kanban-status")).to_contain_text("원래 열로 되돌렸습니다")
+    expect(page.get_by_test_id("stat-completed")).to_have_text("1")
+    assert server_todo(page, 1)["completed"] is False
+
+    card(page, "보고서").get_by_test_id("kanban-move").click()                    # 버튼으로 옮겨도 같다
+    expect(page.locator("#error")).to_contain_text("상태 변경 실패")
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+    expect(card(page, "보고서").get_by_test_id("kanban-move")).to_be_enabled()
+
+
+def test_kanban_no_duplicate_requests(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    puts = []
+    page.on("request", lambda r: puts.append(r.url) if r.method == "PUT" else None)
+    # 같은 순간 두 번 눌러도 요청은 한 번 (처리 중인 카드는 무시)
+    card(page, "보고서").get_by_test_id("kanban-move").evaluate("b => { b.click(); b.click(); }")
+    expect(column_titles(page, "completed")).to_have_text(["보고서", "끝난 일"])
+    page.wait_for_load_state("networkidle")
+    assert len(puts) == 1
+    assert server_todo(page, 1)["completed"] is True
+
+
+def test_kanban_recurring_creates_next_card(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    card(page, "주간 회의").drag_to(column(page, "completed"))
+    expect(column_titles(page, "completed")).to_have_text(["주간 회의", "끝난 일"])
+    expect(column_titles(page, "active")).to_have_text(["보고서", "밀린 일", "주간 회의"])   # 다음 일정은 목록 끝
+    nxt = column(page, "active").get_by_test_id("kanban-card").last
+    expect(nxt).to_contain_text("마감 2026-10-19")
+    expect(nxt.get_by_test_id("recurrence-badge")).to_have_text("🔁 매주")
+    expect(nxt.get_by_test_id("todo-tag")).to_have_text(["#팀"])
+    expect(page.get_by_test_id("stat-total")).to_have_text("5")
+
+
+def test_kanban_filters_and_sort(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    page.locator("#search").fill("보고")
+    expect(page.get_by_test_id("kanban-card")).to_have_count(1)
+    expect(column(page, "completed")).to_contain_text("항목 없음")
+    page.locator("#search").fill("")
+
+    page.get_by_test_id("favorite-filter").click()
+    expect(column_titles(page, "active")).to_have_text(["보고서"])
+    page.get_by_test_id("favorite-filter").click()
+
+    page.get_by_test_id("tag-filter").select_option("팀")
+    expect(column_titles(page, "active")).to_have_text(["주간 회의"])
+    page.get_by_test_id("tag-filter").select_option("")
+
+    page.locator("[data-filter=active]").click()
+    expect(column(page, "completed")).to_contain_text("상태 필터로 숨김")
+    expect(column(page, "completed").get_by_test_id("kanban-card")).to_have_count(0)
+    expect(column_titles(page, "active")).to_have_count(3)
+    page.locator("[data-filter=completed]").click()
+    expect(column(page, "active")).to_contain_text("상태 필터로 숨김")
+    expect(column_titles(page, "completed")).to_have_text(["끝난 일"])
+    page.locator("[data-filter=all]").click()
+
+    page.locator("#sort").select_option("due-date")                              # 카드 순서는 지금 고른 정렬
+    expect(column_titles(page, "active")).to_have_text(["밀린 일", "주간 회의", "보고서"])
+    page.locator("#sort").select_option("priority")
+    expect(column_titles(page, "active")).to_have_text(["보고서", "주간 회의", "밀린 일"])
+
+
+def test_kanban_changes_reflect_in_other_views(page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(page)
+    open_kanban(page)
+    card(page, "보고서").get_by_test_id("kanban-move").click()
+    expect(column_titles(page, "completed")).to_have_text(["보고서", "끝난 일"])
+    card(page, "주간 회의").get_by_test_id("favorite-toggle").click()           # 카드의 즐겨찾기도 기존 PUT
+    expect(card(page, "주간 회의").get_by_test_id("favorite-toggle")).to_have_text("★")
+    assert server_todo(page, 2)["favorite"] is True
+    assert server_todo(page, 2)["recurrence"] == "weekly"
+
+    page.get_by_test_id("view-toggle").get_by_role("button", name="목록").click()
+    expect(item(page, "보고서").locator(DONE_BOX)).to_be_checked()
+    expect(item(page, "보고서").locator(".meta")).to_contain_text("완료:")
+
+    open_calendar(page)
+    expect(chips(page, "2026-10-15")).to_have_class(re.compile(r"\bdone\b"))
+
+    open_stats(page)
+    expect(page.get_by_test_id("dash-completed")).to_have_text("2")
+    assert stats(page)[1] == "2"
+
+
+@pytest.fixture
+def mobile_page(browser, base_url):
+    context = browser.new_context(base_url=base_url, timezone_id="Asia/Seoul", viewport={"width": 375, "height": 800},
+                                  has_touch=True, is_mobile=True)
+    page = context.new_page()
+    page.clock.set_fixed_time(f"{TODAY}T12:00:00")
+    yield page
+    context.close()
+
+
+def test_kanban_mobile_touch(mobile_page: Page, seed):
+    seed(KANBAN_TODOS)
+    open_app(mobile_page)
+    mobile_page.get_by_test_id("view-toggle").get_by_role("button", name="칸반").tap()
+    expect(mobile_page.get_by_test_id("kanban")).to_be_visible()
+    active, done_col = column(mobile_page, "active").bounding_box(), column(mobile_page, "completed").bounding_box()
+    assert done_col["y"] >= active["y"] + active["height"]                     # 좁은 화면에서는 세로로 쌓인다
+    assert mobile_page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+    card(mobile_page, "보고서").get_by_test_id("kanban-move").tap()             # 터치는 이동 버튼으로
+    expect(column_titles(mobile_page, "completed")).to_have_text(["보고서", "끝난 일"])
+    assert mobile_page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+
+# ---------- 6.0.0 3단계: 마감일 알림 센터 ----------
+
+NOTIFY_KEY = "todo.v6.notifications.read"
+NOTIFY_TODOS = [
+    todo(1, "내일 마감 일", due_date="2026-10-13"),
+    todo(2, "오늘 마감 일", due_date="2026-10-12"),
+    todo(3, "지난 일", due_date="2026-10-10"),
+    todo(4, "완료한 일", due_date="2026-10-12", completed=True),       # 완료 — 대상 아님
+    todo(5, "마감 없음"),                                              # 마감일 없음 — 대상 아님
+    todo(6, "모레 일", due_date="2026-10-14"),                         # 이틀 뒤 — 대상 아님
+    todo(7, "오래된 일", due_date="2026-10-01"),
+]
+NOTIFY_ORDER = ["오래된 일", "지난 일", "오늘 마감 일", "내일 마감 일"]   # 기한 초과(오래된 순) → 오늘 → 내일
+
+
+def bell(page: Page):
+    return page.get_by_test_id("notification-bell")
+
+
+def notify_badge(page: Page):
+    return page.get_by_test_id("notification-badge")
+
+
+def notify_item(page: Page, title: str):
+    return page.get_by_test_id("notification-item").filter(has=page.locator(".notify-title", has_text=title))
+
+
+def notify_titles(page: Page):
+    return page.locator("[data-testid=notification-item] .notify-title")
+
+
+def open_notifications(page: Page) -> None:
+    if page.get_by_test_id("notification-panel").is_hidden():
+        bell(page).click()
+    expect(page.get_by_test_id("notification-panel")).to_be_visible()
+
+
+def read_all(page: Page) -> None:
+    open_notifications(page)
+    page.get_by_test_id("notification-read-all").click()
+    expect(notify_badge(page)).to_be_hidden()
+
+
+def stored_keys(page: Page) -> list[str]:
+    return page.evaluate(f"JSON.parse(localStorage.getItem('{NOTIFY_KEY}') || '[]')")
+
+
+def test_notify_categories_order_and_badge(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    open_app(page)
+    expect(notify_badge(page)).to_have_text("4")                                  # 앱을 열면 바로 보인다
+    expect(bell(page)).to_have_attribute("aria-label", "알림, 읽지 않은 알림 4개")
+    expect(page.get_by_test_id("notification-panel")).to_be_hidden()
+    open_notifications(page)
+    expect(notify_titles(page)).to_have_text(NOTIFY_ORDER)
+    expect(page.get_by_test_id("notification-item").locator(".notify-category")).to_have_text(
+        ["기한 초과", "기한 초과", "오늘 마감", "내일 마감"])
+    expect(notify_item(page, "지난 일")).to_contain_text("마감 2026-10-10 (D+2)")
+    expect(notify_item(page, "내일 마감 일")).to_contain_text("마감 2026-10-13 (D-1)")
+    expect(page.get_by_test_id("notification-item").filter(has_text="새 알림")).to_have_count(4)
+    for title in ("완료한 일", "마감 없음", "모레 일"):
+        expect(notify_item(page, title)).to_have_count(0)
+
+
+def test_notify_compute_boundaries(page: Page, seed):
+    open_app(page)
+    keys = page.evaluate("""() => {
+      const t = (id, due, completed = false) => ({ id, title: `t${id}`, due_date: due, completed });
+      const list = [t(1, "2027-01-01"), t(2, "2026-12-31"), t(3, "2026-12-30"), t(4, "2027-01-02"),
+                    t(5, "2026-12-31", true), t(6, null), t(7, "2026-12-31"), t(2, "2026-12-31")];
+      return {
+        yearEnd: computeNotifications(list, "2026-12-31").map((n) => n.key),
+        leap: computeNotifications([t(1, "2028-02-29"), t(2, "2028-03-01")], "2028-02-28").map((n) => n.key),
+        monthEnd: computeNotifications([t(1, "2026-11-01"), t(2, "2026-10-30")], "2026-10-31").map((n) => n.key),
+      };
+    }""")
+    # 연말·다음 해, 완료·마감일 없음·이틀 뒤 제외, 같은 할 일이 두 번 와도 키는 하나
+    assert keys["yearEnd"] == ["3|2026-12-30|overdue", "2|2026-12-31|today", "7|2026-12-31|today",
+                               "1|2027-01-01|tomorrow"]
+    assert keys["leap"] == ["1|2028-02-29|tomorrow"]
+    assert keys["monthEnd"] == ["2|2026-10-30|overdue", "1|2026-11-01|tomorrow"]
+
+
+def test_notify_read_persists_after_reload(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    open_app(page)
+    open_notifications(page)
+    notify_item(page, "오늘 마감 일").click()                                     # 누르면 읽음
+    expect(notify_badge(page)).to_have_text("3")
+    open_notifications(page)
+    expect(notify_item(page, "오늘 마감 일")).to_have_class(re.compile(r"\bread\b"))
+    expect(notify_item(page, "오늘 마감 일")).not_to_contain_text("새 알림")
+    assert stored_keys(page) == ["2|2026-10-12|today"]
+
+    page.reload()
+    expect(notify_badge(page)).to_have_text("3")                                  # 새로고침 후에도 유지
+    read_all(page)
+    expect(bell(page)).to_have_attribute("aria-label", "알림, 읽지 않은 알림 없음")
+    expect(page.get_by_test_id("notification-read-all")).to_be_disabled()
+    page.reload()
+    expect(page.get_by_test_id("stat-total")).to_have_text("7")
+    expect(notify_badge(page)).to_be_hidden()
+    assert sorted(stored_keys(page)) == sorted(["1|2026-10-13|tomorrow", "2|2026-10-12|today",
+                                                "3|2026-10-10|overdue", "7|2026-10-01|overdue"])
+
+
+def test_notify_no_duplicates_across_rerenders(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    open_app(page)
+    open_notifications(page)
+    for view in ("캘린더", "칸반", "통계", "목록"):                               # 여러 번 다시 그려도
+        page.get_by_test_id("view-toggle").get_by_role("button", name=view).click()
+    page.locator("#search").fill("일")
+    page.locator("#sort").select_option("priority")
+    page.locator("#search").fill("")
+    expect(page.get_by_test_id("notification-item")).to_have_count(4)             # 알림은 그대로 4개
+    expect(notify_badge(page)).to_have_text("4")
+    read_all(page)
+    page.get_by_test_id("notification-read-all").click(force=True)               # 다시 눌러도
+    page.locator("[data-filter=active]").click()
+    keys = stored_keys(page)
+    assert len(keys) == len(set(keys)) == 4                                      # 키가 중복 저장되지 않는다
+
+
+def test_notify_complete_delete_and_undo_cleanup(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    open_app(page)
+    read_all(page)
+    item(page, "오늘 마감 일").locator(DONE_BOX).check()                          # 완료하면 알림이 사라진다
+    expect(notify_item(page, "오늘 마감 일")).to_have_count(0)
+    expect(page.get_by_test_id("notification-item")).to_have_count(3)
+    page.wait_for_function(f"!localStorage.getItem('{NOTIFY_KEY}').includes('2|2026-10-12|today')")
+
+    delete_item(page, "지난 일")                                                  # 삭제하면 관련 알림을 정리한다
+    expect(notify_item(page, "지난 일")).to_have_count(0)
+    page.wait_for_function(f"!localStorage.getItem('{NOTIFY_KEY}').includes('3|2026-10-10|overdue')")
+    expect(notify_badge(page)).to_be_hidden()
+
+    page.get_by_test_id("undo-button").click()                                   # 되살리면 새 알림으로 다시 보인다
+    expect(notify_item(page, "지난 일")).to_have_count(1)
+    expect(notify_badge(page)).to_have_text("1")
+    expect(notify_item(page, "지난 일")).to_contain_text("새 알림")
+
+
+def test_notify_due_date_change_is_new_alert(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    open_app(page)
+    read_all(page)
+    item(page, "내일 마감 일").get_by_role("button", name="Edit").click()
+    page.get_by_test_id("edit-form").get_by_label("마감일").fill("2026-10-12")
+    page.get_by_test_id("edit-save").click()
+    expect(notify_badge(page)).to_have_text("1")                                  # 분류가 바뀌면 새 알림
+    expect(notify_item(page, "내일 마감 일")).to_have_attribute("data-category", "today")
+    expect(notify_item(page, "내일 마감 일")).to_contain_text("새 알림")
+    assert "1|2026-10-13|tomorrow" not in stored_keys(page)
+
+
+@pytest.fixture
+def clock_page(browser, base_url):
+    # 타이머까지 가짜 시계로 돌리는 페이지 (자정 넘김 테스트용)
+    context = browser.new_context(base_url=base_url, timezone_id="Asia/Seoul")
+    yield context.new_page()
+    context.close()
+
+
+def test_notify_midnight_rollover(clock_page: Page, seed):
+    clock_page.clock.install(time=dt(2026, 10, 12, 23, 59, 30, tzinfo=KST_ZONE))
+    seed(NOTIFY_TODOS)
+    open_app(clock_page)
+    expect(notify_badge(clock_page)).to_have_text("4")
+    read_all(clock_page)
+    clock_page.clock.run_for("01:00")                                            # 한국 자정을 넘긴다
+    # 10-13: 내일→오늘, 오늘→기한 초과, 모레→내일 은 새 알림. 이미 기한 초과였던 둘은 읽은 그대로
+    expect(notify_badge(clock_page)).to_have_text("3")
+    expect(notify_titles(clock_page)).to_have_text(["오래된 일", "지난 일", "오늘 마감 일", "내일 마감 일", "모레 일"])
+    expect(clock_page.get_by_test_id("notification-item").locator(".notify-category")).to_have_text(
+        ["기한 초과", "기한 초과", "기한 초과", "오늘 마감", "내일 마감"])
+    expect(clock_page.get_by_test_id("notification-live")).to_have_text("읽지 않은 마감일 알림 3개")
+    # 다른 화면도 같은 날짜로 다시 계산된다
+    expect(item(clock_page, "내일 마감 일").get_by_test_id("dday")).to_have_text("오늘 마감")
+    expect(clock_page.get_by_test_id("stat-overdue")).to_have_text("3")
+
+
+def test_notify_recalculates_on_tab_return(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    open_app(page)
+    expect(notify_badge(page)).to_have_text("4")
+    page.clock.set_fixed_time("2026-10-13T09:00:00")                             # 탭이 백그라운드인 동안 날짜가 바뀜
+    page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+    expect(notify_badge(page)).to_have_text("5")
+    expect(page.get_by_test_id("stat-overdue")).to_have_text("3")
+
+
+def test_notify_opens_todo_and_clears_hiding_filters(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    open_app(page)
+    page.locator("#search").fill("없는 검색어")
+    page.get_by_test_id("view-toggle").get_by_role("button", name="칸반").click()
+    open_notifications(page)
+    notify_item(page, "지난 일").click()
+    expect(page.get_by_test_id("view-toggle").get_by_role("button", name="목록")).to_have_attribute("aria-pressed", "true")
+    expect(page.locator("#search")).to_have_value("")                            # 가리던 필터를 푼다
+    target = page.locator(f"{ITEM}[data-id='3']")
+    expect(target).to_be_focused()
+    expect(target).to_have_class(re.compile(r"\bflash\b"))
+    expect(page.get_by_test_id("notification-panel")).to_be_hidden()
+    expect(notify_badge(page)).to_have_text("3")
+
+    page.locator("#search").fill("일")                                           # 이미 보이면 필터는 그대로
+    open_notifications(page)
+    notify_item(page, "내일 마감 일").click()
+    expect(page.locator("#search")).to_have_value("일")
+    expect(page.locator(f"{ITEM}[data-id='1']")).to_be_focused()
+
+
+def test_notify_keyboard_and_screen_reader(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    open_app(page)
+    expect(page.get_by_test_id("notification-live")).to_have_text("읽지 않은 마감일 알림 4개")
+    bell(page).focus()
+    page.keyboard.press("Enter")
+    expect(bell(page)).to_have_attribute("aria-expanded", "true")
+    expect(page.get_by_test_id("notification-item").first).to_be_focused()       # 열면 첫 알림으로
+    page.keyboard.press("Tab")
+    expect(page.get_by_test_id("notification-item").nth(1)).to_be_focused()
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("notification-panel")).to_be_hidden()
+    expect(bell(page)).to_be_focused()                                           # 닫으면 종으로 돌아온다
+    expect(bell(page)).to_have_attribute("aria-expanded", "false")
+
+    page.keyboard.press("Enter")
+    page.keyboard.press("Enter")                                                 # 첫 알림을 키보드로 연다
+    expect(page.locator(f"{ITEM}[data-id='7']")).to_be_focused()
+    expect(page.get_by_test_id("notification-live")).to_have_text("읽지 않은 마감일 알림 3개")
+
+
+def test_notify_empty_state(page: Page, seed):
+    seed([todo(1, "마감 없음"), todo(2, "완료", due_date="2026-10-01", completed=True)])
+    open_app(page)
+    expect(notify_badge(page)).to_be_hidden()
+    open_notifications(page)
+    expect(page.get_by_test_id("notification-panel")).to_contain_text("알림이 없습니다.")
+    expect(page.get_by_test_id("notification-read-all")).to_be_disabled()
+
+
+def test_notify_corrupt_storage_is_ignored(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    page.add_init_script(f"localStorage.setItem('{NOTIFY_KEY}', '{{broken')")
+    open_app(page)
+    expect(notify_badge(page)).to_have_text("4")                                  # 깨진 값은 읽지 않음으로 시작
+    expect(page.locator("#error")).to_be_hidden()
+    read_all(page)
+    assert len(stored_keys(page)) == 4                                           # 올바른 값으로 다시 저장된다
+
+
+def test_notify_works_when_storage_unavailable(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    page.add_init_script("""
+      Storage.prototype.getItem = () => { throw new Error("blocked"); };
+      Storage.prototype.setItem = () => { throw new Error("blocked"); };
+    """)
+    open_app(page)
+    expect(notify_badge(page)).to_have_text("4")
+    read_all(page)                                                               # 이 화면에서는 읽음이 유지된다
+    page.locator("#search").fill("일")
+    expect(notify_badge(page)).to_be_hidden()
+    expect(page.locator("#error")).to_be_hidden()
+
+
+def test_notify_load_failure_keeps_read_state(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    page.add_init_script(f"""if (!sessionStorage.getItem('seeded')) {{
+      sessionStorage.setItem('seeded', '1');
+      localStorage.setItem('{NOTIFY_KEY}', JSON.stringify(['3|2026-10-10|overdue']));
+    }}""")
+    page.route("**/todos", lambda route: route.fulfill(status=500, body="down")
+               if route.request.method == "GET" else route.continue_())
+    page.goto("/")
+    expect(page.locator("#error")).to_contain_text("목록 불러오기 실패")
+    assert stored_keys(page) == ["3|2026-10-10|overdue"]                         # 목록을 못 받으면 지우지 않는다
+    page.unroute("**/todos")
+    page.reload()
+    expect(notify_badge(page)).to_have_text("3")
+    open_notifications(page)
+    expect(notify_item(page, "지난 일")).to_have_class(re.compile(r"\bread\b"))
+
+
+def test_notify_matches_other_views(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    open_app(page)
+    open_notifications(page)
+    overdue = page.locator("[data-testid=notification-item][data-category=overdue]")
+    expect(overdue).to_have_count(2)
+    expect(page.get_by_test_id("stat-overdue")).to_have_text("2")                # 통계 바와 같은 기준
+    expect(page.locator(ITEM).filter(has_text="⚠ 기한 초과")).to_have_count(2)  # 목록
+    page.get_by_test_id("view-toggle").get_by_role("button", name="칸반").click()
+    expect(page.locator(".kanban-card.kanban-overdue")).to_have_count(2)         # 칸반
+    card(page, "내일 마감 일").get_by_test_id("kanban-move").click()             # 칸반에서 완료하면 알림도 빠진다
+    expect(notify_item(page, "내일 마감 일")).to_have_count(0)
+    open_calendar(page)
+    expect(chips(page, "2026-10-10")).to_have_class(re.compile(r"\boverdue\b"))  # 캘린더
+
+
+def test_notify_overdue_matches_dashboard(page: Page, seed, live_clock):
+    # 대시보드는 서버 실제 시계 기준이므로 데이터도 지금 한국 날짜로 만든다
+    seed([todo(1, "어제", due_date=due(-1)), todo(2, "오늘", due_date=due(0)),
+          todo(3, "내일", due_date=due(1)), todo(4, "그제", due_date=due(-2))])
+    open_app(page)
+    open_stats(page)
+    expect(page.get_by_test_id("dash-overdue")).to_have_text("2")
+    open_notifications(page)
+    expect(page.locator("[data-testid=notification-item][data-category=overdue]")).to_have_count(2)
+    expect(page.locator("[data-testid=notification-item][data-category=today]")).to_have_count(1)
+    expect(page.locator("[data-testid=notification-item][data-category=tomorrow]")).to_have_count(1)
+
+
+def test_notify_mobile(mobile_page: Page, seed):
+    seed(NOTIFY_TODOS)
+    open_app(mobile_page)
+    bell(mobile_page).tap()
+    expect(mobile_page.get_by_test_id("notification-panel")).to_be_visible()
+    assert mobile_page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+    notify_item(mobile_page, "오늘 마감 일").tap()
+    expect(mobile_page.locator(f"{ITEM}[data-id='2']")).to_be_in_viewport()
+    expect(notify_badge(mobile_page)).to_have_text("3")
+
+
+# ---------- 6.0.0 4단계: 테마·반응형·접근성 ----------
+
+THEME_KEY = "todo.v6.theme"
+NO_HSCROLL = "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+THEME_TODOS = [
+    todo(1, "보고서 제출", description="3장까지", priority="높음", due_date="2026-10-10", tags=["학교", "과제"], favorite=True),
+    todo(2, "운동", due_date="2026-10-12", recurrence="daily", tags=["건강"],
+         subtasks=[{"id": 1, "title": "스트레칭", "completed": True}, {"id": 2, "title": "달리기", "completed": False}]),
+    todo(3, "장보기", due_date="2026-10-13", priority="낮음"),
+    todo(4, "책 읽기", completed=True, due_date="2026-10-05",
+         created_at="2026-10-01T03:00:00Z", completed_at="2026-10-04T03:00:00Z"),
+    todo(5, "마감 없는 일", description="언젠가"),
+]
+VIEWS = ("목록", "캘린더", "칸반", "통계")
+
+# 화면에 보이는 글자마다 글자색과 실제 배경색(반투명이면 겹쳐서 계산)의 대비를 잰다.
+# 비활성 컨트롤(WCAG 예외)·스크린리더 전용 글자·반투명 처리 중 카드는 뺀다. 4.5:1 미만만 돌려준다
+CONTRAST_JS = r"""() => {
+  const parse = (c) => {
+    const m = c.match(/rgba?\(([^)]+)\)/);
+    if (!m) return null;
+    const [r, g, b, a = 1] = m[1].split(/[\s,\/]+/).filter(Boolean).map(Number);
+    return { r, g, b, a };
+  };
+  const over = (top, under) => ({
+    r: top.r * top.a + under.r * (1 - top.a), g: top.g * top.a + under.g * (1 - top.a),
+    b: top.b * top.a + under.b * (1 - top.a), a: 1,
+  });
+  const lum = ({ r, g, b }) => {
+    const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+  };
+  const background = (node) => {
+    const layers = [];
+    for (let n = node; n; n = n.parentElement) {
+      const c = parse(getComputedStyle(n).backgroundColor);
+      if (c && c.a > 0) { layers.push(c); if (c.a >= 1) break; }
+    }
+    let color = { r: 255, g: 255, b: 255, a: 1 };
+    for (const layer of layers.reverse()) color = over(layer, color);
+    return color;
+  };
+  const fails = [];
+  for (const node of document.body.querySelectorAll("*")) {
+    const own = [...node.childNodes].filter((c) => c.nodeType === 3).map((c) => c.textContent.trim()).join("");
+    if (!own || !node.checkVisibility({ opacityProperty: true, visibilityProperty: true })) continue;
+    if (node.closest(":disabled, .visually-hidden, option, select, .pending, .dragging")) continue;
+    const fg = parse(getComputedStyle(node).color);
+    const bg = background(node);
+    const [hi, lo] = [lum(over(fg, bg)), lum(bg)].sort((a, b) => b - a);
+    const ratio = (hi + 0.05) / (lo + 0.05);
+    if (ratio < 4.5) fails.push({ text: own.slice(0, 30), ratio: Math.round(ratio * 100) / 100,
+                                  color: getComputedStyle(node).color, cls: String(node.className) });
+  }
+  return fails;
+}"""
+
+# 색 토큰 두 개의 대비 (차트 막대처럼 글자가 아닌 그래픽은 3:1 이상)
+TOKEN_RATIO_JS = r"""([a, b]) => {
+  const probe = (v) => {
+    const d = document.createElement("div");
+    d.style.color = `var(${v})`;
+    document.body.append(d);
+    const c = getComputedStyle(d).color;
+    d.remove();
+    return c;
+  };
+  const lum = (c) => {
+    const [r, g, bl] = c.match(/\d+/g).map(Number).map((v) => {
+      v /= 255;
+      return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  const [x, y] = [lum(probe(a)), lum(probe(b))].sort((p, q) => q - p);
+  return (x + 0.05) / (y + 0.05);
+}"""
+
+LIGHT_BG, DARK_BG = "rgb(255, 255, 255)", "rgb(21, 23, 26)"
+
+
+def body_background(page: Page) -> str:
+    return page.evaluate("getComputedStyle(document.body).backgroundColor")
+
+
+def choose_theme(page: Page, label: str) -> None:
+    page.get_by_test_id("theme-select").select_option(label=label)
+
+
+def test_theme_default_follows_system(page: Page, seed):
+    page.emulate_media(color_scheme="dark")
+    open_app(page)
+    expect(page.get_by_test_id("theme-select")).to_have_value("system")         # 기본은 시스템
+    assert page.evaluate("document.documentElement.dataset.theme") is None
+    assert body_background(page) == DARK_BG
+    page.emulate_media(color_scheme="light")                                      # OS 설정이 바뀌면 바로 따라간다
+    assert body_background(page) == LIGHT_BG
+
+
+def test_theme_choice_persists_and_overrides_system(page: Page, seed):
+    page.emulate_media(color_scheme="dark")
+    open_app(page)
+    choose_theme(page, "라이트")
+    expect(page.locator("html")).to_have_attribute("data-theme", "light")
+    assert body_background(page) == LIGHT_BG                                      # 시스템이 다크여도 라이트
+    assert page.evaluate(f"localStorage.getItem('{THEME_KEY}')") == "light"
+    expect(page.get_by_test_id("status-message")).to_have_text("테마: 라이트")
+    page.reload()
+    expect(page.get_by_test_id("theme-select")).to_have_value("light")           # 새로고침 후에도 유지
+    assert body_background(page) == LIGHT_BG
+
+    page.emulate_media(color_scheme="light")
+    choose_theme(page, "다크")
+    assert body_background(page) == DARK_BG
+    page.reload()
+    assert body_background(page) == DARK_BG
+    choose_theme(page, "시스템")                                                 # 시스템으로 되돌리면 OS 설정
+    assert page.evaluate("document.documentElement.dataset.theme") is None
+    assert body_background(page) == LIGHT_BG
+    assert page.evaluate(f"localStorage.getItem('{THEME_KEY}')") == "system"
+
+
+def test_theme_applied_before_first_paint(page: Page, seed):
+    # <head> 에서 테마를 정하므로 <body> 가 생기는 순간 이미 다크다 (깜빡임 없음)
+    page.add_init_script(f"""
+      localStorage.setItem('{THEME_KEY}', 'dark');
+      new MutationObserver((_, observer) => {{
+        if (!document.body) return;
+        window.themeAtBody = document.documentElement.dataset.theme;
+        observer.disconnect();
+      }}).observe(document, {{ childList: true, subtree: true }});
+    """)
+    open_app(page)
+    assert page.evaluate("window.themeAtBody") == "dark"
+
+
+def test_theme_unknown_value_falls_back_to_system(page: Page, seed):
+    page.add_init_script(f"localStorage.setItem('{THEME_KEY}', 'purple')")
+    page.emulate_media(color_scheme="light")
+    open_app(page)
+    expect(page.get_by_test_id("theme-select")).to_have_value("system")
+    assert page.evaluate("document.documentElement.dataset.theme") is None
+    assert body_background(page) == LIGHT_BG
+
+
+def test_theme_works_when_storage_unavailable(page: Page, seed):
+    page.add_init_script("""
+      Storage.prototype.getItem = () => { throw new Error("blocked"); };
+      Storage.prototype.setItem = () => { throw new Error("blocked"); };
+    """)
+    page.emulate_media(color_scheme="light")
+    open_app(page)
+    expect(page.get_by_test_id("theme-select")).to_have_value("system")
+    choose_theme(page, "다크")                                                   # 이 화면에서는 고른 테마가 유지된다
+    assert body_background(page) == DARK_BG
+    expect(page.locator("#error")).to_be_hidden()
+
+
+def test_theme_and_read_state_sync_across_tabs(page: Page, seed):
+    seed(NOTIFY_TODOS)
+    page.emulate_media(color_scheme="light")
+    open_app(page)
+    other = page.context.new_page()
+    other.clock.set_fixed_time(f"{TODAY}T12:00:00")
+    other.emulate_media(color_scheme="light")
+    open_app(other)
+    choose_theme(page, "다크")
+    expect(other.locator("html")).to_have_attribute("data-theme", "dark")       # 다른 탭에도 반영된다
+    expect(other.get_by_test_id("theme-select")).to_have_value("dark")
+    expect(notify_badge(other)).to_have_text("4")
+    read_all(page)
+    expect(notify_badge(other)).to_be_hidden()                                   # 알림 읽음도 같은 브라우저 안에서 맞춘다
+    other.close()
+
+
+def open_every_view(page: Page):
+    """목록(하위 펼침) → 캘린더(날짜 선택) → 칸반 → 통계 → 알림 패널 순서로 열며 화면 이름을 돌려준다."""
+    page.locator("[data-testid=subtask-toggle]").nth(1).click()
+    yield "목록"
+    for view in VIEWS[1:]:
+        page.get_by_test_id("view-toggle").get_by_role("button", name=view).click()
+        if view == "캘린더":
+            page.locator("[data-date='2026-10-12']").click()
+        if view == "통계":
+            expect(page.get_by_test_id("dash-total")).to_have_text("5")
+        yield view
+    page.get_by_test_id("view-toggle").get_by_role("button", name="목록").click()
+    open_notifications(page)
+    yield "알림"
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_contrast_in_every_view(page: Page, seed, theme):
+    seed(THEME_TODOS)
+    page.emulate_media(color_scheme=theme)
+    open_app(page)
+    item(page, "장보기").locator("[data-testid=bulk-select]").check()            # 선택한 행의 배경도 잰다
+    for view in open_every_view(page):
+        assert page.evaluate(CONTRAST_JS) == [], f"{theme} {view}"
+    for pair in (["--chart-bar", "--chart-track"], ["--chart-bar", "--surface"], ["--focus", "--bg"]):
+        assert page.evaluate(TOKEN_RATIO_JS, pair) >= 3, pair                    # 그래픽·포커스 표시는 3:1 이상
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_mobile_375_every_view(mobile_page: Page, seed, theme):
+    seed(THEME_TODOS)
+    mobile_page.emulate_media(color_scheme=theme)
+    open_app(mobile_page)
+    for view in open_every_view(mobile_page):
+        assert mobile_page.evaluate(NO_HSCROLL), f"{theme} {view} 가로 스크롤"
+    # 핵심 조작이 화면 안에 있다 (테마·알림·보기 전환·추가)
+    for locator in (mobile_page.get_by_test_id("theme-select"), bell(mobile_page),
+                    mobile_page.get_by_test_id("view-toggle"), mobile_page.get_by_role("button", name="Add To-Do")):
+        box = locator.bounding_box()
+        assert box["x"] >= 0 and box["x"] + box["width"] <= 375
+    item(mobile_page, "운동").get_by_role("button", name="Edit").tap()           # 수정 폼도 넘치지 않는다
+    expect(mobile_page.get_by_test_id("edit-form")).to_be_visible()
+    assert mobile_page.evaluate(NO_HSCROLL)
+
+
+def test_keyboard_theme_and_focus_visible(page: Page, seed):
+    page.emulate_media(color_scheme="light")
+    open_app(page)
+    page.keyboard.press("Tab")                                                   # 첫 Tab 은 테마 선택
+    select = page.get_by_test_id("theme-select")
+    expect(select).to_be_focused()
+    outline = select.evaluate("e => [getComputedStyle(e).outlineStyle, getComputedStyle(e).outlineWidth]")
+    assert outline == ["solid", "3px"]                                           # 키보드 포커스가 보인다
+    page.keyboard.press("ArrowDown")                                             # 시스템 → 라이트
+    expect(select).to_have_value("light")
+    page.keyboard.press("ArrowDown")                                             # 라이트 → 다크
+    expect(page.locator("html")).to_have_attribute("data-theme", "dark")
+    page.keyboard.press("Tab")
+    expect(bell(page)).to_be_focused()
+    assert bell(page).evaluate("e => getComputedStyle(e).outlineStyle") == "solid"
+
+
+def test_non_color_status_cues(page: Page, seed):
+    seed(THEME_TODOS)
+    open_app(page)
+    expect(item(page, "보고서 제출")).to_contain_text("⚠ 기한 초과")               # 목록: 글자
+    expect(page.locator("[data-filter=all]")).to_have_attribute("aria-pressed", "true")
+    page.get_by_test_id("view-toggle").get_by_role("button", name="칸반").click()
+    expect(card(page, "보고서 제출")).to_contain_text("⚠ 기한 초과")              # 칸반: 글자
+    expect(page.get_by_test_id("view-toggle").get_by_role("button", name="칸반")).to_have_attribute("aria-pressed", "true")
+    open_calendar(page)
+    chip = chips(page, "2026-10-10")                                             # 캘린더: ⚠ 기호
+    assert chip.evaluate("e => getComputedStyle(e, '::before').content") == '"⚠ "'
+    done = chips(page, "2026-10-05")
+    assert done.evaluate("e => getComputedStyle(e).textDecorationLine") == "line-through"
+
+
+def test_success_and_failure_messages(page: Page, seed):
+    open_app(page)
+    status = page.get_by_test_id("status-message")
+    expect(status).to_have_attribute("role", "status")
+    page.locator("#title").fill("새 일")
+    page.get_by_role("button", name="Add To-Do").click()
+    expect(status).to_have_text("할 일을 추가했습니다.")                          # 성공은 상태 메시지
+    expect(status).to_have_text("", timeout=6000)                                # 잠시 뒤 사라진다
+    item(page, "새 일").locator(DONE_BOX).check()
+    expect(status).to_have_text("변경을 저장했습니다.")
+    page.route("**/todos/*", lambda route: route.fulfill(status=500, body="down"))
+    item(page, "새 일").get_by_test_id("favorite-toggle").click()
+    expect(page.locator("#error")).to_contain_text("수정 실패")                   # 실패는 기존 #error (role=alert)
+    expect(status).to_have_text("")
+
+
+def test_notify_focus_kept_when_redrawn_at_midnight(clock_page: Page, seed):
+    clock_page.clock.install(time=dt(2026, 10, 12, 23, 59, 30, tzinfo=KST_ZONE))
+    seed(NOTIFY_TODOS)
+    open_app(clock_page)
+    open_notifications(clock_page)
+    notify_item(clock_page, "오늘 마감 일").focus()
+    clock_page.clock.run_for("01:00")                                            # 패널이 열린 채 자정을 넘긴다
+    expect(notify_item(clock_page, "오늘 마감 일")).to_have_attribute("data-category", "overdue")
+    expect(notify_item(clock_page, "오늘 마감 일")).to_be_focused()              # 같은 할 일의 알림에 포커스가 남는다
+    expect(clock_page.get_by_test_id("notification-panel")).to_be_visible()
+
+    notify_item(clock_page, "지난 일").focus()                                   # 포커스한 알림이 사라지면 같은 자리로
+    clock_page.evaluate("allTodos = allTodos.filter((t) => t.id !== 3); applyFilters()")
+    expect(clock_page.get_by_test_id("notification-item").nth(1)).to_be_focused()
