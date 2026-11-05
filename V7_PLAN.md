@@ -109,6 +109,23 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 - [ ] UI: 로그인·가입·로그아웃, 오류 표시, 429 안내, 375px, 키보드
 - [ ] 기존 332 passed 유지
 
+하위 단계 (2026-11-05 설계 검토, 각 단계 보고·승인 후 진행)
+| 단계 | 내용 | 상태 |
+|---|---|---|
+| 2-A | Alembic `0002_auth_failures`, 모델 | 미완료 |
+| 2-B | `auth.py` DB 없는 순수 함수 + `tests/test_auth_unit.py` | **완료** (아래) |
+| 2-C | 세션 저장·조회·삭제·만료 정리, `require_user` | 미완료 |
+| 2-D | 시도 제한 (`auth_failures`, advisory lock, `Retry-After`, 클라이언트 IP) | 미완료 |
+| 2-E | `/auth/*` 4개 라우트, `get_db` 연결, 시작 가드(`load_settings`), 외부 Origin 결정 | 미완료 |
+| 2-F | 다중 워커 시도 제한 테스트 | 미완료 |
+| 2-G | 로그인·가입 UI, `api()` CSRF 헤더 (v6 화면 강제 로그인 게이트는 Phase 3까지 보류) | 미완료 |
+
+**2-B 완료 (2026-11-05, 미커밋)**
+- `auth.py`: `load_settings`·`AuthSettings`(APP_ENV·COOKIE_SECURE·REGISTRATION_ENABLED, production이면 Secure 필수), `normalize_username`, `check_password`, `hash_password`·`check_password_hash`(OK·MISMATCH·INVALID_HASH)·`verify_password`·`needs_rehash`·`verify_dummy`(더미 해시는 처음 쓸 때 한 번 생성), 세션·CSRF 토큰과 SHA-256, `csrf_matches`(bytes + `hmac.compare_digest`), 14일 만료, `WebOrigin`·`origin_allowed`(스킴·호스트·포트 비교), 쿠키 생성·삭제 인자. 표준 라이브러리와 argon2만 import, import 시 해시 계산 없음.
+- 보안 보완(같은 날): R-25 Origin·Referer 제어 문자·비ASCII 거부(파싱 전 검사), R-24 검증 경로 입력 방어선(128자·UTF-8 512바이트 초과·인코딩 불가 입력은 Argon2에 넘기지 않고 계정 유무와 관계없이 같은 빠른 실패).
+- 테스트: `tests/test_auth_unit.py` **191 passed**. 전체 회귀(DB 환경변수 없음, integration 제외) **604 passed, 1 skipped, 3 deselected** — skipped 1은 `test_db_postgres.py`(TEST_DATABASE_URL 없음, 통과 아님), deselected 3은 integration(미실행). 기존 413(v6 332 + DB 오프라인 81)은 그대로 통과.
+- 2-E로 넘기는 사항: R-21(422 응답의 비밀번호 원문), R-22(APP_ENV 기본값), R-23(외부 Origin·Host 신뢰), R-24 중 남은 부분(HTTP 본문 크기 제한·인증 API 422 처리).
+
 ## P3. Phase 3 — 사용자별 데이터 분리와 접근 권한
 작업
 1. Alembic `0003`이 필요하면 추가(Phase 1 스키마에 이미 있으면 생략).
@@ -347,3 +364,8 @@ stages {
 | R-18 | `todo_test`의 public 스키마를 테스트가 다시 만들어 소유자가 `pg_database_owner` → `todo_test_user`로 바뀌고 PUBLIC USAGE 권한이 없어짐 | 테스트 계정 전용 DB라 테스트 영향 없음. 원상 복구는 DB 관리자 작업이며 별도 승인 |
 | R-19 | PostgreSQL 테스트 재실행 전 읽기 전용 사전 점검 기준 미정 (첫 실행은 "빈 public", 이후에는 직전 테스트가 남긴 0001 스키마) | 기준을 정해 승인받기 전에는 실행마다 직전 보고 상태(테이블 7개, `alembic_version` 외 0행)와 같은지 확인 후 진행 |
 | R-20 | 1-B 검증은 로컬 Python 3.14 기준, Docker 이미지는 Python 3.13 | Phase 6 이미지 안에서 전체 테스트 (§P11) |
+| R-21 | FastAPI 기본 422 응답은 Pydantic 오류의 `input`을 돌려준다 → 가입·로그인 검증 실패 시 **비밀번호 원문이 응답 본문에 실릴 수 있음** | 2-E에서 인증 경로의 422 응답에서 입력값을 빼고, 비밀번호가 응답·로그에 없음을 테스트 |
+| R-22 | `APP_ENV` 미설정이면 `development`로 동작 (가입 허용, Secure 쿠키 아님) | 운영 compose에 `APP_ENV=production`·`COOKIE_SECURE=true` 필수(§P10). Phase 6 배포 검증에서 확인. 빈 값은 시작 오류 |
+| R-23 | 기대 Origin을 요청 `Host`·스킴에서 만들면 DNS 리바인딩·Host 위조·TLS 종단 프록시에서 잘못 판정할 수 있음 | 2-E에서 외부 Origin 결정 방식(허용 호스트 목록 또는 공개 Origin 설정, 프록시 헤더 신뢰 범위)을 정하고 테스트 |
+| R-24 | 비밀번호 검증 경로에 길이 상한이 없으면 아주 긴 입력으로 Argon2 비용을 쓰게 할 수 있음 (5MB 입력 검증 약 0.2초) | **`auth.py` 방어선 완료 (2-B)**: 128자·512바이트 초과·인코딩 불가 입력은 Argon2에 넘기지 않음(테스트 포함). **남은 일 (2-E)**: HTTP 요청 본문 크기 제한, 인증 API 422 오류 응답 처리(R-21과 함께) |
+| R-25 | `urlsplit`이 탭·개행과 앞쪽 제어 문자를 지워, `http://test\tserver` 같은 비정상 Origin·Referer도 정상 값으로 판정됨 (브라우저는 보내지 않는 값이라 CSRF 우회 경로는 아님, 낮음) | **완료 (2-B)**: 파싱 전에 출력 가능한 ASCII(0x21~0x7E) 밖의 문자를 거부(지우지 않음), 제어 문자·비ASCII 거부와 정상 Origin·Referer 회귀 테스트 |

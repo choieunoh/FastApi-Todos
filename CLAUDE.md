@@ -41,7 +41,7 @@ FastApi_Todos/
 └── fastapi-app/
     ├── main.py                 # API + 모델 + 저장 로직 (7.0.0: 라우트·Pydantic 모델·순수 로직)
     ├── db.py                   # (7.0.0 Phase 1) 엔진·ORM 6개·세션·테스트 DB 보호·downgrade 보호. 소유자 조건 헬퍼는 Phase 3 예정
-    ├── auth.py                 # (7.0.0 예정) 비밀번호 해시·세션·CSRF·시도 제한
+    ├── auth.py                 # (7.0.0 Phase 2-B) 순수 인증 함수: 설정·입력 검증·Argon2id·토큰·CSRF 비교·Origin 판정·쿠키 속성 (DB·라우트 없음). 세션 저장·시도 제한·라우트 연결은 2-C~2-E 예정
     ├── migrate_json.py         # (7.0.0 예정) JSON → PostgreSQL 이전·검증·역내보내기·diff CLI
     ├── alembic.ini, alembic/   # (7.0.0 Phase 1) 스키마 마이그레이션, 리비전 versions/0001_initial.py (DATABASE_URL로 접속)
     ├── templates/index.html    # UI 전체
@@ -467,6 +467,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
     - 근거 (2026-11-05): PostgreSQL 통합 11 passed, 전체 pytest **424 passed, 3 deselected**(v6 332 + DB 오프라인 81 + PostgreSQL 11). `todo_dev`에 `0001` upgrade head 성공 — 테이블 7·IDENTITY 시퀀스 4·인덱스 14·CHECK 5·FK 5, `alembic_version` = `0001`, 나머지 테이블 0행.
     - 후속 사항(`V7_PLAN.md` R-16~R-20): Windows 로캘과 C.UTF-8 차이(`lower(name)` 검증), 5433 `listen_addresses`·`pg_hba.conf`·방화벽 점검, `todo_test` public 스키마 소유자·ACL 변경, 테스트 재실행 전 사전 점검 기준, Python 3.13/Docker 검증.
 - [ ] 2. 회원가입·로그인·로그아웃, Argon2id, 쿠키 속성, 14일 만료, CSRF·Origin, **로그인 시도 제한(DB 기반, 다중 워커)**, 운영 시작 가드, 로그인 UI.
+  - [x] 2-B. DB 없는 순수 인증 함수(`auth.py`)와 단위 테스트(`tests/test_auth_unit.py` 191 passed, 전체 604 passed·1 skipped·3 deselected, 2026-11-05). API·화면에는 아직 연결하지 않았다.
+  - [ ] 2-A(`auth_failures` 리비전), 2-C(세션 저장), 2-D(시도 제한), 2-E(`/auth/*` 라우트·시작 가드), 2-F(다중 워커), 2-G(로그인 UI) — `V7_PLAN.md` §P2.
 - [ ] 3. 15개 데이터 경로 인증 필수, 익명 401·타 사용자 404 매트릭스, bulk·restore 격리, 템플릿 이름 사용자별, soft delete·position, 동시 요청.
 - [ ] 4. v6 기능 전체를 DB·인증 위에서 통과(기존 테스트는 픽스처만 교체, 변경 목록은 `V7_PLAN.md` §P8.3), 사용자별 알림 키, 두 사용자 UI 격리, `Version 7.0.0`.
 - [ ] 5. `migrate_json.py` import·verify·export-v6·diff, 백업 사본 리허설 2회, 원본 해시 불변, `pg_dump` 복원 검증, 내용 미출력.
