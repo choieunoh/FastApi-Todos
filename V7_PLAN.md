@@ -112,7 +112,7 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 하위 단계 (2026-11-05 설계 검토, 각 단계 보고·승인 후 진행)
 | 단계 | 내용 | 상태 |
 |---|---|---|
-| 2-A | Alembic `0002_auth_failures`, 모델 | 미완료 |
+| 2-A | Alembic `0002_auth_failures`, 모델, R-19 게이트 | **완료** (아래, `todo_dev` 0002 적용은 보류) |
 | 2-B | `auth.py` DB 없는 순수 함수 + `tests/test_auth_unit.py` | **완료** (아래) |
 | 2-C | 세션 저장·조회·삭제·만료 정리, `require_user` | 미완료 |
 | 2-D | 시도 제한 (`auth_failures`, advisory lock, `Retry-After`, 클라이언트 IP) | 미완료 |
@@ -120,11 +120,19 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 | 2-F | 다중 워커 시도 제한 테스트 | 미완료 |
 | 2-G | 로그인·가입 UI, `api()` CSRF 헤더 (v6 화면 강제 로그인 게이트는 Phase 3까지 보류) | 미완료 |
 
-**2-B 완료 (2026-11-05, 미커밋)**
+**2-B 완료 (2026-11-05, 로컬 커밋 `b4d3ad4`)**
 - `auth.py`: `load_settings`·`AuthSettings`(APP_ENV·COOKIE_SECURE·REGISTRATION_ENABLED, production이면 Secure 필수), `normalize_username`, `check_password`, `hash_password`·`check_password_hash`(OK·MISMATCH·INVALID_HASH)·`verify_password`·`needs_rehash`·`verify_dummy`(더미 해시는 처음 쓸 때 한 번 생성), 세션·CSRF 토큰과 SHA-256, `csrf_matches`(bytes + `hmac.compare_digest`), 14일 만료, `WebOrigin`·`origin_allowed`(스킴·호스트·포트 비교), 쿠키 생성·삭제 인자. 표준 라이브러리와 argon2만 import, import 시 해시 계산 없음.
 - 보안 보완(같은 날): R-25 Origin·Referer 제어 문자·비ASCII 거부(파싱 전 검사), R-24 검증 경로 입력 방어선(128자·UTF-8 512바이트 초과·인코딩 불가 입력은 Argon2에 넘기지 않고 계정 유무와 관계없이 같은 빠른 실패).
 - 테스트: `tests/test_auth_unit.py` **191 passed**. 전체 회귀(DB 환경변수 없음, integration 제외) **604 passed, 1 skipped, 3 deselected** — skipped 1은 `test_db_postgres.py`(TEST_DATABASE_URL 없음, 통과 아님), deselected 3은 integration(미실행). 기존 413(v6 332 + DB 오프라인 81)은 그대로 통과.
 - 2-E로 넘기는 사항: R-21(422 응답의 비밀번호 원문), R-22(APP_ENV 기본값), R-23(외부 Origin·Host 신뢰), R-24 중 남은 부분(HTTP 본문 크기 제한·인증 API 422 처리).
+
+**2-A 완료 (2026-11-05)**
+- 모델·마이그레이션: `db.AuthFailure`와 Alembic `0002_auth_failures`(down_revision `0001`, 단일 선형). upgrade는 `auth_failures`와 인덱스 3개만 만들고 0001 객체는 바꾸지 않는다. downgrade는 첫 줄 `db.guard_downgrade` 후 `auth_failures` 관련 객체만 지운다. 구조는 `V7_SPEC.md` §27.2. D-12는 이 스키마 구현에 한해 잠정 채택(정식 승인 상태는 그대로).
+- R-19 게이트(`db.verify_test_schema`): `fresh_schema`가 같은 트랜잭션에서 서버 확인 → 게이트 → `lock_timeout 5s` → `DROP SCHEMA` 순서로 실행하고, `engine` 픽스처도 처음에 한 번 확인한다. 허용 상태는 빈 스키마·base·0001·0002(리비전별 고정 목록, 오프라인 SQL과 일치를 테스트로 강제). 객체 종류·소유자·리비전·DB/스키마 소유자·함수·타입·확장·트리거·이벤트 트리거·같은 역할의 다른 세션(`pg_stat_activity`)과 **모든 역할의 연결 수(`pg_stat_database.numbackends` = 1)**를 확인하고, 어긋나거나 확인할 수 없으면 지우지 않고 세션을 멈춘다. 데이터는 알려진 표의 행 수만 센다.
+- 테스트: DB 없는 스키마 테스트 **146 passed**, DB 없는 전체 회귀 **669 passed, 1 skipped, 3 deselected**. `todo_test`(1회 승인 실행): PostgreSQL 테스트 **16 passed**, PostgreSQL 포함 전체 회귀 **685 passed, 3 deselected**. 스키마 초기화 32회·게이트 34회 모두 통과.
+- 종료 후 `todo_test`: `alembic_version` 0002, 표 8·시퀀스 5·인덱스 18, 사용자 데이터 0행, 게이트 판정 `0002`.
+- `todo_dev`는 0001에 머문다. 0002 적용(2-A4)은 2-E 직전에 별도 승인으로 한다(Phase 1과 같은 절차).
+- R-19 잔여 위험은 §P12 R-19 행에 있다.
 
 ## P3. Phase 3 — 사용자별 데이터 분리와 접근 권한
 작업
@@ -359,10 +367,10 @@ stages {
 | R-13 | 사용자 잠금(`FOR UPDATE`)으로 같은 사용자 동시 요청 지연 | 트랜잭션 짧게 유지, 사용자 단위라 다른 사용자에 영향 없음 |
 | R-14 | Argon2 해싱 CPU·메모리 비용 (가입·로그인 폭주) | 시도 제한이 검증 전에 차단, 비밀번호 최대 128자 |
 | R-15 | 이미지 크기·빌드 시간 증가 (psycopg binary, argon2) | Phase 6에서 측정 보고 |
-| R-16 | 로컬 `todo_dev`는 Windows libc 로캘(`Korean_Korea.949`, `todo_test`는 미확인), 운영 예정 환경은 `C.UTF-8` → `lower(name)` 고유 인덱스·문자열 정렬이 일부 문자에서 다를 수 있음, 로캘 변경 시 텍스트 인덱스 REINDEX 필요 가능. `lc_messages` 한국어라 서버 오류 메시지가 깨져 보일 수 있음(동작 무관) | Phase 3 템플릿 이름 기준 테스트(§P3), Phase 6 C.UTF-8 재검증(§P11). 개발 DB를 운영으로 옮기지 않는다 |
+| R-16 | 로컬 `todo_dev`·`todo_test`는 Windows libc 로캘(`Korean_Korea.949`, `todo_test`는 2-A3 읽기 전용 점검에서 확인), 운영 예정 환경은 `C.UTF-8` → `lower(name)` 고유 인덱스·문자열 정렬이 일부 문자에서 다를 수 있음, 로캘 변경 시 텍스트 인덱스 REINDEX 필요 가능. `lc_messages` 한국어라 서버 오류 메시지가 깨져 보일 수 있음(동작 무관) | Phase 3 템플릿 이름 기준 테스트(§P3), Phase 6 C.UTF-8 재검증(§P11). 개발 DB를 운영으로 옮기지 않는다 |
 | R-17 | 로컬 PostgreSQL 18(5433)의 `listen_addresses = *` → 모든 네트워크 주소에서 연결 대기 | 사용자가 `pg_hba.conf`·Windows 방화벽 점검 또는 `listen_addresses`를 `127.0.0.1`로 제한 (사용자 설정, 미완료) |
 | R-18 | `todo_test`의 public 스키마를 테스트가 다시 만들어 소유자가 `pg_database_owner` → `todo_test_user`로 바뀌고 PUBLIC USAGE 권한이 없어짐 | 테스트 계정 전용 DB라 테스트 영향 없음. 원상 복구는 DB 관리자 작업이며 별도 승인 |
-| R-19 | PostgreSQL 테스트 재실행 전 읽기 전용 사전 점검 기준 미정 (첫 실행은 "빈 public", 이후에는 직전 테스트가 남긴 0001 스키마) | 기준을 정해 승인받기 전에는 실행마다 직전 보고 상태(테이블 7개, `alembic_version` 외 0행)와 같은지 확인 후 진행 |
+| R-19 | PostgreSQL 테스트의 `DROP SCHEMA public CASCADE`는 스키마 소유자라면 다른 소유자의 객체까지 지운다 | **자동 게이트 구현 (2-A)**: 삭제 전 같은 트랜잭션에서 객체·소유자·리비전·연결 수(`numbackends` = 1)를 확인하고 어긋나면 멈춤(§P2 2-A). 게이트가 있어도 `todo_test` 실행은 계속 실행마다 승인받는다. **잔여 위험**: ① 확인과 삭제 사이의 몇 ms 틈에 새로 접속해 커밋까지 끝낸 객체는 막지 못함(PostgreSQL에 스키마 생성 차단 잠금이 없음) ② 게이트는 관계·함수·타입·확장·트리거·이벤트 트리거만 센다 — 통계 객체·연산자·콜레이션·텍스트 검색 객체 등은 미검사(2-A3 실측 0개) ③ 이름·종류·소유자 기준이라 CHECK 내용·기본값 같은 정의 수준 차이는 비교하지 않음 ④ 다른 역할의 세션이 `numbackends`에 잡히는지는 같은 역할 2번째 연결로만 실측했고 다른 역할로 직접 재현하지 않음 |
 | R-20 | 1-B 검증은 로컬 Python 3.14 기준, Docker 이미지는 Python 3.13 | Phase 6 이미지 안에서 전체 테스트 (§P11) |
 | R-21 | FastAPI 기본 422 응답은 Pydantic 오류의 `input`을 돌려준다 → 가입·로그인 검증 실패 시 **비밀번호 원문이 응답 본문에 실릴 수 있음** | 2-E에서 인증 경로의 422 응답에서 입력값을 빼고, 비밀번호가 응답·로그에 없음을 테스트 |
 | R-22 | `APP_ENV` 미설정이면 `development`로 동작 (가입 허용, Secure 쿠키 아님) | 운영 compose에 `APP_ENV=production`·`COOKIE_SECURE=true` 필수(§P10). Phase 6 배포 검증에서 확인. 빈 값은 시작 오류 |

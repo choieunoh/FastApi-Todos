@@ -27,7 +27,7 @@ APP_DIR = Path(__file__).resolve().parent.parent
 OFFLINE_URL = "postgresql://offline@localhost/offline_check"   # 오프라인 SQL 생성용 (연결하지 않는다)
 DIALECT = postgresql.dialect()
 
-TABLES = {"users", "sessions", "todos", "subtasks", "task_templates", "data_migrations"}
+TABLES = {"users", "sessions", "todos", "subtasks", "task_templates", "data_migrations", "auth_failures"}
 
 
 def alembic_config(buffer: io.StringIO | None = None) -> Config:
@@ -158,17 +158,48 @@ def test_template_name_unique_per_user_case_insensitive():
         "CREATE UNIQUE INDEX uq_task_templates_user_id_lower_name ON task_templates (user_id, lower(name))")
 
 
-def test_no_auth_failures_table_yet():
-    # 로그인 시도 제한 테이블은 Phase 2 리비전에서 만든다 (동시성 설계 재검토 후)
-    assert "auth_failures" not in db.Base.metadata.tables
+def test_auth_failures_columns():
+    # (Phase 2-A) 시도 제한 기록 — V7_SPEC §27.2
+    t = db.Base.metadata.tables["auth_failures"]
+    assert list(t.columns.keys()) == ["id", "kind", "username_key", "client_ip", "created_at"]
+    assert {c.name for c in t.columns if c.nullable} == {"username_key"}
+    assert (t.c.kind.type.length, t.c.username_key.type.length, t.c.client_ip.type.length) == (8, 30, 45)
+    assert t.c.id.identity.always is True
+    assert t.c.created_at.type.timezone is True
+    assert not t.foreign_keys                      # 없는 계정에 대한 시도도 기록한다
+
+
+def test_auth_failures_checks_and_indexes():
+    t = db.Base.metadata.tables["auth_failures"]
+    ddl = str(CreateTable(t).compile(dialect=DIALECT))
+    assert "CONSTRAINT ck_auth_failures_kind CHECK (kind IN ('login', 'register'))" in ddl
+    assert ("CONSTRAINT ck_auth_failures_register_has_no_username "
+            "CHECK (kind = 'login' OR username_key IS NULL)") in ddl
+    assert "CONSTRAINT pk_auth_failures PRIMARY KEY (id)" in ddl
+    assert {i.name: [c.name for c in i.columns] for i in t.indexes} == {
+        "ix_auth_failures_kind_username_key_created_at": ["kind", "username_key", "created_at"],
+        "ix_auth_failures_kind_client_ip_created_at": ["kind", "client_ip", "created_at"],
+        "ix_auth_failures_created_at": ["created_at"],
+    }
+    assert not any(i.unique for i in t.indexes)
+
+
+def test_identifier_names_fit_postgresql_limit():
+    # PostgreSQL 은 63바이트를 넘는 이름을 잘라 버린다 — 모델과 마이그레이션 이름이 어긋나지 않게
+    names = set()
+    for table in db.Base.metadata.tables.values():
+        names |= {c.name for c in table.constraints if c.name} | {i.name for i in table.indexes}
+    assert names and all(len(n.encode()) <= 63 for n in names), sorted(n for n in names if len(n) > 63)
 
 
 # ---------- Alembic (오프라인) ----------
 
 def test_single_linear_head():
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == ["0001"]
+    assert script.get_heads() == ["0002"]
+    assert script.get_revision("0002").down_revision == "0001"
     assert script.get_revision("0001").down_revision is None
+    assert [r.revision for r in script.walk_revisions()] == ["0002", "0001"]   # 갈래 없이 한 줄
 
 
 def test_alembic_ini_has_no_url_and_is_ascii():
@@ -182,6 +213,7 @@ def test_offline_upgrade_creates_every_table(monkeypatch):
     for table in TABLES:
         assert f"CREATE TABLE {table} (" in sql
     assert "INSERT INTO alembic_version (version_num) VALUES ('0001')" in sql
+    assert re.search(r"UPDATE alembic_version SET version_num='0002' WHERE alembic_version.version_num = '0001'", sql)
 
 
 def test_migration_ddl_equals_model_ddl(monkeypatch):
@@ -195,9 +227,67 @@ def test_migration_ddl_equals_model_ddl(monkeypatch):
 def test_offline_downgrade_drops_everything(monkeypatch):
     sql = offline_sql(monkeypatch, "0001:base", downgrade=True)
     drops = re.findall(r"DROP TABLE (\w+)", sql)
-    assert set(drops) >= TABLES
+    assert set(drops) == TABLES - {"auth_failures"}             # 0001 이 만든 표 (auth_failures 는 0002)
     assert drops.index("todos") > drops.index("subtasks")      # 외래키 순서
     assert drops.index("users") > drops.index("todos")
+
+
+def test_offline_0001_to_0002_only_adds_auth_failures(monkeypatch):
+    # 0002 는 새 테이블과 인덱스만 만든다 — 0001 의 표·열·제약·데이터는 건드리지 않는다
+    sql = offline_sql(monkeypatch, "0001:0002")
+    kinds = [" ".join(s.split()[:3]) for s in statements(sql)]
+    assert kinds == ["BEGIN", "CREATE TABLE auth_failures",
+                     "CREATE INDEX ix_auth_failures_kind_username_key_created_at",
+                     "CREATE INDEX ix_auth_failures_kind_client_ip_created_at",
+                     "CREATE INDEX ix_auth_failures_created_at",
+                     "UPDATE alembic_version SET", "COMMIT"]
+    for word in ("DROP", "ALTER", "DELETE", "TRUNCATE", "INSERT", "GRANT", "REVOKE"):
+        assert not re.search(rf"\b{word}\b", sql), word
+    assert "kind IN ('login', 'register')" in sql and "kind = 'login' OR username_key IS NULL" in sql
+
+
+def test_offline_0002_to_0001_drops_only_auth_failures(monkeypatch):
+    sql = offline_sql(monkeypatch, "0002:0001", downgrade=True)
+    assert re.findall(r"DROP TABLE (\w+)", sql) == ["auth_failures"]
+    assert sorted(re.findall(r"DROP INDEX (\w+)", sql)) == sorted([
+        "ix_auth_failures_created_at", "ix_auth_failures_kind_client_ip_created_at",
+        "ix_auth_failures_kind_username_key_created_at"])
+    assert "UPDATE alembic_version SET version_num='0001'" in sql
+    for word in ("CREATE", "ALTER", "DELETE", "TRUNCATE", "INSERT"):
+        assert not re.search(rf"\b{word}\b", sql), word
+
+
+def test_offline_head_to_base_drops_auth_failures_too(monkeypatch):
+    drops = re.findall(r"DROP TABLE (\w+)", offline_sql(monkeypatch, "0002:base", downgrade=True))
+    assert set(drops) == TABLES and drops[0] == "auth_failures"
+
+
+def relations_created_by(sql: str) -> set[tuple[str, str]]:
+    # 오프라인 SQL 에서 생기는 관계 (테이블 r, PK·UNIQUE 제약과 인덱스 i, IDENTITY 시퀀스 S)
+    result = set()
+    for stmt in statements(sql):
+        flat = " ".join(stmt.split())
+        if m := re.match(r"CREATE TABLE (\w+) \(", flat):
+            table = m.group(1)
+            result.add((table, "r"))
+            result |= {(n, "i") for n in re.findall(r"CONSTRAINT (\w+) (?:PRIMARY KEY|UNIQUE)", flat)}
+            result |= {(f"{table}_{c}_seq", "S") for c in re.findall(r"[(,] (\w+) BIGINT GENERATED", flat)}
+        elif m := re.match(r"CREATE (?:UNIQUE )?INDEX (\w+)", flat):
+            result.add((m.group(1), "i"))
+    return result
+
+
+def test_schema_gate_manifests_match_migrations(monkeypatch):
+    # R-19 게이트의 리비전별 고정 목록이 실제 마이그레이션이 만드는 객체와 같다 (리비전을 바꾸면 여기서 걸린다)
+    full_0001 = relations_created_by(offline_sql(monkeypatch, "base:0001"))
+    assert full_0001 == db.TEST_SCHEMA_MANIFESTS["0001"]
+    assert {r for r in full_0001 if r[0].startswith("alembic_version")} == db.TEST_SCHEMA_MANIFESTS[None]
+    added = relations_created_by(offline_sql(monkeypatch, "0001:0002"))
+    assert db.TEST_SCHEMA_MANIFESTS["0002"] == db.TEST_SCHEMA_MANIFESTS["0001"] | added
+    script = ScriptDirectory.from_config(alembic_config())
+    assert set(db.TEST_SCHEMA_MANIFESTS) - {None} == {r.revision for r in script.walk_revisions()}
+    by_kind = {k: len({n for n, kind in db.TEST_SCHEMA_MANIFESTS["0001"] if kind == k}) for k in "rSi"}
+    assert by_kind == {"r": 7, "S": 4, "i": 14}            # Phase 1-B todo_dev·todo_test 실측과 같다
 
 
 def test_env_requires_database_url(monkeypatch):
@@ -374,9 +464,189 @@ def test_fresh_schema_verifies_server_before_drop():
     functions = {n.name: ast.get_source_segment(source, n) for n in tree.body if isinstance(n, ast.FunctionDef)}
     fresh = functions["fresh_schema"]
     assert source.count("DROP SCHEMA") == fresh.count("DROP SCHEMA") == 1
-    assert fresh.index("db.verify_test_server(conn)") < fresh.index("DROP SCHEMA")
+    order = [fresh.index("db.verify_test_server(conn)"), fresh.index("db.verify_test_schema(conn)"),
+             fresh.index("lock_timeout"), fresh.index("DROP SCHEMA")]     # 서버 → 스키마 내용(R-19) → 삭제
+    assert order == sorted(order)
+    assert "pytest.exit" in fresh and "SQLAlchemyError" in fresh       # 확인할 수 없어도 멈춘다
     engine = functions["engine"]
-    assert engine.index("check_test_database_url") < engine.index("verify_test_server")
+    order = [engine.index("check_test_database_url"), engine.index("verify_test_server"),
+             engine.index("verify_test_schema")]
+    assert order == sorted(order)
+
+
+# ---------- 테스트 DB 스키마 사전 게이트 (R-19) ----------
+
+USER = "todo_test_user"
+
+
+def inventory(revision: str | None = "0002", **changes) -> db.SchemaInventory:
+    # 리비전 상태의 가짜 객체 목록 ("empty" 는 빈 스키마, None 은 base)
+    relations = set() if revision == "empty" else db.TEST_SCHEMA_MANIFESTS[revision]
+    tables = {n for n, k in relations if k == "r"}
+    base = dict(
+        database_owner=USER,
+        schemas=frozenset({("public", "pg_database_owner")}),
+        relations=frozenset(("public", n, k, USER) for n, k in relations),
+        functions=frozenset(),
+        types=frozenset({("public", t) for t in tables} | {("public", f"_{t}") for t in tables}),
+        extensions=frozenset({"plpgsql"}), triggers=frozenset(), event_triggers=frozenset(), other_sessions=0,
+        database_backends=1,                     # 점검 연결 자신만
+        alembic_versions=None if revision == "empty" else ((revision,) if revision else ()),
+    )
+    base.update(changes)
+    return db.SchemaInventory(**base)
+
+
+def with_relation(inv: db.SchemaInventory, *extra: tuple[str, str, str, str]) -> db.SchemaInventory:
+    return dataclasses.replace(inv, relations=inv.relations | set(extra))
+
+
+def without_relation(inv: db.SchemaInventory, name: str) -> db.SchemaInventory:
+    return dataclasses.replace(inv, relations=frozenset(r for r in inv.relations if r[1] != name))
+
+
+@pytest.mark.parametrize("revision, state", [("empty", "empty"), (None, "base"), ("0001", "0001"), ("0002", "0002")])
+def test_gate_accepts_known_states(revision, state):
+    assert db.check_test_schema_inventory(inventory(revision)) == state
+
+
+def test_gate_accepts_rows_and_test_user_as_public_owner():
+    inv = inventory("0002", row_counts=(("users", 3), ("todos", 12)), schemas=frozenset({("public", USER)}))
+    assert db.check_test_schema_inventory(inv) == "0002"
+
+
+GATE_REJECTS = {
+    "extra-table": lambda: with_relation(inventory(), ("public", "notes", "r", USER)),
+    "extra-view": lambda: with_relation(inventory(), ("public", "v_users", "v", USER)),
+    "extra-matview": lambda: with_relation(inventory(), ("public", "mv", "m", USER)),
+    "extra-sequence": lambda: with_relation(inventory(), ("public", "orphan_seq", "S", USER)),
+    "extra-index": lambda: with_relation(inventory(), ("public", "ix_extra", "i", USER)),
+    "missing-index": lambda: without_relation(inventory(), "ix_auth_failures_created_at"),
+    "missing-table": lambda: without_relation(inventory("0001"), "data_migrations"),
+    "wrong-kind": lambda: with_relation(without_relation(inventory(), "users"), ("public", "users", "v", USER)),
+    "other-owner": lambda: dataclasses.replace(inventory(), relations=frozenset(
+        (s, n, k, "someone_else" if n == "todos" else o) for s, n, k, o in inventory().relations)),
+    "other-schema-table": lambda: with_relation(inventory(), ("other", "t", "r", USER)),
+    "extra-schema": lambda: inventory(schemas=frozenset({("public", USER), ("audit", USER)})),
+    "no-public-schema": lambda: inventory("empty", schemas=frozenset()),
+    "public-owner": lambda: inventory(schemas=frozenset({("public", "postgres")})),
+    "db-owner": lambda: inventory(database_owner="postgres"),
+    "function": lambda: inventory(functions=frozenset({("public", "f")})),
+    "extra-type": lambda: dataclasses.replace(inventory(), types=inventory().types | {("public", "mood")}),
+    "missing-type": lambda: dataclasses.replace(inventory(), types=frozenset()),
+    "extension": lambda: inventory(extensions=frozenset({"plpgsql", "pgcrypto"})),
+    "trigger": lambda: inventory(triggers=frozenset({("todos", "tg_audit")})),
+    "event-trigger": lambda: inventory(event_triggers=frozenset({"evt_ddl"})),
+    "other-session": lambda: inventory(other_sessions=1),
+    "version-mismatch": lambda: inventory("0002", alembic_versions=("0001",)),
+    "unknown-revision": lambda: inventory("0002", alembic_versions=("9999",)),
+    "two-version-rows": lambda: inventory("0002", alembic_versions=("0001", "0002")),
+    "base-with-tables": lambda: inventory("0002", alembic_versions=()),
+    "tables-without-version": lambda: inventory("0002", alembic_versions=None),
+    "empty-with-version-table": lambda: inventory("empty", alembic_versions=()),
+}
+
+
+@pytest.mark.parametrize("make", list(GATE_REJECTS.values()), ids=list(GATE_REJECTS))
+def test_gate_rejects_unexpected_state(make):
+    with pytest.raises(db.DatabaseConfigError, match="삭제하지 않음"):
+        db.check_test_schema_inventory(make())
+
+
+@pytest.mark.parametrize("revision", ["empty", None, "0001", "0002"])
+def test_gate_accepts_exactly_one_backend(revision):
+    assert db.check_test_schema_inventory(inventory(revision, database_backends=1))
+
+
+@pytest.mark.parametrize("backends", [0, 2, 3, 10, -1], ids=lambda v: f"count-{v}")
+def test_gate_rejects_backend_count_other_than_one(backends):
+    with pytest.raises(db.DatabaseConfigError, match="DB 전체 연결 수"):
+        db.check_test_schema_inventory(inventory(database_backends=backends))
+
+
+@pytest.mark.parametrize("backends", [None, "1", 1.0, True, b"1", [1], (1,)],
+                         ids=["none", "str", "float", "bool", "bytes", "list", "tuple"])
+def test_gate_rejects_missing_or_malformed_backend_count(backends):
+    with pytest.raises(db.DatabaseConfigError, match="확인할 수 없음"):
+        db.check_test_schema_inventory(inventory(database_backends=backends))
+
+
+def test_gate_rejects_hidden_other_role_session():
+    # 2-A3 실측: 다른 역할의 세션은 pg_stat_activity 에서 datname 이 숨겨져 other_sessions=0 으로 보인다.
+    # numbackends 는 역할과 관계없이 세므로 2 가 되어 막힌다
+    inv = inventory("0001", other_sessions=0, database_backends=2)
+    with pytest.raises(db.DatabaseConfigError, match="DB 전체 연결 수 2"):
+        db.check_test_schema_inventory(inv)
+
+
+def test_inventory_requires_backend_count():
+    fields = {f.name for f in dataclasses.fields(db.SchemaInventory) if f.default is dataclasses.MISSING}
+    assert "database_backends" in fields          # 기본값이 없어 빠뜨리면 만들 수 없다
+    with pytest.raises(TypeError):
+        db.SchemaInventory(**{k: v for k, v in dataclasses.asdict(inventory()).items()
+                              if k != "database_backends"})
+
+
+def test_gate_reports_every_problem_at_once():
+    inv = inventory(other_sessions=2, database_owner="postgres", functions=frozenset({("public", "f")}))
+    with pytest.raises(db.DatabaseConfigError) as e:
+        db.check_test_schema_inventory(inv)
+    assert all(word in str(e.value) for word in ("다른 세션 2개", "DB 소유자 postgres", "함수"))
+
+
+GATE_FORBIDDEN = ("INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE", "GRANT", "REVOKE",
+                  "LOCK", "SET ", "COPY", "VACUUM", "CALL", "DO ")
+
+
+def test_gate_sql_is_read_only():
+    for key, sql in db.TEST_SCHEMA_SQL.items():
+        assert sql.startswith("SELECT "), key
+        assert not any(word in sql.upper() for word in GATE_FORBIDDEN), key
+    tree = ast.parse((APP_DIR / "db.py").read_text(encoding="utf-8"))
+    func = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "read_test_schema_inventory")
+    literals = [n.value for n in ast.walk(func) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    assert not any(any(w in lit.upper() for w in GATE_FORBIDDEN) for lit in literals)   # 행 수 세기도 SELECT 만
+
+
+class InventoryConnection:
+    # read_test_schema_inventory 가 보내는 SELECT 에 가짜 결과를 돌려준다 (실행한 문장 기록)
+    def __init__(self, answers: dict[str, list[tuple]]):
+        self.answers, self.executed = answers, []
+
+    def execute(self, statement, *args):
+        sql = str(statement)
+        self.executed.append(sql)
+        key = next((k for k, v in db.TEST_SCHEMA_SQL.items() if v == sql), None)
+        rows = self.answers.get(key, [(0,)] if sql.startswith("SELECT count(*) FROM public.") else [])
+        return type("R", (), {"all": lambda _s: rows, "scalar_one": lambda _s: rows[0][0]})()
+
+
+def test_read_inventory_counts_only_known_tables_and_runs_selects_only():
+    conn = InventoryConnection({
+        "has_alembic_version": [(True,)], "database_owner": [(USER,)],
+        "schemas": [("public", USER)],
+        "relations": [("public", "users", "r", USER), ("public", "secret_notes", "r", USER),
+                      ("public", "alembic_version", "r", USER)],
+        "other_sessions": [(0,)], "alembic_versions": [("0001",)], "database_backends": [(1,)],
+    })
+    inv = db.read_test_schema_inventory(conn)
+    assert dict(inv.row_counts) == {"alembic_version": 0, "users": 0}     # 모르는 표(secret_notes)는 세지 않는다
+    assert inv.alembic_versions == ("0001",)
+    assert all(sql.startswith("SELECT ") for sql in conn.executed)
+    assert not any("secret_notes" in sql for sql in conn.executed)
+    with pytest.raises(db.DatabaseConfigError):
+        db.check_test_schema_inventory(inv)                               # 모르는 표가 있으니 삭제 거부
+    assert inv.database_backends == 1
+    assert any("pg_stat_database" in sql for sql in conn.executed)
+
+
+@pytest.mark.parametrize("answer, expected", [
+    ([(1,)], 1), ([(3,)], 3), ([], None), ([(1,), (1,)], None), ([(None,)], None), ([(1, 2)], None),
+], ids=["one", "three", "no-row", "two-rows", "null", "two-columns"])
+def test_read_inventory_backend_count_shape(answer, expected):
+    conn = InventoryConnection({"has_alembic_version": [(False,)], "database_owner": [(USER,)],
+                                "other_sessions": [(0,)], "database_backends": answer})
+    assert db.read_test_schema_inventory(conn).database_backends == expected
 
 
 # ---------- downgrade 보호 ----------

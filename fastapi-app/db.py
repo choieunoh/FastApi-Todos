@@ -136,6 +136,24 @@ class DataMigration(Base):                       # JSON → DB 이전 기록 —
     migrated_at: Mapped[datetime] = utc_timestamp(nullable=False)
 
 
+class AuthFailure(Base):                         # (Phase 2-A) 로그인 실패·가입 시도 기록 — 시도 제한(§29.5)용, 24시간 뒤 정리
+    __tablename__ = "auth_failures"
+    __table_args__ = (
+        CheckConstraint("kind IN ('login', 'register')", name="kind"),
+        CheckConstraint("kind = 'login' OR username_key IS NULL", name="register_has_no_username"),  # 가입 기록은 null
+        Index("ix_auth_failures_kind_username_key_created_at", "kind", "username_key", "created_at"),
+        Index("ix_auth_failures_kind_client_ip_created_at", "kind", "client_ip", "created_at"),
+        Index("ix_auth_failures_created_at", "created_at"),       # 24시간 지난 기록 정리
+    )
+
+    # users 와 연결하지 않는다 — 없는 계정에 대한 시도도 기록해야 한다
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(8), nullable=False)
+    username_key: Mapped[str | None] = mapped_column(String(30), nullable=True)   # 정규화한 username, 담을 수 없는 형식은 null
+    client_ip: Mapped[str] = mapped_column(String(45), nullable=False)           # 정규화한 개별 IP 주소 문자열
+    created_at: Mapped[datetime] = utc_timestamp(nullable=False)
+
+
 # ---------- 연결 설정 ----------
 
 class DatabaseConfigError(RuntimeError):
@@ -240,6 +258,178 @@ def verify_test_server(connection: Connection) -> ServerFacts:
     facts = read_server_facts(connection)
     check_test_server_facts(facts)
     return facts
+
+
+# ---------- 테스트 DB 스키마 사전 게이트 (R-19, Phase 2-A) ----------
+# DROP SCHEMA public CASCADE 는 스키마 소유자라면 다른 소유자의 객체까지 지운다. 그래서 지우기 전에
+# 테스트 DB 안의 객체가 "빈 상태" 또는 "이 프로젝트 리비전이 만든 상태"와 정확히 같은지 읽기 전용으로 확인한다.
+# 리비전별 객체 목록은 고정값이다 — tests/test_db_schema.py 가 Alembic 오프라인 SQL 과 같은지 확인한다.
+
+def _relations(tables: set[str], sequences: set[str], indexes: set[str]) -> frozenset[tuple[str, str]]:
+    return frozenset({(t, "r") for t in tables} | {(s, "S") for s in sequences} | {(i, "i") for i in indexes})
+
+
+_BASE_RELATIONS = _relations({"alembic_version"}, set(), {"alembic_version_pkc"})
+_0001_RELATIONS = _BASE_RELATIONS | _relations(
+    {"users", "sessions", "todos", "subtasks", "task_templates", "data_migrations"},
+    {"users_id_seq", "todos_id_seq", "task_templates_id_seq", "data_migrations_id_seq"},
+    {"pk_users", "uq_users_username", "pk_sessions", "ix_sessions_user_id", "ix_sessions_expires_at",
+     "pk_todos", "uq_todos_user_id_position", "pk_subtasks", "pk_task_templates",
+     "uq_task_templates_user_id_position", "uq_task_templates_user_id_lower_name",
+     "pk_data_migrations", "uq_data_migrations_source_sha256"})
+_0002_RELATIONS = _0001_RELATIONS | _relations(
+    {"auth_failures"}, {"auth_failures_id_seq"},
+    {"pk_auth_failures", "ix_auth_failures_kind_username_key_created_at",
+     "ix_auth_failures_kind_client_ip_created_at", "ix_auth_failures_created_at"})
+
+# alembic_version 값(없으면 base: 표는 있고 행이 없다) → public 의 관계 (이름, relkind)
+TEST_SCHEMA_MANIFESTS: dict[str | None, frozenset[tuple[str, str]]] = {
+    None: _BASE_RELATIONS,
+    "0001": _0001_RELATIONS,
+    "0002": _0002_RELATIONS,
+}
+TEST_SCHEMA_ALLOWED_PUBLIC_OWNERS = frozenset({"pg_database_owner", TEST_DB_USER})
+TEST_SCHEMA_ALLOWED_EXTENSIONS = frozenset({"plpgsql"})
+
+_USER_SCHEMA = ("n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
+                "AND n.nspname NOT LIKE 'pg_temp_%' AND n.nspname NOT LIKE 'pg_toast_temp_%'")
+# 모두 읽기 전용 SELECT 다 (tests/test_db_schema.py 가 확인한다)
+TEST_SCHEMA_SQL = {
+    "database_owner": "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = current_database()",
+    "schemas": f"SELECT n.nspname, pg_get_userbyid(n.nspowner) FROM pg_namespace n WHERE {_USER_SCHEMA}",
+    "relations": ("SELECT n.nspname, c.relname, c.relkind::text, pg_get_userbyid(c.relowner) FROM pg_class c "
+                  f"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE {_USER_SCHEMA}"),
+    "functions": ("SELECT n.nspname, p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                  f"WHERE {_USER_SCHEMA}"),
+    "types": ("SELECT n.nspname, t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
+              f"WHERE {_USER_SCHEMA}"),
+    "extensions": "SELECT extname FROM pg_extension",
+    "triggers": ("SELECT c.relname, t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+                 f"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE NOT t.tgisinternal AND {_USER_SCHEMA}"),
+    "event_triggers": "SELECT evtname FROM pg_event_trigger",
+    "other_sessions": ("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                       "AND pid <> pg_backend_pid() AND backend_type = 'client backend'"),
+    # pg_stat_activity 는 pg_read_all_stats 가 없으면 다른 역할 세션의 datname 을 숨긴다(2-A3 실측).
+    # numbackends 는 역할과 관계없이 이 DB 에 붙은 모든 백엔드 수라 교차 확인에 쓴다 (점검 연결 자신 포함)
+    "database_backends": "SELECT numbackends FROM pg_stat_database WHERE datname = current_database()",
+    "has_alembic_version": "SELECT to_regclass('public.alembic_version') IS NOT NULL",
+    "alembic_versions": "SELECT version_num FROM public.alembic_version",
+}
+
+
+@dataclass(frozen=True)
+class SchemaInventory:                           # 테스트 DB 안의 객체 목록 — 이름·종류·소유자·개수만 (데이터 내용 없음)
+    database_owner: str
+    schemas: frozenset[tuple[str, str]]          # (스키마, 소유자) — 시스템 스키마 제외
+    relations: frozenset[tuple[str, str, str, str]]   # (스키마, 이름, relkind, 소유자)
+    functions: frozenset[tuple[str, str]]
+    types: frozenset[tuple[str, str]]
+    extensions: frozenset[str]
+    triggers: frozenset[tuple[str, str]]
+    event_triggers: frozenset[str]
+    other_sessions: int                          # 이 DB 에 붙은 다른 클라이언트 세션 (같은 역할만 보인다)
+    database_backends: object                    # pg_stat_database.numbackends (모든 역할, 자신 포함) — 정확히 1 이어야 한다
+    alembic_versions: tuple[str, ...] | None     # None: alembic_version 표 없음
+    row_counts: tuple[tuple[str, int], ...] = ()  # 알려진 테이블만, 보고용
+
+
+def _single_value(result_rows: list) -> object:
+    # 정확히 한 행·한 열일 때만 그 값을, 아니면 None (판정에서 거부된다)
+    return result_rows[0][0] if len(result_rows) == 1 and len(result_rows[0]) == 1 else None
+
+
+def read_test_schema_inventory(connection: Connection) -> SchemaInventory:
+    # 읽기 전용 SELECT 만 실행한다. 권한 문제 등으로 실패하면 예외가 그대로 올라가 호출한 쪽이 멈춘다
+    def rows(key: str) -> list:
+        return connection.execute(text(TEST_SCHEMA_SQL[key])).all()
+
+    has_version = bool(connection.execute(text(TEST_SCHEMA_SQL["has_alembic_version"])).scalar_one())
+    relations = frozenset(tuple(r) for r in rows("relations"))
+    known_tables = {name for manifest in TEST_SCHEMA_MANIFESTS.values() for name, kind in manifest if kind == "r"}
+    present = sorted(name for schema, name, kind, _ in relations if schema == "public" and kind == "r")
+    counts = tuple((name, int(connection.execute(text(f'SELECT count(*) FROM public."{name}"')).scalar_one()))
+                   for name in present if name in known_tables)   # 이름은 고정 목록에서만 — 모르는 표는 세지 않는다
+    return SchemaInventory(
+        database_owner=connection.execute(text(TEST_SCHEMA_SQL["database_owner"])).scalar_one(),
+        schemas=frozenset(tuple(r) for r in rows("schemas")),
+        relations=relations,
+        functions=frozenset(tuple(r) for r in rows("functions")),
+        types=frozenset(tuple(r) for r in rows("types")),
+        extensions=frozenset(r[0] for r in rows("extensions")),
+        triggers=frozenset(tuple(r) for r in rows("triggers")),
+        event_triggers=frozenset(r[0] for r in rows("event_triggers")),
+        other_sessions=int(connection.execute(text(TEST_SCHEMA_SQL["other_sessions"])).scalar_one()),
+        database_backends=_single_value(rows("database_backends")),
+        alembic_versions=tuple(r[0] for r in rows("alembic_versions")) if has_version else None,
+        row_counts=counts,
+    )
+
+
+def check_test_schema_inventory(inv: SchemaInventory,
+                                manifests: Mapping[str | None, frozenset[tuple[str, str]]] = TEST_SCHEMA_MANIFESTS,
+                                ) -> str:
+    # 순수 판정 — "empty" 또는 리비전("base", "0001", "0002")을 돌려주고, 하나라도 어긋나면 모든 이유를 모아 멈춘다
+    problems: list[str] = []
+    if inv.other_sessions:
+        problems.append(f"이 DB 에 다른 세션 {inv.other_sessions}개")
+    backends = inv.database_backends
+    if type(backends) is not int:                # None·문자열·실수·bool 은 모두 거부 (bool 은 int 의 하위형)
+        problems.append(f"DB 전체 연결 수를 확인할 수 없음 ({type(backends).__name__})")
+    elif backends != 1:
+        problems.append(f"DB 전체 연결 수 {backends} (점검 연결 1개만 허용, 다른 역할 세션 포함)")
+    if inv.database_owner != TEST_DB_USER:
+        problems.append(f"DB 소유자 {inv.database_owner}")
+    if {s for s, _ in inv.schemas} != {"public"}:
+        problems.append(f"사용자 스키마 {sorted(s for s, _ in inv.schemas)} (public 하나만 허용)")
+    for schema, owner in inv.schemas:
+        if schema == "public" and owner not in TEST_SCHEMA_ALLOWED_PUBLIC_OWNERS:
+            problems.append(f"public 소유자 {owner}")
+    if inv.extensions - TEST_SCHEMA_ALLOWED_EXTENSIONS:
+        problems.append(f"확장 {sorted(inv.extensions - TEST_SCHEMA_ALLOWED_EXTENSIONS)}")
+    if inv.functions:
+        problems.append(f"함수 {sorted(inv.functions)}")
+    if inv.triggers:
+        problems.append(f"트리거 {sorted(inv.triggers)}")
+    if inv.event_triggers:
+        problems.append(f"이벤트 트리거 {sorted(inv.event_triggers)}")
+    outside = sorted((s, n) for s, n, _, _ in inv.relations if s != "public")
+    if outside:
+        problems.append(f"public 밖의 관계 {outside}")
+    owners = sorted({o for _, _, _, o in inv.relations} - {TEST_DB_USER})
+    if owners:
+        problems.append(f"다른 소유자의 관계 {owners}")
+
+    actual = frozenset((n, k) for s, n, k, _ in inv.relations if s == "public")
+    state = "?"
+    if not actual and inv.alembic_versions is None:
+        state = "empty"
+    elif inv.alembic_versions is None:
+        problems.append("alembic_version 표 없이 다른 객체가 있음")
+    elif len(inv.alembic_versions) > 1:
+        problems.append(f"alembic_version 행 {len(inv.alembic_versions)}개")
+    else:
+        revision = inv.alembic_versions[0] if inv.alembic_versions else None
+        if revision not in manifests:
+            problems.append(f"모르는 리비전 {revision}")
+        elif actual != manifests[revision]:
+            missing = sorted(manifests[revision] - actual)
+            extra = sorted(actual - manifests[revision])
+            problems.append(f"리비전 {revision or 'base'} 구조와 다름 (없음 {missing}, 추가 {extra})")
+        else:
+            state = revision or "base"
+    tables = {n for n, k in actual if k == "r"}
+    expected_types = {("public", t) for t in tables} | {("public", f"_{t}") for t in tables}   # 테이블 행 타입과 배열 타입
+    if inv.types != expected_types:
+        problems.append(f"타입이 테이블 행 타입과 다름 (추가 {sorted(inv.types - expected_types)}, "
+                        f"없음 {sorted(expected_types - inv.types)})")
+    if problems:
+        raise DatabaseConfigError("테스트 DB 스키마 사전 확인 실패 (삭제하지 않음): " + "; ".join(problems))
+    return state
+
+
+def verify_test_schema(connection: Connection) -> str:
+    # DROP SCHEMA 직전, verify_test_server 다음에 같은 연결·트랜잭션에서 부른다
+    return check_test_schema_inventory(read_test_schema_inventory(connection))
 
 
 def check_downgrade_allowed(url: URL, facts: ServerFacts, x_args: Mapping[str, str],

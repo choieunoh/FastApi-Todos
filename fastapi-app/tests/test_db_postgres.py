@@ -16,7 +16,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from sqlalchemy import func, insert, inspect, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 import db
 
@@ -38,9 +38,11 @@ def engine():
     try:
         with engine.connect() as conn:
             db.verify_test_server(conn)
-    except db.DatabaseConfigError as e:
+            db.verify_test_schema(conn)          # R-19 — 읽기 전용, 처음 지우기 전에 한 번 더 일찍 멈춘다
+            conn.rollback()
+    except (db.DatabaseConfigError, SQLAlchemyError) as e:
         engine.dispose()
-        pytest.exit(f"테스트 DB 보호: {e}", returncode=2)   # 다른 테스트도 진행하지 않는다
+        pytest.exit(f"테스트 DB 보호: {e}", returncode=2)   # 다른 테스트도 진행하지 않는다 (확인할 수 없어도 멈춘다)
     yield engine
     engine.dispose()
 
@@ -55,11 +57,17 @@ def alembic_cfg(monkeypatch):
 
 @pytest.fixture
 def fresh_schema(engine, alembic_cfg):
-    # 빈 스키마에서 head 까지 올린다. 지우기 직전에 같은 연결로 서버를 다시 확인한다 (실패하면 지우지 않는다)
-    with engine.begin() as conn:
-        db.verify_test_server(conn)
-        conn.execute(text("DROP SCHEMA public CASCADE"))
-        conn.execute(text("CREATE SCHEMA public"))
+    # 빈 스키마에서 head 까지 올린다. 지우기 직전에 같은 연결·트랜잭션에서 서버와 스키마 내용(R-19)을
+    # 다시 확인한다. 하나라도 어긋나거나 확인할 수 없으면 지우지 않고 세션 전체를 멈춘다
+    try:
+        with engine.begin() as conn:
+            db.verify_test_server(conn)
+            db.verify_test_schema(conn)
+            conn.execute(text("SET LOCAL lock_timeout = '5s'"))   # 다른 세션이 잡고 있으면 기다리지 않고 실패
+            conn.execute(text("DROP SCHEMA public CASCADE"))
+            conn.execute(text("CREATE SCHEMA public"))
+    except (db.DatabaseConfigError, SQLAlchemyError) as e:
+        pytest.exit(f"테스트 DB 보호: {e}", returncode=2)
     command.upgrade(alembic_cfg, "head")
     yield engine
 
@@ -167,3 +175,50 @@ def test_cascade_delete(fresh_schema):
         conn.execute(db.User.__table__.delete().where(db.User.id == uid))
         assert conn.execute(select(db.Todo)).all() == []
         assert conn.execute(select(db.Subtask)).all() == []
+
+
+# ---------- Phase 2-A: auth_failures (0002) ----------
+
+def failure_row(kind: str, username_key: str | None, client_ip: str = "127.0.0.1") -> dict:
+    return {"kind": kind, "username_key": username_key, "client_ip": client_ip,
+            "created_at": datetime.now(timezone.utc)}
+
+
+def test_gate_accepts_state_left_by_migrations(fresh_schema):
+    with fresh_schema.connect() as conn:
+        assert db.verify_test_schema(conn) == "0002"
+
+
+def test_stepwise_0002_0001_round_trip(fresh_schema, alembic_cfg):
+    command.downgrade(alembic_cfg, "0001")
+    tables = set(inspect(fresh_schema).get_table_names())
+    assert "auth_failures" not in tables and {"users", "todos", "alembic_version"} <= tables
+    with fresh_schema.connect() as conn:
+        assert db.verify_test_schema(conn) == "0001"
+    command.upgrade(alembic_cfg, "head")
+    assert "auth_failures" in inspect(fresh_schema).get_table_names()
+
+
+def test_auth_failures_indexes(fresh_schema):
+    indexes = {i["name"]: i["column_names"] for i in inspect(fresh_schema).get_indexes("auth_failures")}
+    assert indexes == {
+        "ix_auth_failures_kind_username_key_created_at": ["kind", "username_key", "created_at"],
+        "ix_auth_failures_kind_client_ip_created_at": ["kind", "client_ip", "created_at"],
+        "ix_auth_failures_created_at": ["created_at"],
+    }
+
+
+def test_auth_failures_constraints(fresh_schema):
+    with fresh_schema.connect() as conn, conn.begin():
+        conn.execute(insert(db.AuthFailure).values(**failure_row("login", "alice")))
+        conn.execute(insert(db.AuthFailure).values(**failure_row("login", None)))       # 담을 수 없는 형식은 null
+        conn.execute(insert(db.AuthFailure).values(**failure_row("register", None)))
+        assert_rejected(conn, insert(db.AuthFailure).values(**failure_row("register", "alice")))
+        assert_rejected(conn, insert(db.AuthFailure).values(**failure_row("logout", None)))
+        assert count(conn, db.AuthFailure) == 3
+
+
+def test_advisory_lock_key_function_available(fresh_schema):
+    # 2-D 의 username 잠금이 쓸 함수 — 트랜잭션이 끝나면 자동으로 풀린다
+    with fresh_schema.connect() as conn, conn.begin():
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended('login:' || :u, 0))"), {"u": "alice"})
