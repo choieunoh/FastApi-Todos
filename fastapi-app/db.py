@@ -6,7 +6,10 @@ Phase 1-A: 스키마와 연결 설정만 둔다. 아직 main.py 는 이 모듈�
 - 열거값은 PG ENUM 대신 VARCHAR + CHECK (Alembic 으로 값 바꾸기 쉽다).
 - 스키마 변경은 Alembic 리비전으로만 한다. 앱이 create_all 을 부르지 않는다.
 """
+import base64
+import binascii
 import os
+import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -14,8 +17,10 @@ from functools import lru_cache
 
 from sqlalchemy import (
     CHAR, BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Identity, Index, Integer,
-    LargeBinary, MetaData, String, Text, UniqueConstraint, create_engine, func, text,
+    LargeBinary, MetaData, String, Text, UniqueConstraint, create_engine, delete, func, select, text,
 )
+
+import auth                                      # 순수 함수만 (auth 는 db 를 import 하지 않는다)
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.engine import URL, Connection, Engine, make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, MappedColumn, Session, mapped_column, sessionmaker
@@ -466,6 +471,7 @@ def make_engine(url: URL | str, **kwargs: object) -> Engine:
         url,
         pool_pre_ping=True,                      # 끊긴 연결을 재사용하지 않는다
         connect_args={"options": "-c TimeZone=UTC"},   # 응답 시각이 항상 UTC 로 나오게
+        hide_parameters=True,                    # (2-C) 오류 문자열·로그에 바인드 값(CSRF 토큰·해시 등)을 넣지 않는다
         **kwargs,
     )
 
@@ -484,3 +490,74 @@ def get_db() -> Iterator[Session]:
     # FastAPI 의존성 — 요청마다 세션 1개·트랜잭션 1개. 예외가 나면 전부 되돌린다
     with get_sessionmaker()() as session, session.begin():
         yield session
+
+
+# ---------- 로그인 세션 저장 (Phase 2-C, V7_SPEC §29.2) ----------
+# - 쿠키 토큰 원문은 반환값으로만 내보내고 DB 에는 SHA-256(auth.hash_token)만 저장한다.
+# - 모든 함수는 호출자의 Session·트랜잭션 안에서 동작한다. commit·rollback 하지 않고 새 엔진·연결도 만들지 않는다.
+# - DB 오류는 잡지 않고 그대로 올린다 (오류가 나도 인증 성공으로 처리하지 않는다).
+# - 시각은 호출자가 넘기는 시간대 있는 now 만 받는다 (DB now() 를 쓰지 않는다).
+# - HTTP(쿠키 읽기·401·require_user·CSRF 검사)는 Phase 2-E(main.py)에서 연결한다.
+
+SESSION_TOKEN_LENGTH = 43                        # auth.new_session_token() = token_urlsafe(32)
+_SESSION_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}", re.ASCII)
+
+
+def is_valid_session_token(token: object) -> bool:
+    # 외부(쿠키)에서 온 값이 우리가 만드는 형식과 정확히 같은지 — 정규화·잘라내기 없이 그대로 본다
+    if not isinstance(token, str) or len(token) != SESSION_TOKEN_LENGTH or not _SESSION_TOKEN_RE.fullmatch(token):
+        return False
+    try:
+        raw = base64.urlsafe_b64decode(token + "=")
+    except (binascii.Error, ValueError):
+        return False
+    # 마지막 글자의 남는 비트까지 같아야 한다 (같은 32바이트를 가리키는 다른 표기를 받지 않는다)
+    return len(raw) == auth.TOKEN_BYTES and base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii") == token
+
+
+def _require_aware(now: datetime) -> None:
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("시간대가 있는 시각(now)이어야 합니다")
+
+
+def create_session(db: Session, user_id: int, now: datetime, *, replace_token: str | None = None) -> tuple[str, str]:
+    # 새 세션을 만들고 (세션 토큰 원문, CSRF 토큰)을 돌려준다. 만료는 now + 14일 고정
+    # replace_token: 재로그인 때 그 요청 쿠키의 세션만 지운다 (형식이 틀리면 아무것도 지우지 않는다, 다른 기기 세션은 유지)
+    _require_aware(now)                          # 시간대 없는 now 는 아무것도 바꾸기 전에 ValueError
+    expires_at = auth.session_expires_at(now)
+    if replace_token is not None and is_valid_session_token(replace_token):
+        db.execute(delete(UserSession).where(UserSession.token_hash == auth.hash_token(replace_token)))
+    token, csrf = auth.new_session_token(), auth.new_csrf_token()
+    db.add(UserSession(token_hash=auth.hash_token(token), user_id=user_id, csrf_token=csrf,
+                       created_at=now, expires_at=expires_at))
+    db.flush()                                   # 제약 위반을 이 자리에서 드러낸다 (commit 은 호출자)
+    return token, csrf
+
+
+def get_active_session(db: Session, token: object, now: datetime) -> tuple[UserSession, User] | None:
+    # 유효한 세션과 그 사용자를 돌려준다. 형식이 틀린 토큰은 DB 조회 없이 None. 읽기만 한다(만료 행도 지우지 않는다)
+    _require_aware(now)
+    if not is_valid_session_token(token):
+        return None
+    row = db.execute(
+        select(UserSession, User)
+        .join(User, User.id == UserSession.user_id)
+        .where(UserSession.token_hash == auth.hash_token(token), UserSession.expires_at > now)   # 같으면 만료
+    ).one_or_none()
+    if row is None or auth.is_expired(row[0].expires_at, now):   # 같은 규칙을 파이썬에서도 한 번 더
+        return None
+    return row[0], row[1]
+
+
+def delete_session(db: Session, token: object) -> bool:
+    # 로그아웃 — 지웠으면 True, 없거나 형식이 틀리면 False (형식이 틀리면 DELETE 를 보내지 않는다). 여러 번 불러도 같다
+    if not is_valid_session_token(token):
+        return False
+    result = db.execute(delete(UserSession).where(UserSession.token_hash == auth.hash_token(token)))
+    return result.rowcount > 0
+
+
+def purge_expired_sessions(db: Session, now: datetime) -> int:
+    # 모든 사용자의 만료 세션(expires_at <= now)을 지우고 지운 수를 돌려준다 (로그인·가입 때 부른다)
+    _require_aware(now)
+    return db.execute(delete(UserSession).where(UserSession.expires_at <= now)).rowcount

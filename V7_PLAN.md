@@ -89,7 +89,10 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 ## P2. Phase 2 — 회원가입·로그인·로그아웃 + 시도 제한
 작업
 1. Alembic `0002_auth_failures`.
-2. `auth.py`: Argon2id 해시·검증·rehash, 더미 해시, 세션 생성·조회·삭제(SHA-256 저장), 만료 정리, `require_user` 의존성, CSRF 검사, Origin 검사, 시도 제한(`auth_failures` + advisory lock), 클라이언트 IP 결정, `APP_ENV=production` 시작 가드, `REGISTRATION_ENABLED`.
+2. 인증 로직의 책임 분담 (2026-11-06 확정)
+   - `auth.py`: DB·웹 프레임워크 없는 **순수 인증 함수** — Argon2id 해시·검증·rehash, 더미 해시, 토큰·SHA-256, CSRF 비교, Origin 판정, 쿠키 속성, 설정(`APP_ENV`·`COOKIE_SECURE`·`REGISTRATION_ENABLED`) (2-B).
+   - `db.py`: **DB 세션 저장** — 생성·조회·삭제·만료 정리(SHA-256만 저장, commit 은 호출자) (2-C). 시도 제한 기록(`auth_failures` + advisory lock, 2-D).
+   - `main.py`: **HTTP 계층** — `require_user` 의존성(쿠키 → `db.get_active_session` → 401), CSRF·Origin 검사 적용, 클라이언트 IP 결정, `APP_ENV=production` 시작 가드 연결 (2-E).
 3. `main.py`: `/auth/register`, `/auth/login`, `/auth/logout`, `/auth/me`.
 4. `index.html`: 로그인·가입 화면, 헤더 사용자명·로그아웃, `api()`의 CSRF 헤더·401 처리.
    - 이 Phase에서는 데이터 API를 아직 막지 않는다(기존 테스트 유지). 화면은 로그인 후 앱을 보여준다.
@@ -114,11 +117,18 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 |---|---|---|
 | 2-A | Alembic `0002_auth_failures`, 모델, R-19 게이트 | **완료** (아래, `todo_dev` 0002 적용은 보류) |
 | 2-B | `auth.py` DB 없는 순수 함수 + `tests/test_auth_unit.py` | **완료** (아래) |
-| 2-C | 세션 저장·조회·삭제·만료 정리, `require_user` | 미완료 |
+| 2-C | `db.py` 세션 저장·조회·삭제·만료 정리, 엔진 `hide_parameters` (`require_user`는 2-E) | **완료** (아래). 재로그인 교체 정책(잠정): `replace_token`이 가리키는 세션 하나만 삭제(그 세션의 사용자와 새 로그인 사용자가 달라도 같음), 양쪽 사용자의 다른 세션은 유지, 형식이 틀린 토큰이면 삭제 없음 |
 | 2-D | 시도 제한 (`auth_failures`, advisory lock, `Retry-After`, 클라이언트 IP) | 미완료 |
-| 2-E | `/auth/*` 4개 라우트, `get_db` 연결, 시작 가드(`load_settings`), 외부 Origin 결정 | 미완료 |
+| 2-E | `/auth/*` 4개 라우트, `require_user`, `get_db` 연결, 시작 가드(`load_settings`), 외부 Origin 결정 | 미완료 |
 | 2-F | 다중 워커 시도 제한 테스트 | 미완료 |
 | 2-G | 로그인·가입 UI, `api()` CSRF 헤더 (v6 화면 강제 로그인 게이트는 Phase 3까지 보류) | 미완료 |
+
+**2-C 구현·검증 완료 (2026-11-06)**
+- `db.py`: `create_session`(토큰·CSRF 발급, SHA-256만 저장, 만료 = 생성 + 14일 고정, `replace_token`이 가리키는 세션 하나만 삭제), `get_active_session`(`expires_at > now`인 행만, 조회는 만료 행을 지우지 않음), `delete_session`(멱등, 형식이 틀린 토큰은 DB 호출 없음), `purge_expired_sessions`(모든 사용자, `expires_at <= now`), `is_valid_session_token`(43자·URL-safe·32바이트·정규 표기). 함수는 commit 하지 않는다(트랜잭션은 호출자 책임). 엔진 `hide_parameters=True`. `auth.py`·`main.py`는 바꾸지 않았다(`require_user`는 2-E).
+- 테스트: DB 없는 `tests/test_auth_sessions.py` 80개, DB 없는 전체 회귀 **749 passed, 1 skipped, 3 deselected**(skipped 1은 `test_db_postgres.py`, 통과 아님). `todo_test`(승인 실행): PostgreSQL 테스트 **27 passed**(2-C 신규 11), PostgreSQL 포함 전체 회귀 **776 passed, 3 deselected**. 스키마 초기화 54회·R-19 게이트 56회 모두 통과.
+- 테스트 격리 보완: 처음 실행(2-C3)에서 마지막 테스트가 `with conn.begin()` 정상 종료로 합성 데이터(users 1·sessions 3)를 커밋해 남겼다. 단일 트랜잭션 테스트 17개를 끝나면 항상 되돌리는 `rolled_back`으로 바꾸고 재검증했다(위 수치). 종료 후 `todo_test`: `alembic_version` 0002, 표 8·시퀀스 5·인덱스 18, **사용자 데이터 표 7개 모두 0행**, 게이트 판정 `0002`. `fresh_schema`·R-19 게이트는 바꾸지 않았다.
+- 제한: 커밋 자체를 검사하는 테스트 2개(`test_session_rollback_leaves_nothing`, `test_logout_commit_is_seen_by_other_connection`)는 의도적으로 커밋한다. 단독(`-k`)이나 마지막 순서로 실행하면 `users` 1행이 남을 수 있다(기본 순서에서는 이후 `fresh_schema`가 지운다). 다음 PostgreSQL 실행 전 사전 점검은 실제 행 수를 확인한다.
+- 남은 위험: R-19 잔여(§P12), R-26(세션 수 상한 없음), R-27(미해결, ③ 앱 로그·HTTP 응답은 2-E).
 
 **2-B 완료 (2026-11-05, 로컬 커밋 `b4d3ad4`)**
 - `auth.py`: `load_settings`·`AuthSettings`(APP_ENV·COOKIE_SECURE·REGISTRATION_ENABLED, production이면 Secure 필수), `normalize_username`, `check_password`, `hash_password`·`check_password_hash`(OK·MISMATCH·INVALID_HASH)·`verify_password`·`needs_rehash`·`verify_dummy`(더미 해시는 처음 쓸 때 한 번 생성), 세션·CSRF 토큰과 SHA-256, `csrf_matches`(bytes + `hmac.compare_digest`), 14일 만료, `WebOrigin`·`origin_allowed`(스킴·호스트·포트 비교), 쿠키 생성·삭제 인자. 표준 라이브러리와 argon2만 import, import 시 해시 계산 없음.
@@ -377,3 +387,5 @@ stages {
 | R-23 | 기대 Origin을 요청 `Host`·스킴에서 만들면 DNS 리바인딩·Host 위조·TLS 종단 프록시에서 잘못 판정할 수 있음 | 2-E에서 외부 Origin 결정 방식(허용 호스트 목록 또는 공개 Origin 설정, 프록시 헤더 신뢰 범위)을 정하고 테스트 |
 | R-24 | 비밀번호 검증 경로에 길이 상한이 없으면 아주 긴 입력으로 Argon2 비용을 쓰게 할 수 있음 (5MB 입력 검증 약 0.2초) | **`auth.py` 방어선 완료 (2-B)**: 128자·512바이트 초과·인코딩 불가 입력은 Argon2에 넘기지 않음(테스트 포함). **남은 일 (2-E)**: HTTP 요청 본문 크기 제한, 인증 API 422 오류 응답 처리(R-21과 함께) |
 | R-25 | `urlsplit`이 탭·개행과 앞쪽 제어 문자를 지워, `http://test\tserver` 같은 비정상 Origin·Referer도 정상 값으로 판정됨 (브라우저는 보내지 않는 값이라 CSRF 우회 경로는 아님, 낮음) | **완료 (2-B)**: 파싱 전에 출력 가능한 ASCII(0x21~0x7E) 밖의 문자를 거부(지우지 않음), 제어 문자·비ASCII 거부와 정상 Origin·Referer 회귀 테스트 |
+| R-26 | 사용자당 동시 세션 수 상한이 없음 → 정상 로그인을 반복하면 `sessions` 행이 쌓인다(만료 14일 뒤 로그인·가입 때 정리) | 2-C 결정: 이번에는 상한 없음(명세에 없음). 로그인 시도 제한(2-D)·정리(`purge_expired_sessions`)로 완화. 상한이 필요하면 별도 결정 |
+| R-27 | `hide_parameters=True`는 SQLAlchemy 가 만드는 오류 문자열·로그의 바인드 값만 숨긴다. 드라이버(PostgreSQL)의 오류 DETAIL(예: 중복 키 값)이나 앱이 직접 남기는 로그는 막지 못함 | 세 층으로 나눠 관리: ① SQLAlchemy 바인드 값 — `hide_parameters`로 숨김(실패 조건으로 테스트) ② PostgreSQL DETAIL — 중복 키 오류에 `token_hash`(토큰 원문이 아닌 SHA-256)가 실릴 수 있음 ③ 앱 로그·HTTP 응답 — 2-E에서 로그 설정과 500 응답 본문에 오류 내용이 나가지 않는지 확인. 세션 함수는 값을 로그·예외 메시지에 넣지 않음(테스트로 확인). **2-C3 관찰(2026-11-06, `todo_test`)**: ① 바인드 값 숨김 확인(`hide_parameters=True` 표시) · 세션 토큰 원문·CSRF 원문(기존 세션·두 번째 INSERT 모두)은 예외 문자열·DETAIL에 없음 ② `postgres_detail_contains_token_hash=True` — DETAIL에 `token_hash`가 실림을 확인(값은 출력하지 않음) ③ 미검증(2-E). users 고유 제약 위반 DETAIL에도 username 이 실릴 수 있음 → 2-E에서 중복을 먼저 조회해 409로 처리. **미해결(열림)** — ③ 확인 전까지 해결로 보지 않는다 |

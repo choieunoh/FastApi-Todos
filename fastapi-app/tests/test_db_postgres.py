@@ -6,8 +6,10 @@
 - 이 파일은 그 DB 의 public 스키마를 지웠다 만든다 (지우기 직전 같은 연결에서 db.verify_test_server).
 - 개발 DB(todo_dev)·운영 DB 에는 절대 연결하지 않는다.
 """
+import hashlib
 import os
-from datetime import date, datetime, timezone
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -17,7 +19,10 @@ from alembic.config import Config
 from alembic.migration import MigrationContext
 from sqlalchemy import func, insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import NullPool
 
+import auth
 import db
 
 pytestmark = pytest.mark.postgres
@@ -72,6 +77,18 @@ def fresh_schema(engine, alembic_cfg):
     yield engine
 
 
+@contextmanager
+def rolled_back(engine):
+    # 한 트랜잭션 안에서 검사하고, 성공해도 실패해도 끝나면 되돌린다 — 합성 데이터를 커밋하지 않는다.
+    # (`with conn.begin():` 은 정상 종료 때 커밋하므로 마지막 테스트의 데이터가 todo_test 에 남았다)
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            yield conn
+        finally:
+            trans.rollback()
+
+
 def make_user(conn, name: str) -> int:
     return conn.execute(insert(db.User).values(
         username=name, password_hash="x", created_at=datetime.now(timezone.utc)).returning(db.User.id)).scalar_one()
@@ -120,14 +137,14 @@ def test_session_timezone_is_utc(fresh_schema):
     {"recurrence": "daily", "due_date": None},
 ])
 def test_check_constraints(fresh_schema, fields):
-    with fresh_schema.connect() as conn, conn.begin():
+    with rolled_back(fresh_schema) as conn:
         uid = make_user(conn, "alice")
         assert_rejected(conn, insert(db.Todo).values(**todo_row(uid, 1, **fields)))
         assert count(conn, db.User) == 1 and count(conn, db.Todo) == 0
 
 
 def test_defaults_and_v6_null_timestamps(fresh_schema):
-    with fresh_schema.connect() as conn, conn.begin():
+    with rolled_back(fresh_schema) as conn:
         uid = make_user(conn, "alice")
         row = conn.execute(insert(db.Todo).values(**todo_row(uid, 1)).returning(db.Todo)).one()
         assert (row.description, row.completed, row.priority, row.tags, row.favorite, row.recurrence,
@@ -136,7 +153,7 @@ def test_defaults_and_v6_null_timestamps(fresh_schema):
 
 
 def test_position_unique_per_user(fresh_schema):
-    with fresh_schema.connect() as conn, conn.begin():
+    with rolled_back(fresh_schema) as conn:
         alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
         conn.execute(insert(db.Todo).values(**todo_row(alice, 1)))
         conn.execute(insert(db.Todo).values(**todo_row(bob, 1)))           # 다른 사용자는 같은 position 가능
@@ -146,7 +163,7 @@ def test_position_unique_per_user(fresh_schema):
 
 
 def test_template_name_unique_per_user_case_insensitive(fresh_schema):
-    with fresh_schema.connect() as conn, conn.begin():
+    with rolled_back(fresh_schema) as conn:
         alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
         base = {"title": "t"}
         conn.execute(insert(db.TaskTemplate).values(user_id=alice, position=1, name="주간 보고", **base))
@@ -158,7 +175,7 @@ def test_template_name_unique_per_user_case_insensitive(fresh_schema):
 
 def test_explicit_ids_keep_and_sequence_can_be_moved(fresh_schema):
     # 이전처럼 원래 id 로 넣은 뒤 setval 하면 다음 id 가 최대 id + 1 이다
-    with fresh_schema.connect() as conn, conn.begin():
+    with rolled_back(fresh_schema) as conn:
         uid = make_user(conn, "alice")
         conn.execute(insert(db.Todo).values(id=7, **todo_row(uid, 1)))
         conn.execute(text("SELECT setval(pg_get_serial_sequence('todos', 'id'), 7)"))
@@ -167,7 +184,7 @@ def test_explicit_ids_keep_and_sequence_can_be_moved(fresh_schema):
 
 
 def test_cascade_delete(fresh_schema):
-    with fresh_schema.connect() as conn, conn.begin():
+    with rolled_back(fresh_schema) as conn:
         uid = make_user(conn, "alice")
         todo_id = conn.execute(insert(db.Todo).values(**todo_row(uid, 1, due_date=date(2026, 11, 5)))
                                .returning(db.Todo.id)).scalar_one()
@@ -209,7 +226,7 @@ def test_auth_failures_indexes(fresh_schema):
 
 
 def test_auth_failures_constraints(fresh_schema):
-    with fresh_schema.connect() as conn, conn.begin():
+    with rolled_back(fresh_schema) as conn:
         conn.execute(insert(db.AuthFailure).values(**failure_row("login", "alice")))
         conn.execute(insert(db.AuthFailure).values(**failure_row("login", None)))       # 담을 수 없는 형식은 null
         conn.execute(insert(db.AuthFailure).values(**failure_row("register", None)))
@@ -220,5 +237,186 @@ def test_auth_failures_constraints(fresh_schema):
 
 def test_advisory_lock_key_function_available(fresh_schema):
     # 2-D 의 username 잠금이 쓸 함수 — 트랜잭션이 끝나면 자동으로 풀린다
-    with fresh_schema.connect() as conn, conn.begin():
+    with rolled_back(fresh_schema) as conn:
         conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended('login:' || :u, 0))"), {"u": "alice"})
+
+
+# ---------- Phase 2-C: 로그인 세션 저장 (db.create_session 등) ----------
+# 세션 함수는 commit 하지 않는다 — 여기서는 연결의 트랜잭션에 묶인 ORM Session 으로 부른다.
+# 트랜잭션의 주인은 연결(rolled_back)이고 ORM Session 은 거기에 합류만 한다 — 끝나면 연결이 되돌린다.
+# 커밋이 꼭 필요한 테스트(호출자 rollback, 다른 연결에서 보이는지)만 명시적으로 커밋한다.
+# 두 번째 연결이 필요하면 NullPool 엔진으로 만들고 반드시 닫는다 (풀에 남은 연결은 R-19 게이트의 연결 수에 잡힌다)
+
+T = datetime(2026, 11, 6, 9, 0, tzinfo=timezone.utc)
+
+
+def orm(conn) -> Session:
+    return Session(bind=conn, expire_on_commit=False)
+
+
+def session_count(conn) -> int:
+    return count(conn, db.UserSession)
+
+
+def test_session_create_lookup_delete(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        uid = make_user(conn, "alice")
+        s = orm(conn)
+        token, csrf = db.create_session(s, uid, T)
+        found = db.get_active_session(s, token, T + timedelta(hours=1))
+        assert found is not None and found[1].id == uid and found[0].csrf_token == csrf
+        assert db.delete_session(s, token) is True
+        assert db.get_active_session(s, token, T + timedelta(hours=1)) is None
+        assert db.delete_session(s, token) is False                          # 멱등
+        assert session_count(conn) == 0
+
+
+def test_session_expiry_boundary_in_database(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        uid = make_user(conn, "alice")
+        s = orm(conn)
+        token, _ = db.create_session(s, uid, T)
+        expires = T + timedelta(days=14)
+        assert db.get_active_session(s, token, expires - timedelta(microseconds=1)) is not None
+        assert db.get_active_session(s, token, expires) is None              # 같으면 만료
+        assert db.get_active_session(s, token, expires + timedelta(days=1)) is None
+        stored = conn.execute(select(db.UserSession.expires_at)).scalar_one()
+        assert stored == expires and stored.utcoffset() == timedelta(0)        # TIMESTAMPTZ 를 거쳐도 같은 순간
+        assert session_count(conn) == 1                                       # 조회는 만료 행을 지우지 않는다
+
+
+def test_relogin_replaces_only_presented_session(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        uid = make_user(conn, "alice")
+        s = orm(conn)
+        a, _ = db.create_session(s, uid, T)                                  # 이 브라우저
+        b, _ = db.create_session(s, uid, T)                                  # 다른 기기
+        c, _ = db.create_session(s, uid, T + timedelta(minutes=5), replace_token=a)
+        now = T + timedelta(minutes=10)
+        assert db.get_active_session(s, a, now) is None
+        assert db.get_active_session(s, b, now) is not None and db.get_active_session(s, c, now) is not None
+        db.create_session(s, uid, now, replace_token="not-a-valid-token")    # 형식이 틀리면 아무것도 지우지 않는다
+        assert session_count(conn) == 3
+
+
+def test_relogin_as_other_user_replaces_only_presented_session(fresh_schema):
+    # 잠정 정책: 제시된 세션 하나만 교체한다 — 그 세션의 사용자와 새로 로그인한 사용자가 달라도 같다.
+    # A 의 다른 세션과 B 의 기존 세션은 그대로 둔다
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        a1, _ = db.create_session(s, alice, T)
+        a2, _ = db.create_session(s, alice, T)
+        b1, _ = db.create_session(s, bob, T)
+        b2, _ = db.create_session(s, bob, T + timedelta(minutes=5), replace_token=a1)
+        now = T + timedelta(minutes=10)
+        assert db.get_active_session(s, a1, now) is None
+        owners = {name: db.get_active_session(s, tok, now)[1].id for name, tok in (("a2", a2), ("b1", b1), ("b2", b2))}
+        assert owners == {"a2": alice, "b1": bob, "b2": bob}
+        assert session_count(conn) == 3
+
+
+def test_purge_removes_expired_sessions_of_all_users(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        db.create_session(s, alice, T - timedelta(days=15))                  # 만료됨
+        db.create_session(s, bob, T - timedelta(days=14))                    # 정확히 지금 만료
+        keep, _ = db.create_session(s, bob, T - timedelta(days=1))           # 유효
+        assert db.purge_expired_sessions(s, T) == 2
+        assert session_count(conn) == 1 and db.get_active_session(s, keep, T) is not None
+        assert db.purge_expired_sessions(s, T) == 0
+
+
+def test_user_delete_cascades_sessions(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        uid = make_user(conn, "alice")
+        s = orm(conn)
+        token, _ = db.create_session(s, uid, T)
+        conn.execute(db.User.__table__.delete().where(db.User.id == uid))
+        s.expunge_all()
+        assert session_count(conn) == 0 and db.get_active_session(s, token, T) is None
+
+
+def test_session_rollback_leaves_nothing(fresh_schema):
+    with fresh_schema.connect() as conn:
+        with conn.begin():
+            uid = make_user(conn, "alice")
+        trans = conn.begin()
+        token, _ = db.create_session(orm(conn), uid, T)
+        trans.rollback()                                                     # 호출자가 되돌리면 세션도 없다
+        with conn.begin():
+            assert db.get_active_session(orm(conn), token, T) is None and session_count(conn) == 0
+
+
+def test_raw_tokens_not_stored(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        uid = make_user(conn, "alice")
+        token, csrf = db.create_session(orm(conn), uid, T)
+        row = conn.execute(select(db.UserSession.__table__)).one()._asdict()
+        assert row["token_hash"] == hashlib.sha256(token.encode()).digest()
+        assert all(token not in str(v) for v in row.values())               # 원문은 어느 열에도 없다
+        assert bytes(row["token_hash"]) != token.encode() and row["csrf_token"] == csrf
+
+
+def test_integrity_error_hides_parameters(fresh_schema):
+    # 세 가지를 나눠 본다 (R-27)
+    # 1) SQLAlchemy 바인드 파라미터 — make_engine(hide_parameters=True)로 숨겨져야 한다 (실패 조건)
+    # 2) PostgreSQL 이 만드는 오류 DETAIL — 중복 키 값(token_hash)이 들어 있는지 관찰만 하고 결과(True/False)만 출력
+    # 3) 실제 앱 로그·HTTP 응답 — Phase 2-E 책임 (여기서는 다루지 않는다)
+    # 실패해도 예외 원문·비밀값이 출력되지 않게, 비교 결과를 bool 로 만든 뒤 단언한다
+    with rolled_back(fresh_schema) as conn:
+        uid = make_user(conn, "alice")
+        token, csrf = db.create_session(orm(conn), uid, T)
+        marker = auth.new_csrf_token()                                       # 두 번째 INSERT 의 CSRF 원문
+        with pytest.raises(IntegrityError) as e, conn.begin_nested():
+            conn.execute(insert(db.UserSession).values(
+                token_hash=auth.hash_token(token), user_id=uid, csrf_token=marker,
+                created_at=T, expires_at=T + timedelta(days=14)))
+        message = str(e.value)
+        detail = getattr(getattr(e.value.orig, "diag", None), "message_detail", None) or ""
+        hidden_note = "hide_parameters=True" in message
+        leaked_marker = marker in message or marker in detail
+        leaked_csrf = csrf in message or csrf in detail
+        leaked_token = token in message or token in detail
+        detail_has_hash = auth.hash_token(token).hex() in (message + detail).lower()
+        del message, detail, e                                               # 실패 출력에 원문이 실리지 않게
+        print(f"R-27 observation: postgres_detail_contains_token_hash={detail_has_hash}")
+        assert hidden_note, "SQLAlchemy 바인드 파라미터가 숨겨지지 않음"
+        assert not leaked_marker, "CSRF 원문(바인드 값)이 예외 문자열에 있음"
+        assert not leaked_csrf, "기존 세션의 CSRF 원문이 예외 문자열에 있음"
+        assert not leaked_token, "세션 토큰 원문이 예외 문자열에 있음"
+        assert session_count(conn) == 1
+
+
+def test_logout_commit_is_seen_by_other_connection(fresh_schema):
+    other = db.make_engine(db.check_test_database_url(TEST_URL), poolclass=NullPool)
+    try:
+        with fresh_schema.connect() as conn:
+            with conn.begin():
+                uid = make_user(conn, "alice")
+                token, _ = db.create_session(orm(conn), uid, T)
+            with other.connect() as conn2:
+                with conn2.begin():
+                    db.verify_test_server(conn2)
+                    assert db.get_active_session(orm(conn2), token, T) is not None
+                with conn.begin():
+                    assert db.delete_session(orm(conn), token) is True        # 로그아웃 커밋
+                with conn2.begin():
+                    assert db.get_active_session(orm(conn2), token, T) is None
+    finally:
+        other.dispose()                                                      # 다음 게이트 전에 연결을 닫는다
+
+
+def test_multiple_sessions_for_same_user(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        uid = make_user(conn, "alice")
+        s = orm(conn)
+        tokens = [db.create_session(s, uid, T)[0] for _ in range(3)]
+        assert len(set(tokens)) == 3 and session_count(conn) == 3
+        assert all(db.get_active_session(s, t, T)[1].id == uid for t in tokens)
+        hashes = conn.execute(select(db.UserSession.token_hash).where(db.UserSession.user_id == uid)).scalars()
+        assert len({bytes(h) for h in hashes}) == 3                         # 저장된 해시도 서로 다르다
+    with fresh_schema.connect() as conn:                                     # 되돌렸으므로 종료 후 남는 행이 없다
+        assert count(conn, db.User) == 0 and session_count(conn) == 0
+        conn.rollback()

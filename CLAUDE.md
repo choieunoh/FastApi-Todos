@@ -40,8 +40,8 @@ FastApi_Todos/
 ├── scripts/dev-postgres-init/  # (7.0.0, 선택) Docker 개발 DB 첫 기동 때 테스트 DB 생성 SQL
 └── fastapi-app/
     ├── main.py                 # API + 모델 + 저장 로직 (7.0.0: 라우트·Pydantic 모델·순수 로직)
-    ├── db.py                   # (7.0.0 Phase 1·2-A) 엔진·ORM 7개(2-A `auth_failures`)·세션·테스트 DB 보호·삭제 전 스키마 게이트(R-19)·downgrade 보호. 소유자 조건 헬퍼는 Phase 3 예정
-    ├── auth.py                 # (7.0.0 Phase 2-B) 순수 인증 함수: 설정·입력 검증·Argon2id·토큰·CSRF 비교·Origin 판정·쿠키 속성 (DB·라우트 없음). 세션 저장·시도 제한·라우트 연결은 2-C~2-E 예정
+    ├── db.py                   # (7.0.0 Phase 1·2-A·2-C) 엔진·ORM 7개(2-A `auth_failures`)·세션·테스트 DB 보호·삭제 전 스키마 게이트(R-19)·downgrade 보호, (2-C) 로그인 세션 저장·조회·삭제·만료 정리(commit 은 호출자). 소유자 조건 헬퍼는 Phase 3 예정
+    ├── auth.py                 # (7.0.0 Phase 2-B) 순수 인증 함수: 설정·입력 검증·Argon2id·토큰·CSRF 비교·Origin 판정·쿠키 속성 (DB·라우트 없음). 세션 저장은 db.py(2-C), 시도 제한은 2-D, `require_user`·라우트 연결은 main.py(2-E) 예정
     ├── migrate_json.py         # (7.0.0 예정) JSON → PostgreSQL 이전·검증·역내보내기·diff CLI
     ├── alembic.ini, alembic/   # (7.0.0 Phase 1·2-A) 스키마 마이그레이션, 리비전 versions/0001_initial.py·0002_auth_failures.py (DATABASE_URL로 접속)
     ├── templates/index.html    # UI 전체
@@ -469,7 +469,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - [ ] 2. 회원가입·로그인·로그아웃, Argon2id, 쿠키 속성, 14일 만료, CSRF·Origin, **로그인 시도 제한(DB 기반, 다중 워커)**, 운영 시작 가드, 로그인 UI.
   - [x] 2-B. DB 없는 순수 인증 함수(`auth.py`)와 단위 테스트(`tests/test_auth_unit.py` 191 passed, 전체 604 passed·1 skipped·3 deselected, 2026-11-05, 로컬 커밋 `b4d3ad4`). API·화면에는 아직 연결하지 않았다.
   - [x] 2-A. `auth_failures` 모델·Alembic `0002`, PostgreSQL 테스트 삭제 전 스키마 게이트(R-19, 연결 수 교차 확인). DB 없는 회귀 669 passed·1 skipped·3 deselected, `todo_test` PostgreSQL 16 passed·PostgreSQL 포함 회귀 685 passed·3 deselected(2026-11-05). `todo_dev`는 0001 그대로(0002 미적용).
-  - [ ] 2-C(세션 저장), 2-D(시도 제한), 2-E(`/auth/*` 라우트·시작 가드), 2-F(다중 워커), 2-G(로그인 UI) — `V7_PLAN.md` §P2. Phase 2 전체는 미완료, 원격 push는 보류.
+  - [x] 2-C. `db.py` 로그인 세션 저장·조회·삭제·만료 정리(SHA-256만 저장, 14일 고정, 재로그인은 제시된 세션 하나만 교체, commit 은 호출자), 엔진 `hide_parameters`. DB 없는 회귀 749 passed·1 skipped·3 deselected, `todo_test` PostgreSQL 27 passed·PostgreSQL 포함 회귀 776 passed·3 deselected, 종료 후 `todo_test` 0002·사용자 데이터 0행. Phase 2-C 구현·검증 완료(2026-11-06). `require_user`는 2-E. R-27(오류 DETAIL의 `token_hash`)은 미해결.
+  - [ ] 2-D(시도 제한), 2-E(`/auth/*` 라우트·`require_user`·시작 가드), 2-F(다중 워커), 2-G(로그인 UI) — `V7_PLAN.md` §P2. Phase 2 전체는 미완료, `todo_dev`는 아직 Alembic 0001(0002 미적용), 원격 push는 보류.
 - [ ] 3. 15개 데이터 경로 인증 필수, 익명 401·타 사용자 404 매트릭스, bulk·restore 격리, 템플릿 이름 사용자별, soft delete·position, 동시 요청.
 - [ ] 4. v6 기능 전체를 DB·인증 위에서 통과(기존 테스트는 픽스처만 교체, 변경 목록은 `V7_PLAN.md` §P8.3), 사용자별 알림 키, 두 사용자 UI 격리, `Version 7.0.0`.
 - [ ] 5. `migrate_json.py` import·verify·export-v6·diff, 백업 사본 리허설 2회, 원본 해시 불변, `pg_dump` 복원 검증, 내용 미출력.
