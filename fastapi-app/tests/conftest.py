@@ -23,6 +23,18 @@ REAL_TODO_HASH = file_hash(REAL_TODO_FILE)             # 테스트 시작 전 �
 REAL_TEMPLATE_HASH = file_hash(REAL_TEMPLATE_FILE)     # 없으면 None — 테스트가 만들어서도 안 된다
 
 
+def pytest_configure(config):
+    # (7.0.0) TEST_DATABASE_URL 이 테스트 DB(이름이 _test 로 끝남)가 아니면 테스트 세션을 시작하지 않는다
+    raw = os.environ.get("TEST_DATABASE_URL")
+    if not raw:
+        return                                         # PostgreSQL 테스트는 건너뛴다 (test_db_postgres.py)
+    import db                                          # PostgreSQL 테스트를 돌릴 때만 불러온다
+    try:
+        db.check_test_database_url(raw, os.environ.get("DATABASE_URL"))
+    except db.DatabaseConfigError as e:
+        raise pytest.UsageError(f"테스트 DB 보호: {e}") from None
+
+
 @pytest.fixture(scope="session", autouse=True)
 def protect_real_todo_file():
     # 어떤 테스트도 실제 todo.json 을 바꾸면 안 된다 (A22)

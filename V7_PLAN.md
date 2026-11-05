@@ -1,0 +1,349 @@
+# V7_PLAN.md — FastAPI To-Do List 7.0.0 구현 계획
+
+명세는 `V7_SPEC.md`(§25~§34)와 `CLAUDE.md`를 따른다. 이 문서는 단계·절차·백업·롤백·테스트·위험을 다룬다.
+각 Phase가 끝나면 구현 내용, 변경 파일, 테스트 결과, 위험 요소를 보고하고 **승인을 받은 뒤** 다음 Phase로 간다.
+
+## 운영 보호 원칙 (모든 Phase 공통)
+다음은 사용자의 명시적 승인 없이는 하지 않는다.
+- 운영 Docker 컨테이너 중지·삭제·재생성, 운영 볼륨 변경·삭제
+- 기존 JSON 데이터 변경·삭제 (운영 볼륨, 저장소의 `todo.json`, Git 기록 포함)
+- 운영 PostgreSQL 생성·변경, Jenkins 설정·배포 작업 변경, 운영 서버 배포
+- Git 강제 푸시·파괴적 Git 명령 (history 재작성, `reset --hard`, stash 삭제 등)
+- `test_integration.py` 실행 (외부 서버 `163.239.77.78:5014`에 POST·DELETE를 보낸다)
+- 운영 볼륨에서 백업 사본을 꺼내는 작업 (읽기 전용이라도 운영 서버에서 명령을 실행하므로)
+
+운영 HTTPS가 확인되기 전에는 v7을 운영에 공개하지 않는다(§P7).
+
+## P0. 결정 현황
+### 승인됨 (2026-11-05)
+D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비밀번호 8~128자, D-5 14일 고정 세션, D-8 사용자별 알림 키, D-9 비밀번호 변경 제외, D-10 지정 사용자 1명에게 이전, D-11 익명 401.
+
+### 권장안 — Phase 1 시작 전 승인 필요
+| ID | 내용 | 권장 |
+|---|---|---|
+| D-6 | 목록 순서 보존 | `position` 열 (할 일·템플릿), 삭제 시 유지·복구 시 원래 값, 반복 다음 일정은 끝 (`V7_SPEC.md` §27.3) |
+| D-7 | 삭제 실행 취소 저장 | PostgreSQL soft delete (`deleted_at`, 30초·사용자당 100건) (§27.4 비교표) |
+| D-12 | 시도 제한 수치·저장 | DB `auth_failures` + username advisory lock. (username,IP) 5회 / username 50회 / IP 20회 per 15분, 가입 IP 10회/시간. **Phase 2에서 구현** (§29.5) |
+| D-13 | 가입 공개 제어 | `REGISTRATION_ENABLED` 환경변수 — 운영 기본 `false`, 개발·테스트 `true` |
+| D-14 | 저장소의 개인정보 값 | 아래 §P9 선택지 중 결정. 결정 전에는 아무것도 바꾸지 않는다 |
+| D-15 | 리허설 사본 보관 기간 | 운영 전환 검증 완료 후 30일, 이후 삭제·기록 |
+| D-16 | PostgreSQL 버전 | 18.x 최신 패치를 Phase 1에서 확인해 정확한 태그로 고정 |
+| D-17 | `migrate_json.py` 서브커맨드 | `import`, `verify`, `export-v6`, `diff` (역내보내기·비교를 같은 파일에 둔다, 새 파일 없음) |
+
+## P1. Phase 1 — PostgreSQL 개발 환경, SQLAlchemy, Alembic
+**개발 DB 경로 (2026-11-05 변경)**: 이 VDI에서는 Docker Desktop을 쓸 수 없어(R-1), 기본 경로는 **Windows 로컬 PostgreSQL 18.6**(`127.0.0.1:5433`, 설치 `C:\Program Files\PostgreSQL(new)`)이다. 같은 PC의 PostgreSQL 16(5432)은 접근·변경하지 않는다.
+- DB와 계정: 개발 `todo_dev`(소유자 `todo_dev_user`), 테스트 `todo_test`(소유자 `todo_test_user`). 서로의 DB에 CONNECT 권한이 없다(사용자 확인).
+- 비밀번호는 `%APPDATA%\postgresql\pgpass.conf`(사용자가 메모장으로 작성)에만 둔다. URL·소스·로그·Git·채팅에 넣지 않고, Claude는 이 파일을 읽지 않는다(존재 여부만 확인).
+- `docker-compose.dev.yml`은 Docker가 되는 PC용 **선택 구성**으로 남긴다. 테스트 보호 장치가 5433만 허용하므로 그 구성으로 테스트하려면 승인이 필요하다.
+
+작업 (1-A 완료, 2026-11-05)
+1. `docker-compose.dev.yml` (선택 구성, 운영 `docker-compose.yml`과 별개, 운영 서비스 없음)
+   - 서비스 `postgres-dev` 1개, 프로젝트명 `fastapi-v7dev`, 컨테이너 `FastApi-pg-v7dev`, 포트 `127.0.0.1:15432:5432`, 볼륨 `fastapi_v7dev_pg-data`. `docker compose config`만 확인했고 실행하지 않았다.
+2. `requirements.txt`: `sqlalchemy>=2.1.8`, `psycopg[binary]>=3.3.8`, `alembic>=1.20.1`, `argon2-cffi>=25.1.0`.
+3. `db.py`: 엔진(`DATABASE_URL`, `pool_pre_ping`, 연결 `TimeZone=UTC`), 세션, `get_db`, ORM 모델 6개, 테스트 DB 보호·downgrade 보호 함수.
+4. Alembic: `fastapi-app/alembic.ini`, `alembic/env.py`(`DATABASE_URL` 읽기, `db.Base.metadata`), 리비전 `0001_initial`.
+5. 테스트 기반: `conftest.py`가 세션 시작 전에 `TEST_DATABASE_URL`을 검사하고, `test_db_postgres.py`가 접속 후 서버를 확인한 뒤 테스트마다 public 스키마를 다시 만든다(아래 P1.1).
+6. `.gitignore`에 `.env.dev`, `*.dump`, `*.sql.gz` 추가. 이미지에 `db.py`·`alembic/`을 넣는 것은 Phase 3·6.
+
+**이 Phase에서는 앱 엔드포인트 동작을 바꾸지 않는다.** 아직 `main.py`는 JSON 저장을 쓴다.
+
+### P1.1 테스트 DB 보호 (F-1)
+- 허용 대상은 하나다: `todo_test_user@127.0.0.1:5433/todo_test`, 서버 18.x (`db.TEST_DB_*`). 이 값을 바꾸거나 완화하려면 사용자 승인을 받는다.
+- 1단계 URL (`db.check_test_database_url`, `conftest.pytest_configure`): DB 이름 `_test`, 쿼리 매개변수 없음, 포트 명시, 계정·호스트·포트·DB가 대상과 정확히 같음, `DATABASE_URL`과 다른 DB. 어긋나면 세션을 시작하지 않는다(DB 연결 전).
+- 2단계 서버 (`db.verify_test_server`): 접속 후 `current_database()`, `current_user`, `inet_server_addr()`, `inet_server_port()`, `server_version_num`, `rolsuper`를 읽어 대상·18.x·비슈퍼유저인지 확인한다. `engine` 픽스처가 처음 한 번(실패 시 `pytest.exit`), `fresh_schema`가 **`DROP SCHEMA` 직전 같은 연결에서** 다시 확인한다.
+- `DROP SCHEMA`는 `fresh_schema`에만 있고 확인 뒤에 온다(오프라인 테스트가 소스로 확인).
+
+### P1.2 downgrade 보호와 승인 절차 (F-2)
+- 모든 리비전의 `downgrade()` 첫 줄은 `db.guard_downgrade(...)`다(오프라인 테스트가 모든 리비전을 확인).
+- 테스트 대상(P1.1의 URL·서버 확인을 모두 통과)에서는 그대로 허용한다 — 마이그레이션 왕복은 **pytest로 테스트 DB에서만** 한다.
+- 그 밖의 DB(`todo_dev` 포함)는 확인값 **두 개**가 실제 서버 값과 모두 맞아야 한다. 하나만 있거나 다르면 아무것도 지우지 않고 멈춘다.
+  - `alembic -x downgrade_confirm=<DB 이름> downgrade <리비전>`
+  - 환경변수 `TODO_DOWNGRADE_CONFIRM=<DB 이름>@<서버 주소>:<포트>` (예: `todo_dev@127.0.0.1:5433`)
+- 오프라인 `--sql`은 SQL만 출력하므로 막지 않는다. 그 SQL을 DB에 직접 실행하는 것도 아래 절차를 거친다.
+- 승인 절차 (테스트 DB가 아닌 DB의 downgrade)
+  1. 대상 DB·리비전·이유·지워지는 테이블을 사용자에게 보고한다.
+  2. `pg_dump -Fc`로 백업하고, 백업 파일 크기와 `pg_restore --list` 결과를 확인한다(백업은 Git 제외).
+  3. 사용자의 **명시적 승인**을 받는다(대상 DB 이름 포함). 승인은 그 한 번에만 유효하다.
+  4. 같은 셸에서만 확인값 두 개를 설정해 실행하고, 끝나면 환경변수를 지운다.
+  5. `alembic current`와 테이블 목록으로 결과를 확인해 보고한다.
+- 개발 DB에서 하는 일은 `alembic current`, `alembic upgrade head`(각각 승인 후)뿐이다.
+
+테스트·완료 기준
+- [x] 기존 332 passed 유지 (DB 없이도 기존 테스트가 돈다) — 1-A
+- [x] 보호 장치의 허용·거부 사례(URL·서버 값·downgrade 확인값) 오프라인 테스트 — 1-A 보강
+- [x] (1-B, `todo_test`) `alembic upgrade head` → `downgrade base` → `upgrade head` 왕복
+- [x] (1-B) 모델과 마이그레이션 차이 없음 (autogenerate 비교 결과 빈 값)
+- [x] (1-B) CHECK·UNIQUE 제약 (priority, recurrence+due_date, (user_id, position), 템플릿 lower(name)), 위반은 SAVEPOINT 안에서 확인
+- [x] (1-B) 실제 서버 확인 통과 (18.x, 127.0.0.1:5433, todo_test, todo_test_user, 비슈퍼유저)
+- [x] (1-B) 연결 TimeZone UTC 확인 (TIMESTAMPTZ를 읽으면 UTC tzinfo), 시퀀스 이동, cascade
+- [x] (1-B, 선택·승인 후) `todo_dev`에 `alembic upgrade head`
+
+**1-B 완료 (2026-11-05) — 검증 근거**
+- 서버: 로컬 PostgreSQL 18.6, `127.0.0.1:5433`. PostgreSQL 16(5432)에는 연결하지 않았다.
+- 테스트: v6 기존 332 passed, DB 오프라인(`test_db_schema.py`) 81 passed, PostgreSQL 통합(`test_db_postgres.py`, `todo_test`) 11 passed, 전체 회귀(integration 제외) **424 passed, 3 deselected**.
+- `todo_dev`: 읽기 전용 점검(빈 public, `alembic_version` 없음) → 오프라인 SQL(`upgrade head --sql`) 검토 → `alembic upgrade head` 1회 성공, `alembic current` = `0001 (head)`.
+  - 사후 점검: 테이블 7개, IDENTITY 시퀀스 4개, 인덱스 14개, CHECK 5개, FK 5개. `alembic_version` = `0001`(1행), 나머지 테이블 0행.
+- **Phase 1(PostgreSQL 기반)만 끝났다. v7.0.0 전체는 미완료다** — 인증(Phase 2), 사용자별 분리(3), v6 기능 연동(4), JSON 이전(5), 릴리스 준비(6)가 남았고, 앱(`main.py`)은 아직 JSON 저장을 쓴다.
+- 1-B에서 남긴 후속 사항은 R-16~R-20(§P12)에 있다. Docker 개발 compose 기동은 선택 항목으로 남는다(R-1).
+
+## P2. Phase 2 — 회원가입·로그인·로그아웃 + 시도 제한
+작업
+1. Alembic `0002_auth_failures`.
+2. `auth.py`: Argon2id 해시·검증·rehash, 더미 해시, 세션 생성·조회·삭제(SHA-256 저장), 만료 정리, `require_user` 의존성, CSRF 검사, Origin 검사, 시도 제한(`auth_failures` + advisory lock), 클라이언트 IP 결정, `APP_ENV=production` 시작 가드, `REGISTRATION_ENABLED`.
+3. `main.py`: `/auth/register`, `/auth/login`, `/auth/logout`, `/auth/me`.
+4. `index.html`: 로그인·가입 화면, 헤더 사용자명·로그아웃, `api()`의 CSRF 헤더·401 처리.
+   - 이 Phase에서는 데이터 API를 아직 막지 않는다(기존 테스트 유지). 화면은 로그인 후 앱을 보여준다.
+5. Docker 포트 공개 시 원래 클라이언트 IP가 보이는지 격리 환경에서 확인(R-12).
+
+테스트·완료 기준 (T-A)
+- [ ] 가입: 길이·문자 규칙 422, 대소문자 무시 중복 409, 공백 정규화, 응답에 해시 없음, 해시가 `$argon2id$`로 시작
+- [ ] 로그인 성공 200 + 쿠키, 없는 아이디와 틀린 비밀번호의 401 본문 동일
+- [ ] 쿠키 속성: HttpOnly, SameSite=Lax, Path=/; `COOKIE_SECURE=true`면 Secure + `__Host-` 이름
+- [ ] 로그아웃 뒤 같은 쿠키로 `/auth/me` 401, 14일 지난 세션 401(시계 고정), 재로그인 시 토큰 교체
+- [ ] CSRF: 헤더 없음·틀림 403, 맞으면 통과. 로그인 Origin 불일치 403
+- [ ] 시도 제한: 5회 실패 후 6번째 429 + `Retry-After`, 15분 뒤 해제, 성공 시 기록 삭제, 없는 계정도 같은 규칙, 가입 IP 제한
+- [ ] 동시성: 같은 username에 동시 로그인 실패 요청 N개(스레드)를 보내도 실패 기록이 한도를 넘어 통과하지 않음
+- [ ] 다중 워커: `uvicorn --workers 2` 서버에 실패 요청을 나눠 보내도 한도 적용
+- [ ] `APP_ENV=production` + `COOKIE_SECURE` 미설정이면 시작 실패
+- [ ] `REGISTRATION_ENABLED=false`면 가입 403
+- [ ] UI: 로그인·가입·로그아웃, 오류 표시, 429 안내, 375px, 키보드
+- [ ] 기존 332 passed 유지
+
+## P3. Phase 3 — 사용자별 데이터 분리와 접근 권한
+작업
+1. Alembic `0003`이 필요하면 추가(Phase 1 스키마에 이미 있으면 생략).
+2. 저장 계층 교체: `load_todos/save_todos/read_list/write_list`를 `db.py` 헬퍼로 바꾼다.
+   - `active_todos(db, uid)`, `get_owned_todo(db, uid, id)`, `insert_todo`(position), `soft_delete`, `restore`, `purge_expired`, 템플릿 헬퍼.
+   - 쓰기 요청은 `lock_user(db, uid)`(`SELECT ... FOR UPDATE`)로 시작.
+3. 엔드포인트 15개에 `require_user` 적용. `next_id()`·`RECENTLY_DELETED` 제거(D-7 승인 시).
+4. 순수 로직(`apply_completion`, `next_occurrence`, `add_months`, `compute_stats`, `todos_to_csv`)은 그대로 두고 입력만 DB에서 만든 `TodoItem` 목록으로 바꾼다.
+5. 앱 시작 시 `todo.json` 생성 코드 제거. `TODO_FILE`·`TEMPLATE_FILE`은 런타임에서 쓰지 않는다(이전 도구만 쓴다).
+
+테스트·완료 기준 (T-B)
+- [ ] 15개 경로 × 익명 401 매트릭스
+- [ ] 15개 경로 × 사용자 B가 A의 리소스 id로 요청 → 404, A의 데이터 불변
+- [ ] 목록·stats·export(JSON·CSV)에 다른 사용자 데이터 없음, 템플릿 목록 분리
+- [ ] bulk에 A·B id 혼합 → 404, 양쪽 모두 불변
+- [ ] restore: B가 A의 지운 id → 404, A는 계속 복구 가능
+- [ ] 템플릿 이름: A와 B가 같은 이름 가능, 같은 사용자 안 중복 409
+- [ ] 본문의 `user_id`, `id`, `position`, `deleted_at` 무시
+- [ ] soft delete: 지운 직후 GET·stats·export·bulk·PUT·하위 API에서 안 보임, 30초 안 복구, 30초 뒤 404, 100건 초과 시 오래된 것 정리, 재시작(엔진 재생성) 뒤에도 30초 안 복구
+- [ ] position: 추가·반복 생성·삭제·복구 후 순서가 v6과 같은 시나리오 표로 확인
+- [ ] 동시 요청: 같은 사용자 POST 병렬 → position 충돌 없음, bulk와 restore 병렬 → 일관
+- [ ] position과 soft delete (`V7_SPEC.md` §27.3): max 계산에 지운 대기 행 포함(대기 행이 max일 때 추가 → 더 큰 번호, 복구 후 순서 유지), 완전 삭제 뒤 번호 재사용 허용, 반복 생성·템플릿 생성도 같은 규칙
+- [ ] 사용자 행 잠금: 쓰기 경로가 모두 `lock_user`로 시작(라우트·헬퍼 테스트), 잠금 없이 병렬 생성하면 실패함을 보이는 대조 테스트, 생성·삭제·복구 병렬 실행 후 position 중복·누락 없음
+- [ ] 라우트 목록 테스트: 데이터 경로 15개 모두 `require_user` 의존성 보유
+- [ ] 템플릿 이름 중복(409) 기준: DB `lower(name)` 고유 인덱스와 앱 검사가 같은 결과인지 ASCII·한글·특수 문자(İ/ı, ß, 전각 등)로 확인 (R-16)
+
+## P4. Phase 4 — 기존 v6 기능과 DB·인증 연동
+작업
+1. 기존 테스트 이전 (§P8): `client` 로그인 픽스처, `seed`를 DB 쓰기로, UI `page`에 로그인 쿠키.
+2. 반복·하위 할 일·템플릿·내보내기·통계·칸반·알림이 DB와 인증 위에서 동작 확인.
+3. 알림 읽음 키 `todo.v7.notifications.read.<userId>`.
+4. 화면 버전 `Version 7.0.0`, B22·`/` 테스트 갱신.
+
+테스트·완료 기준
+- [ ] 기존 v4~v6 테스트 전부 통과 (의미가 바뀐 테스트는 §P8 목록대로만 변경)
+- [ ] KST 규칙(§20) 회귀 없음: LA 시간대 브라우저 테스트, `/stats` 경계 테스트
+- [ ] 두 사용자를 브라우저 컨텍스트 2개로 띄워 목록·칸반·캘린더·통계·알림·템플릿 격리
+- [ ] 같은 브라우저에서 사용자 전환 시 알림 읽음 기록이 섞이거나 지워지지 않음
+- [ ] 로그아웃 후 화면에 이전 사용자 데이터가 남지 않음, 세션 만료 시 401 → 로그인 화면
+
+## P5. Phase 5 — JSON 데이터 이전 리허설 (개발 환경 전용)
+### 5.1 도구 (`migrate_json.py`)
+```
+python migrate_json.py import    --todos <사본>/todo.json --templates <사본>/task_templates.json --owner <username> [--dry-run]
+python migrate_json.py verify    --todos <사본>/todo.json --templates <사본>/task_templates.json --owner <username>
+python migrate_json.py export-v6 --owner <username> --out <폴더>
+python migrate_json.py diff      <v6 JSON 폴더 A> <v6 JSON 폴더 B 또는 --owner <username>>
+```
+- `DATABASE_URL`은 환경변수로만 받는다. 출력은 건수·id·필드 이름만(내용 미출력).
+- `import`: 원본 sha256 기록 → v6 모델 검증 → 사전 거부 조건 → 한 트랜잭션 삽입 → `setval` → `data_migrations` 기록 → 원본 sha256 재확인.
+- `verify`: 원본을 v6 규칙으로 읽은 결과와 DB의 그 사용자 데이터를 항목·필드 단위로 비교. 같은 시계에서 `compute_stats` 결과 비교. 차이가 있으면 실패 코드.
+
+### 5.2 리허설 절차
+1. **[승인 필요] 운영 백업 사본 확보** — 운영 서버에서 읽기만 한다(컨테이너·볼륨 변경 없음).
+   ```bash
+   export COMPOSE_PROJECT_NAME=fastapi_todos
+   B=backups/v7-rehearsal-$(date +%Y%m%d-%H%M%S); mkdir -p "$B"; chmod 700 "$B"
+   docker compose cp fastapi-app:/app/data/. "$B/"     # README "백업"과 같은 명령
+   sha256sum "$B"/*.json | tee "$B/SHA256SUMS"; chmod 600 "$B"/*
+   ```
+   사본을 개발 환경으로 옮길 때는 암호화한다(`age`/`gpg`). 운영 서버의 사본은 그대로 둔다.
+2. 개발 환경: `sha256sum -c SHA256SUMS`로 사본 무결성 확인.
+3. 개발 DB(`todo_dev`)를 새로 만들고 `alembic upgrade head`, 소유자 계정 가입.
+4. `import --dry-run` → 리포트 확인(건수, 순서가 id 순과 다른지, 시간대 없는 시각 수, 예전 형식 수, 실패 항목).
+5. `import` → `verify` → `export-v6` → `diff`(원본 사본 vs 역내보내기, 차이 0이어야 함. 시간대 표기 정규화 후).
+6. 앱을 개발 DB로 띄워 소유자로 로그인, 화면 확인(목록 순서, 하위 할 일, 반복 배지, 통계, 캘린더, 칸반, 알림, 템플릿, 내보내기).
+7. `pg_dump -Fc` 결과를 만들고 빈 DB에 `pg_restore`해 다시 `verify` (백업 복원 가능성 확인).
+8. DB를 지우고 3~7을 한 번 더 반복해 재현성 확인.
+9. 결과 보고(건수·검증 결과·이상 항목 id). 보관 기간(D-15)이 끝나면 개발 DB·사본 삭제, 삭제 기록.
+
+### 5.3 완료 기준 (T-C)
+- [ ] v1·v3·v4·v5·v6 형식 합성 데이터 각각 이전·검증 통과
+- [ ] id, position(배열 순서), created_at(null 포함), completed_at, next_spawned, 하위 할 일 sid·순서, 템플릿 id·순서 보존
+- [ ] 시간대 없는 시각 → UTC, `due_date: ""` → null
+- [ ] 깨진 항목 1개 → 아무것도 들어가지 않음, 실패 id 보고
+- [ ] `--dry-run` 후 DB 변화 없음, 같은 원본 재이전 거부, id 충돌 거부, 소유자 없음 거부
+- [ ] 이전 후 첫 POST id = 최대 id + 1, 새 항목 position = 끝
+- [ ] 원본 사본 sha256 불변
+- [ ] `export-v6` 결과가 v6 앱(`main.py` v6.0.0)에서 그대로 읽힘 (v6 모델 검증)
+- [ ] 이전 전 v6 `/stats`와 이전 후 v7 `/stats`가 같은 시계에서 같음
+- [ ] 출력에 제목·설명 등 내용이 없음
+
+## P6. 운영 전환·백업·검증·롤백 절차 (문서 — 실제 실행은 Phase 6 이후 별도 승인)
+### 6.1 보존 원칙
+- 기존 JSON 볼륨 `fastapi_todos_fastapi-data`는 전환 후에도 **지우지도, 쓰지도 않는다.** v7 컨테이너에는 마운트하지 않는다(실수로 쓰는 것 방지).
+- v6 이미지는 태그(`fastapi-todos:6.0.0`)로 보관한다.
+- PostgreSQL 데이터는 새 볼륨 `fastapi_todos_pg-data`에 두고, 전환 직후·매 배포 전·롤백 직전에 `pg_dump -Fc`를 남긴다.
+- 모든 백업에 `SHA256SUMS`를 두고, 최소 2곳(서버의 `backups/`, 서버 밖 암호화 사본)에 보관한다.
+
+### 6.2 전환 순서
+| 단계 | 내용 | 확인 |
+|---|---|---|
+| 0 | §P7 HTTPS 게이트 통과 확인 | 체크리스트 전부 ✅ |
+| 1 | 쓰기 중단 공지 후 v6 백업: JSON 사본 + `docker commit` 스냅샷 + v6 이미지 태그 | SHA256SUMS |
+| 2 | v6 컨테이너 중지 **[승인]** (마지막 백업 이후 쓰기가 생기지 않게) | 중지 후 다시 sha256 비교, 바뀌었으면 1 반복 |
+| 3 | postgres 서비스 기동, `alembic upgrade head` | `alembic current` = head |
+| 4 | 소유자 계정 생성 (`REGISTRATION_ENABLED=true`로 한 번 또는 관리 명령) | `/auth/me` |
+| 5 | `import --dry-run` → `import` → `verify` | 차이 0 |
+| 6 | 전환 직후 `pg_dump -Fc` (기준점 B0) | 복원 테스트 |
+| 7 | v7 앱 기동 (`REGISTRATION_ENABLED=false`) | 로그인, 건수, 화면 기능, `/metrics` 수집 |
+| 8 | 관찰 기간 7일: 매일 `pg_dump` + 소유자 `export-v6` 스냅샷 | 오류 로그, 메트릭 |
+| 9 | 관찰 기간 종료 후에만 가입 공개 여부 결정 **[승인]** | |
+
+### 6.3 롤백 단계
+| 수준 | 상황 | 절차 | 데이터 |
+|---|---|---|---|
+| L0 | 5단계 전 실패 | v7 중지, v6 컨테이너 다시 시작 | JSON 볼륨 그대로 → 손실 없음 |
+| L1 | 7단계 후, 사용자 쓰기 전 | v7 중지, v6 재시작 (원래 볼륨) | 손실 없음 (B0 = JSON 내용) |
+| L2 | 사용자 쓰기 후 | §6.4 | v7 변경분을 역내보내기로 v6에 옮김 |
+
+### 6.4 v7 신규 데이터와 v6 롤백 (L2)
+문제: v6은 원래 JSON 볼륨만 읽으므로, v7에서 새로 만들거나 바꾼 데이터는 그대로 롤백하면 보이지 않는다. 다른 사용자의 데이터는 v6(단일 사용자)에 아예 담을 수 없다.
+
+대응
+1. **예방**: 관찰 기간에는 가입을 막아(D-13) 사용자를 소유자 1명으로 제한한다. 이 기간에 롤백하면 v6이 표현할 수 없는 데이터가 생기지 않는다.
+2. **v7 쓰기 중단**: v7 컨테이너 중지 **[승인]** → 롤백 직전 `pg_dump -Fc`(B-rb) + SHA256SUMS. PostgreSQL 볼륨은 그대로 둔다.
+3. **역내보내기**: `migrate_json.py export-v6 --owner <소유자>` → v6 형식 `todo.json`·`task_templates.json` (id·순서 보존, 활성 데이터만). `diff`로 원래 JSON 사본과 비교해 v7 기간의 추가·변경·삭제 id를 기록한다.
+4. **새 볼륨에 적재**: 원래 볼륨에는 쓰지 않는다. 새 볼륨 `fastapi_todos_fastapi-data-rb-<시각>`에 `scripts/load-data.sh`로 적재하고, v6 컨테이너가 그 볼륨을 쓰도록 compose override로 띄운다 **[승인]**.
+5. **다른 사용자 데이터**(가입을 열었던 경우): v6에서는 보이지 않지만 PostgreSQL과 B-rb에 그대로 남는다. 필요하면 사용자별 `export-v6` 파일을 만들어 안전하게 전달한다. 공지 문구: "롤백 기간 동안 보이지 않으며 삭제되지 않았습니다."
+6. **재전환(v7 복귀)**: B-rb 시점 DB를 그대로 쓰고, 롤백 기간에 v6에서 바뀐 소유자 데이터는 `diff`(B-rb의 export-v6 vs 롤백 볼륨 현재 JSON)로 확인해 반영한다. 자동 병합은 범위 밖이다. 롤백 기간을 짧게 하고 그동안 쓰기를 최소화하도록 공지한다.
+7. 모든 단계의 볼륨·덤프는 재전환 검증 후 보관 기간이 지나기 전까지 지우지 않는다.
+
+## P7. 운영 공개 조건 (HTTPS 게이트)
+다음이 모두 확인되기 전에는 v7을 운영에 배포·공개하지 않는다.
+- [ ] 운영 도메인에 TLS 종단(리버스 프록시 또는 로드밸런서)이 있고 HTTP는 HTTPS로 리다이렉트
+- [ ] 앱은 프록시 뒤에서만 접근 가능 (5001 직접 공개 여부 결정 — 현재 모든 인터페이스에 바인딩, OWASP A02-3)
+- [ ] uvicorn `--proxy-headers --forwarded-allow-ips=<프록시 주소>`
+- [ ] `APP_ENV=production`, `COOKIE_SECURE=true` (`__Host-` 쿠키, Secure)
+- [ ] HSTS 헤더 (프록시 또는 앱)
+- [ ] `REGISTRATION_ENABLED=false`
+- [ ] DB 비밀번호가 저장소에 없음 (Jenkins Credentials 또는 서버의 권한 600 `.env`)
+- [ ] PostgreSQL 포트 외부 미공개 (`ports` 없음)
+- [ ] 시도 제한이 실제 클라이언트 IP로 동작 (R-12)
+
+## P8. 기존 테스트 유지·변경 계획
+### 8.1 기준
+- v6.0.0: `332 passed, 3 deselected` (2026-11-05, 143.95초). deselected 3개는 `test_integration.py`.
+- 목표: 기존 332개는 의미를 바꾸지 않고 **픽스처만 교체**해 통과. 새 테스트는 추가로 센다.
+
+### 8.2 픽스처 교체
+| 대상 | v6 | v7 |
+|---|---|---|
+| `test_api.py` `isolated_file` | `TODO_FILE`·`TEMPLATE_FILE`·`RECENTLY_DELETED` monkeypatch | `db` 픽스처(test DB TRUNCATE) + 로그인한 사용자 |
+| `client = TestClient(app)` (모듈 전역) | 익명 | 로그인 쿠키 + `X-CSRF-Token` 기본 헤더를 가진 픽스처. 테스트 본문의 `client.post(...)` 형태는 유지 |
+| `load_todos()/save_todos()/write_text` 직접 호출 (약 16곳) | 파일 | `seed_todos(user, [dict])`, `read_todos(user)` 헬퍼 (v6 모델로 검증 후 DB 삽입) |
+| `monkeypatch(main, "now")` (6곳) | 동작 | 그대로 동작 (시각을 파이썬에서 넣음) |
+| `conftest.py` `seed` (UI, 96곳) | 파일에 쓰기 | 같은 시그니처로 테스트 사용자 DB에 쓰기, `seed.templates` 유지 |
+| UI `page` | 익명 | 테스트 사용자 세션 쿠키를 넣은 컨텍스트 |
+| UI 서버 subprocess | `TODO_FILE`·`TEMPLATE_FILE` env | `DATABASE_URL`=test DB, `REGISTRATION_ENABLED=true` |
+| A22 해시 보호 | 유지 | 유지 + 비 `_test` DB 거부 |
+
+### 8.3 의미가 바뀌는 테스트 (변경 목록 — 이 외에는 바꾸지 않는다)
+| 테스트 | 변경 |
+|---|---|
+| A19·v1~v4 데이터 호환 테스트 (파일에 예전 형식을 쓰고 GET) | 런타임은 JSON을 읽지 않으므로 **이전 테스트**로 옮김: 같은 입력 → `migrate_json import` → GET 결과 동일 |
+| `test_v6_routes_are_v5_plus_stats_only` | `V7_ROUTES` = v6 경로 + `/auth/*` 4개 |
+| B22, `/` 응답 버전 테스트 | `Version 7.0.0` |
+| 알림 테스트 중 `todo.v6.notifications.read` 사용 1곳 | 사용자별 키 |
+| `RECENTLY_DELETED` 직접 참조·30초 경과 테스트 | soft delete 기준(시계 고정)으로 같은 결과 확인 |
+| A21 (최대 id + 1) | 단일 사용자·빈 DB에서 그대로 통과. 다중 사용자 시퀀스 동작은 새 테스트로 명시 |
+| `test_integration.py` | 로그인 흐름으로 다시 작성. **실행은 명시적 승인 후** (대상 서버에 테스트 계정·데이터가 생긴다) |
+
+### 8.4 새 테스트 묶음
+- T-A 인증 (§P2), T-B 격리·soft delete·position (§P3), T-C 이전 (§P5), T-D Alembic (§P1), T-E UI 인증·다중 사용자 (§P2·§P4).
+- 보안 회귀: 응답·로그에 해시·토큰 없음, 사용자 입력 `textContent` 출력 유지, CSV 수식 방지 유지.
+
+### 8.5 실행 시간
+DB 테스트로 늘어나는 시간은 테스트마다 TRUNCATE, UI 서버는 세션당 1개로 억제한다. Phase마다 소요 시간을 보고한다.
+
+## P9. 개인정보 처리 (D-14)
+확인된 사실은 `V7_SPEC.md` §32.1. 선택지:
+
+| 선택지 | 내용 | 효과 | 위험·비용 |
+|---|---|---|---|
+| A. 그대로 둠 | 아무것도 바꾸지 않음 | 없음 | 공개 저장소면 계속 노출 |
+| B. 앞으로만 정리 | 이후 커밋에서 `fastapi-app/todo.json`을 합성 예시로 바꾸거나 추적 해제(`git rm --cached` + `.gitignore`) | 최신 트리에서 사라짐 | 기록(`98e98f4` 등)에는 남음. `conftest.py` 해시 보호가 파일 존재를 전제하므로 테스트 조정 필요 |
+| C. 기록 재작성 | `git filter-repo`로 모든 커밋에서 값 제거 후 강제 푸시 | 기록에서 제거 | **파괴적**. 모든 브랜치 해시 변경, 협업자·PR·포크·GitHub 캐시에는 남을 수 있음, 별도 명시적 승인 필수 |
+| D. 저장소 공개 범위 점검 | 저장소가 공개인지 확인하고 필요하면 비공개 전환 | 노출 범위 축소 | GitHub 설정 변경 — 사용자가 직접 |
+
+- 권장: D 확인 → B를 v7 작업 중 별도 커밋으로(승인 후). C는 공개 저장소이고 삭제가 꼭 필요할 때만 따로 결정.
+- 로컬 stash `stash@{0}`(`d66b8fb`)는 push되지 않았다. 지우는 것도 파괴적 명령이라 사용자가 결정한다.
+- 운영 데이터 사본 처리 원칙은 `V7_SPEC.md` §32.2.
+
+## P10. Docker Compose·Jenkins 영향 (적용은 Phase 6 이후 승인)
+**운영 `docker-compose.yml` 변경안**
+- `postgres` 서비스: 버전 고정(D-16), `ports` 없음, 볼륨 `fastapi_todos_pg-data`(이름 고정), `pg_isready` healthcheck, `no-new-privileges`, 비밀번호는 `.env`/secret.
+- `fastapi-app`: `DATABASE_URL`, `APP_ENV`, `COOKIE_SECURE`, `REGISTRATION_ENABLED` 추가, `depends_on: postgres: condition: service_healthy`. `fastapi-data` 볼륨 마운트는 v7에서 제거(롤백용으로 볼륨 정의는 유지, 데이터 보존).
+- 워커 수: soft delete·DB 시도 제한이라 다중 워커 가능. 기본은 1개 유지, 늘리는 것은 별도 결정.
+- SonarQube·Prometheus·Grafana·node-exporter 변경 없음. Prometheus는 계속 `fastapi-app:8000`. (cAdvisor는 이 저장소 compose에 없음 — 운영에서 별도 실행 중인지 확인 필요.)
+
+**Jenkins 변경안** (저장소에 Jenkinsfile 없음, README 예시 기준)
+```groovy
+environment {
+    COMPOSE_PROJECT_NAME = 'fastapi_todos'
+    POSTGRES_PASSWORD = credentials('fastapi-todos-pg-password')
+}
+stages {
+    stage('Backup')  { steps { sh './scripts/backup-v7.sh' } }          // pg_dump -Fc + SHA256SUMS (Phase 6에서 작성 여부 결정)
+    stage('Build')   { steps { sh 'docker compose build fastapi-app' } }
+    stage('DB')      { steps { sh 'docker compose up -d postgres' } }
+    stage('Migrate') { steps { sh 'docker compose run --rm --no-deps fastapi-app alembic upgrade head' } }
+    stage('Deploy')  { steps { sh 'docker compose up -d --no-deps fastapi-app' } }
+}
+```
+- 현재 `up -d --no-deps fastapi-app`만으로는 postgres가 뜨지 않는다(R-6).
+- `down -v`, `volume prune` 금지 유지. JSON → DB 이전은 Jenkins가 아니라 §P6 수동 절차로 한 번만 한다.
+
+## P11. Phase 6 — 전체 테스트·보안 점검·릴리스 준비
+- 전체 pytest(integration 제외), Alembic 왕복, 이미지 빌드(`alembic/`·`db.py`·`auth.py` 포함, `tests/` 제외 확인).
+- Python 3.13(Docker 이미지)과 C.UTF-8 PostgreSQL에서 DB 테스트·`lower(name)`·정렬 관련 테스트 재실행 (R-16, R-20). 로컬 1-B 검증은 Python 3.14·Windows 로캘 기준이다.
+- 격리 Compose 프로젝트(`fastapi-v7test`, `127.0.0.1` 포트, 테스트 볼륨)에서 postgres+앱 실행, 컨테이너 재생성 후 데이터 유지(C5), `/metrics` 확인.
+- OWASP 재점검: A01 접근 제어(격리 매트릭스), A07 인증 실패(시도 제한·세션), CSRF, 보안 헤더, 의존성 CVE.
+- 문서: README(실행·DB·이전·백업·롤백), CLAUDE.md DoD 체크, `RELEASE_NOTES.md` 7.0.0, Jenkins 변경안.
+- `test_integration.py` 재작성. 실행은 승인 후.
+
+## P12. 위험 목록
+| ID | 위험 | 대응 |
+|---|---|---|
+| R-1 | 이 VDI에서 Docker 사용 불가 → PG 테스트 불가 | 로컬 PostgreSQL 18.6(127.0.0.1:5433)으로 대체 (§P1). PostgreSQL 16(5432)은 보호 장치가 거부 |
+| R-2 | DB 테스트로 실행 시간 증가 | TRUNCATE, 세션 단위 서버, 소요 시간 보고 |
+| R-3 | psycopg가 시간대 오프셋을 붙여 응답 형식 변경 | 연결 TimeZone UTC, 형식 회귀 테스트 |
+| R-4 | 운영 데이터 형식 미확인 (검증 실패·순서 불일치) | 사본 리허설, dry-run 리포트 |
+| R-5 | soft delete 조회 누락으로 지운 항목 노출 | 헬퍼 강제, 전 경로 테스트 |
+| R-6 | Jenkins `--no-deps`로 DB 없이 배포 | 파이프라인 변경 (승인 후) |
+| R-7 | 운영 HTTPS 미확인 | §P7 게이트, `APP_ENV` 시작 가드 |
+| R-8 | `/metrics` 외부 노출 (기존) | 범위 밖, 프록시 단계에서 차단 검토 |
+| R-9 | 롤백 시 v7 데이터 미표시 | §P6.4 (가입 제한·역내보내기·새 볼륨) |
+| R-10 | 통합 테스트 대상 `:5014`와 운영 `:5001` 불일치 | 대상 서버 확인 후 재작성 |
+| R-11 | 저장소에 개인정보로 보이는 값 | §P9 결정 |
+| R-12 | Docker NAT·프록시로 모든 요청이 같은 IP → IP 제한이 전역 제한이 됨 | Phase 2 격리 환경 확인, 프록시 헤더 신뢰 설정 |
+| R-13 | 사용자 잠금(`FOR UPDATE`)으로 같은 사용자 동시 요청 지연 | 트랜잭션 짧게 유지, 사용자 단위라 다른 사용자에 영향 없음 |
+| R-14 | Argon2 해싱 CPU·메모리 비용 (가입·로그인 폭주) | 시도 제한이 검증 전에 차단, 비밀번호 최대 128자 |
+| R-15 | 이미지 크기·빌드 시간 증가 (psycopg binary, argon2) | Phase 6에서 측정 보고 |
+| R-16 | 로컬 `todo_dev`는 Windows libc 로캘(`Korean_Korea.949`, `todo_test`는 미확인), 운영 예정 환경은 `C.UTF-8` → `lower(name)` 고유 인덱스·문자열 정렬이 일부 문자에서 다를 수 있음, 로캘 변경 시 텍스트 인덱스 REINDEX 필요 가능. `lc_messages` 한국어라 서버 오류 메시지가 깨져 보일 수 있음(동작 무관) | Phase 3 템플릿 이름 기준 테스트(§P3), Phase 6 C.UTF-8 재검증(§P11). 개발 DB를 운영으로 옮기지 않는다 |
+| R-17 | 로컬 PostgreSQL 18(5433)의 `listen_addresses = *` → 모든 네트워크 주소에서 연결 대기 | 사용자가 `pg_hba.conf`·Windows 방화벽 점검 또는 `listen_addresses`를 `127.0.0.1`로 제한 (사용자 설정, 미완료) |
+| R-18 | `todo_test`의 public 스키마를 테스트가 다시 만들어 소유자가 `pg_database_owner` → `todo_test_user`로 바뀌고 PUBLIC USAGE 권한이 없어짐 | 테스트 계정 전용 DB라 테스트 영향 없음. 원상 복구는 DB 관리자 작업이며 별도 승인 |
+| R-19 | PostgreSQL 테스트 재실행 전 읽기 전용 사전 점검 기준 미정 (첫 실행은 "빈 public", 이후에는 직전 테스트가 남긴 0001 스키마) | 기준을 정해 승인받기 전에는 실행마다 직전 보고 상태(테이블 7개, `alembic_version` 외 0행)와 같은지 확인 후 진행 |
+| R-20 | 1-B 검증은 로컬 Python 3.14 기준, Docker 이미지는 Python 3.13 | Phase 6 이미지 안에서 전체 테스트 (§P11) |

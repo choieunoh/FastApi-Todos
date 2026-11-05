@@ -3,4 +3,9 @@ starlette>=1.7.0          # CVE-2026-48710(Host 헤더) 등 보안 패치가 들
 uvicorn[standard]>=0.54.0
 prometheus-fastapi-instrumentator>=8.1.0   # /metrics — Starlette 1.x 지원 버전 (7.x 이하는 설치 충돌)
 prometheus-client>=0.26.0
+# (7.0.0) PostgreSQL·인증 — 하한은 Phase 1-A 에서 설치·검사한 버전
+sqlalchemy>=2.1.8         # ORM (2.x 스타일: DeclarativeBase, Mapped, select)
+psycopg[binary]>=3.3.8    # PostgreSQL 드라이버 (psycopg 3)
+alembic>=1.20.1           # 스키마 마이그레이션
+argon2-cffi>=25.1.0       # 비밀번호 해시 Argon2id (Phase 2부터 사용)
 # 테스트 도구(pytest 등)는 requirements-dev.txt 에만 둔다 — Docker 이미지에 넣지 않는다

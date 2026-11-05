@@ -1,0 +1,40 @@
+# (7.0.0) 개발·테스트 전용 PostgreSQL — 운영 docker-compose.yml 과 섞어 쓰지 않는다.
+# - 운영 서버에서 실행하지 않는다. 개발 PC(Docker 가 되는 환경)에서만 쓴다.
+# - 프로젝트·컨테이너·볼륨·포트 이름이 운영(fastapi_todos, FastApi-app, 5001/9000/7070/3000)과 겹치지 않는다.
+# - (선택 구성) 기본 개발 환경은 Windows 로컬 PostgreSQL 18.6(127.0.0.1:5433)이다. 이 파일은 Docker 가 되는 PC 용이다.
+#   테스트 DB 보호 장치가 127.0.0.1:5433 만 허용하므로, 이 구성으로 PostgreSQL 테스트를 돌리려면 사용자 승인이 필요하다.
+# - 접속 정보는 .env.dev (git 제외). .env.dev.example 의 "Docker 개발 구성" 주석을 풀고 비밀번호를 바꿔 쓴다.
+#
+#   cp .env.dev.example .env.dev                       # Docker 절 주석 해제, 비밀번호 수정
+#   docker compose -f docker-compose.dev.yml --env-file .env.dev config   # 이름·포트 먼저 확인
+#   docker compose -f docker-compose.dev.yml --env-file .env.dev up -d
+#   docker compose -f docker-compose.dev.yml --env-file .env.dev down     # -v 는 개발 데이터까지 지운다
+name: fastapi-v7dev
+
+services:
+  postgres-dev:
+    image: postgres:18.6-trixie                # 18.x 최신 패치 (2026-10-31 태그). Phase 1-B 실행 검증 후 확정
+    container_name: FastApi-pg-v7dev
+    restart: "no"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER 를 .env.dev 에 설정하세요}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 를 .env.dev 에 설정하세요}
+      POSTGRES_DB: ${POSTGRES_DB:-todo_dev}     # 앱 개발용 DB (테스트 DB todo_test 는 init 스크립트가 만든다)
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+    ports:
+      - "127.0.0.1:15432:5432"                  # 이 PC 에서만 접속 (운영 포트와 겹치지 않음)
+    volumes:
+      # PostgreSQL 18 이미지부터 데이터 폴더가 /var/lib/postgresql/18/docker 로 바뀌어, 상위 폴더에 붙인다
+      - pg-dev-data:/var/lib/postgresql
+      - ./scripts/dev-postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  pg-dev-data:
+    name: fastapi_v7dev_pg-data                 # 운영 볼륨(fastapi_todos_*)과 다른 이름

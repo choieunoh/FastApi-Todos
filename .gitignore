@@ -15,3 +15,11 @@ fastapi-app/task_templates.json
 
 # Docker 볼륨 백업 (사용자 데이터)
 backups/
+
+# (7.0.0) 개발·테스트 DB 접속 정보와 DB 덤프 (비밀번호·사용자 데이터)
+.env.dev
+# 실제 환경파일(.env.local, .env.prod 등)은 모두 제외하고, 예시 파일만 추적한다
+.env.*
+!.env.dev.example
+*.dump
+*.sql.gz

@@ -3,14 +3,16 @@
 ## Purpose
 FastAPI와 바닐라 JS로 만든 To-Do 웹 앱이다.
 이 문서는 Version 6.0.0 "생산성·보기 확장"의 개발 명세다. v4·v5 명세는 그대로 계약으로 남고, v6에서 바뀐 규칙은 해당 절에 `(6.0.0)`으로 표시한다.
+(7.0.0) Version 7.0.0 "Multi-User & PostgreSQL"의 상세 명세는 `V7_SPEC.md`(§25~§34), 단계·절차·위험은 `V7_PLAN.md`에 있다. 이 문서의 v4~v6 규칙은 계속 계약이며, v7에서 바뀌는 규칙만 해당 절에 `(7.0.0)`으로 표시한다. 둘이 다르면 `(7.0.0)` 표시와 `V7_SPEC.md`가 우선한다.
 구현과 리뷰는 이 문서를 기준으로 하며, 문서에 없는 기능은 추가하지 않는다.
-5.0.0은 기능별 단계(0~8)로, 6.0.0은 단계(1~5, 아래 §19)로 나누어 구현한다. 각 단계는 앞 단계의 테스트를 모두 통과한 상태에서 시작하고, 단계마다 사용자 승인을 받은 뒤 다음 단계로 간다.
+5.0.0은 기능별 단계(0~8)로, 6.0.0은 단계(1~5, 아래 §19)로, 7.0.0은 Phase 1~6(`V7_PLAN.md`)으로 나누어 구현한다. 각 단계는 앞 단계의 테스트를 모두 통과한 상태에서 시작하고, 단계마다 사용자 승인을 받은 뒤 다음 단계로 간다.
 
 ## Current Version
-**5.0.0** — v4 기능 + 즐겨찾기, 삭제 실행 취소, 일괄 작업, 하위 할 일, 반복 일정, 작업 템플릿, 데이터 내보내기(CSV·JSON), 캘린더 뷰
+**6.0.0** — v5 기능 + 통계 대시보드, 2열 칸반 보드, 마감일 알림 센터(앱 내부), 라이트/다크/시스템 테마와 반응형 UI, 날짜 기준 Asia/Seoul 통일 (main `176e48a`)
 
 ## Target Version
-**6.0.0** — 생산성 통계 대시보드, 2열 칸반 보드, 마감일 알림 센터(앱 내부), 라이트/다크/시스템 테마와 반응형 UI. 날짜 기준을 Asia/Seoul로 통일한다.
+**7.0.0** — PostgreSQL(SQLAlchemy 2.x + Alembic), 회원가입·로그인·로그아웃(Argon2id, HttpOnly 쿠키 세션, CSRF, 로그인 시도 제한), 사용자별 데이터 분리, 기존 JSON 데이터의 안전한 이전. v6 기능은 모두 유지한다.
+- v5 당시 Target은 6.0.0이었다. 6.0.0 명세(§19~§24)는 그대로 남는다.
 
 ## Technology Stack
 | 구분 | 기술 |
@@ -18,7 +20,9 @@ FastAPI와 바닐라 JS로 만든 To-Do 웹 앱이다.
 | Backend | Python 3.13 (Docker), FastAPI ≥ 0.142, Starlette ≥ 1.7, Pydantic v2, Uvicorn ≥ 0.54 |
 | Frontend | `fastapi-app/templates/index.html` 단일 파일 (HTML + CSS + 바닐라 JS, 빌드 없음) |
 | Storage | `fastapi-app/todo.json`, `fastapi-app/task_templates.json` (JSON 파일, 후자는 5.0.0 6단계). Docker에서는 볼륨 `/app/data` 안 |
-| Test | pytest, FastAPI `TestClient`(httpx2), UI는 Playwright(pytest-playwright) |
+| Storage (7.0.0) | PostgreSQL (SQLAlchemy 2.x ORM, psycopg 3, Alembic 마이그레이션). JSON 파일은 이전 원본·롤백용으로만 남는다 |
+| Auth (7.0.0) | argon2-cffi(Argon2id), 서버 세션 테이블 + HttpOnly 쿠키, CSRF 동기화 토큰 |
+| Test | pytest, FastAPI `TestClient`(httpx2), UI는 Playwright(pytest-playwright). (7.0.0) PostgreSQL 테스트 DB(`TEST_DATABASE_URL` = `todo_test_user@127.0.0.1:5433/todo_test` 고정) |
 | Deploy | Docker (`python:3.13-slim`), docker-compose (포트 `5001:8000`, 컨테이너 `FastApi-app`) |
 
 ## Project Structure
@@ -27,21 +31,31 @@ FastApi_Todos/
 ├── CLAUDE.md
 ├── README.md
 ├── RELEASE_NOTES.md            # 버전별 릴리스 노트 (6.0.0부터)
-├── .gitignore
+├── V7_SPEC.md, V7_PLAN.md      # (7.0.0) 명세·구현 계획
+├── .gitignore                  # (7.0.0) 실제 환경파일(.env, .env.*)·DB 덤프 제외, .env.dev.example만 추적
+├── .env.dev.example            # (7.0.0) 개발·테스트 DB 접속 예시 (비밀번호 없음, 비밀번호는 pgpass.conf)
 ├── docker-compose.yml
+├── docker-compose.dev.yml      # (7.0.0, 선택) Docker 개발용 PostgreSQL만, 운영과 분리. 기본은 로컬 PostgreSQL 18.6
 ├── scripts/load-data.sh        # 백업 → 데이터 볼륨 이전·복구 (README "배포와 데이터 관리")
+├── scripts/dev-postgres-init/  # (7.0.0, 선택) Docker 개발 DB 첫 기동 때 테스트 DB 생성 SQL
 └── fastapi-app/
-    ├── main.py                 # API + 모델 + 저장 로직
+    ├── main.py                 # API + 모델 + 저장 로직 (7.0.0: 라우트·Pydantic 모델·순수 로직)
+    ├── db.py                   # (7.0.0 Phase 1) 엔진·ORM 6개·세션·테스트 DB 보호·downgrade 보호. 소유자 조건 헬퍼는 Phase 3 예정
+    ├── auth.py                 # (7.0.0 예정) 비밀번호 해시·세션·CSRF·시도 제한
+    ├── migrate_json.py         # (7.0.0 예정) JSON → PostgreSQL 이전·검증·역내보내기·diff CLI
+    ├── alembic.ini, alembic/   # (7.0.0 Phase 1) 스키마 마이그레이션, 리비전 versions/0001_initial.py (DATABASE_URL로 접속)
     ├── templates/index.html    # UI 전체
     ├── todo.json               # 데이터
-    ├── requirements.txt        # 런타임 의존성 (fastapi, starlette, uvicorn, prometheus 계측만)
+    ├── requirements.txt        # 런타임 의존성 (fastapi, starlette, uvicorn, prometheus 계측 + 7.0.0 sqlalchemy·psycopg·alembic·argon2-cffi)
     ├── requirements-dev.txt    # 테스트 의존성
-    ├── pyproject.toml          # pytest 설정 (integration 마커)
+    ├── pyproject.toml          # pytest 설정 (integration·postgres 마커, 기본 실행은 integration 제외)
     ├── Dockerfile, .dockerignore, sonar-project.properties
     └── tests/
-        ├── conftest.py         # 실제 todo.json 보호, UI 테스트용 임시 서버
+        ├── conftest.py         # 실제 todo.json 보호, UI 테스트용 임시 서버, (7.0.0) TEST_DATABASE_URL 고정 대상 검사
         ├── test_api.py         # TestClient (A, 5.0.0 API)
         ├── test_ui.py          # Playwright (B, 5.0.0 UI)
+        ├── test_db_schema.py   # (7.0.0) DB 없이 도는 스키마·보호 장치 테스트
+        ├── test_db_postgres.py # (7.0.0) PostgreSQL 테스트 DB(todo_test) 통합 테스트, TEST_DATABASE_URL 없으면 skip
         └── test_integration.py # 배포 서버 대상, `pytest -m integration`
 ```
 
@@ -83,8 +97,11 @@ FastApi_Todos/
 ### 4. 기존 데이터 호환
 - `priority`, `due_date`, `tags`, `created_at`, `completed_at`이 없는 항목(v1~v3 데이터)도 오류 없이 읽혀야 한다. 빠진 값은 기본값으로 채운다. `created_at`은 `null`이다.
 - 예전 형식의 `due_date: ""`는 `null`로 읽는다.
+- (7.0.0) 런타임은 JSON을 읽지 않는다. 이 호환 규칙은 `migrate_json.py`가 JSON → PostgreSQL 이전 때 그대로 적용한다(`V7_SPEC.md` §31).
 
 ### 5. API (경로와 상태 코드는 v3와 같다)
+- (7.0.0) 경로·메서드·성공 상태 코드는 그대로이고, 사용자 데이터 경로는 **로그인 필수**다. 익명 요청은 401, CSRF 헤더 오류는 403, 다른 사용자의 리소스는 404다. 신규 경로는 `/auth/register`, `/auth/login`, `/auth/logout`, `/auth/me` (`V7_SPEC.md` §28).
+
 | 메서드 | 경로 | 동작 |
 |---|---|---|
 | GET | `/todos` | 전체 목록 |
@@ -94,7 +111,8 @@ FastApi_Todos/
 | GET | `/` | index.html |
 
 ### 6. UI
-- **버전 표시**: `Version 6.0.0` (6.0.0 개발을 시작하면서 미리 바꿨다. v5 당시 `Version 5.0.0`, v4 당시 `Version 4.0.0`)
+- **버전 표시**: `Version 6.0.0` (6.0.0 개발을 시작하면서 미리 바꿨다. v5 당시 `Version 5.0.0`, v4 당시 `Version 4.0.0`). (7.0.0) Phase 4에서 `Version 7.0.0`으로 바꾸고 B22를 함께 갱신한다.
+- (7.0.0) **로그인 화면·헤더**: 로그인하지 않으면 로그인·가입 화면만 보인다. 헤더에 사용자명과 [로그아웃]을 둔다 (`V7_SPEC.md` §30).
 - **태그 입력**: 추가 폼과 수정 폼에 쉼표로 구분하는 텍스트 입력을 둔다 (예: `학교, 과제`).
 - **태그 표시**: 각 항목에 태그를 칩(chip)으로 보여준다.
 - **태그 필터**:
@@ -142,6 +160,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 프론트는 모든 PUT 본문을 `toPayload(todo, overrides)`로 만든다. 클라이언트 필드 목록 `TODO_FIELDS`는 한 곳에만 정의하고, 새 클라이언트 필드는 여기에 추가한다.
 - 서버가 관리하는 필드(`created_at`, `completed_at`, `subtasks`, `next_spawned`)는 POST/PUT 본문에 있어도 무시하고 기존 값을 유지한다.
 - 새 id는 "현재 목록 + 삭제 취소 버퍼"의 최대 id + 1이다 (복구 시 id 충돌 방지).
+  - (7.0.0) 할 일·템플릿 id는 PostgreSQL 전역 시퀀스로 매기고 재사용하지 않는다. 이전 직후 시퀀스를 최대 id에 맞춘다. 기본 목록 순서는 `position` 열이다(권장안, `V7_SPEC.md` §27.3·§27.5).
+- (7.0.0) 모든 사용자 데이터 조회·변경은 현재 사용자 조건(`user_id`)을 거치는 `db.py` 헬퍼로만 한다. 엔드포인트에서 소유자 조건 없는 조회를 쓰지 않는다.
 - `/todos/bulk`, `/todos/restore`, `/todos/export` 같은 고정 경로는 `/todos/{todo_id}` 라우트보다 먼저 선언한다.
 - 완료 전이(false → true / true → false)는 서버 함수 하나(`apply_completion`)에서 처리하고 PUT·bulk가 함께 쓴다.
 - 통계(전체/완료/진행 중/기한 초과/완료율)는 v4처럼 **상위 할 일** 기준이다.
@@ -163,11 +183,13 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 ### 12. 삭제 실행 취소 (2단계)
 - DELETE한 항목은 서버 메모리 버퍼에 30초 동안(최대 100건, 일괄 작업 한도와 같다) 보관한다. 넘치면 오래된 것부터 버린다. 재시작하면 사라진다.
 - `POST /todos/restore` `{ids:[int](1~100개)}` → 원래 id·`created_at`·내용 그대로 복구, 200. 버퍼에 없는 id가 있으면 404이고 아무것도 복구하지 않는다.
+- (7.0.0, 권장안 D-7) 버퍼는 사용자별이고 PostgreSQL soft delete(`deleted_at`)로 둔다. 30초·사용자당 100건·원자적 복구는 같고, 재시작·다중 워커에서도 30초 안이면 복구된다. 다른 사용자의 지운 id는 404 (`V7_SPEC.md` §27.4).
 - UI: 삭제 확인(`confirm`)은 **유지**한다. 삭제 성공 후 토스트 "N개 삭제됨 [실행 취소]"를 5초 동안 보여준다. 새 삭제가 일어나면 토스트를 교체한다.
 
 ### 13. 일괄 작업 (3단계)
 - `POST /todos/bulk` `{ids:[int](1~100개, 중복 제거), action:"complete"|"uncomplete"|"delete"}` → 200 `{updated:[Todo], deleted:[id]}`.
 - 없는 id가 하나라도 있으면 404이고 파일은 바뀌지 않는다. 시각 규칙(§3)과 반복 규칙(§15)을 그대로 따른다.
+  - (7.0.0) 다른 사용자의 id도 "없는 id"로 본다. 한 트랜잭션으로 처리해 실패하면 DB가 바뀌지 않는다.
 - 일괄 삭제는 복구 버퍼(§12)를 그대로 쓴다. 버퍼·복구 요청 한도(100건)가 일괄 작업 한도와 같아서, 한 번에 지운 항목은 모두 실행 취소할 수 있다.
 - UI: 항목마다 선택 체크박스(완료 체크박스와 별개), 툴바(선택 개수, 보이는 항목 전체 선택, 완료/미완료/삭제). 필터를 바꾸면 보이지 않는 항목은 선택에서 빠진다. 일괄 삭제도 `confirm` → 실행 취소 토스트.
 
@@ -187,12 +209,14 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - 기준은 항상 **직전 마감일**이다. 월말로 당겨진 날짜는 그대로 이어진다(1/31 → 2/28 → 3/28).
   - 마감일이 지난 뒤 완료해도 한 주기만 더한다(오늘 이후로 건너뛰지 않는다). 다음 일정이 곧바로 기한 초과일 수 있다.
   - 다음 일정은 목록 끝에 붙고, id는 `next_id()`로 매긴다. bulk 응답의 `updated`에는 넣지 않는다(목록을 다시 불러와 확인).
+    - (7.0.0) id는 시퀀스, 순서는 그 사용자의 `max(position) + 1`이다. 원본과 같은 사용자 소유다.
   - 복사: title, description, priority, tags, favorite, recurrence, subtasks(모두 미완료, sid 새로).
   - 원본은 `next_spawned=true`가 되어, 완료를 취소했다가 다시 완료해도 또 만들지 않는다.
 - UI: 추가 폼·수정 폼에 반복 select(`반복 없음/매일/매주/매월`), 반복 항목에만 `🔁 매주` 같은 배지. 다음 일정 생성 여부는 따로 표시하지 않는다.
 
 ### 16. 작업 템플릿 (6단계)
 - 저장소 `task_templates.json` (환경변수 `TEMPLATE_FILE`). 필드: `id, name(1~50), title, description, priority, tags, recurrence, subtasks: list[str]`. 검증은 Todo와 같은 규칙을 공유한다.
+  - (7.0.0) 저장소는 PostgreSQL `task_templates` 테이블(사용자별)이다. 이름 중복 409는 같은 사용자 안에서만 검사한다. 아래의 파일·Git 제외·Docker 규칙은 v6 데이터와 이전 원본에 계속 적용한다.
 - `GET/POST /task-templates`, `PUT/DELETE /task-templates/{id}` (201/200/204/404).
 - 재사용은 **추가 폼에 값을 채우는 방식**이다. 생성은 기존 `POST /todos` + 하위 할 일 POST로 한다 (apply API 없음).
 - UI: 템플릿 select, [불러오기], [현재 폼을 템플릿으로 저장](이름 입력), 인라인 수정, 삭제(`confirm`). `prompt()`를 쓰지 않는다.
@@ -217,6 +241,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - CSV 값은 JSON과 같은 표기다: `true`/`false`, `daily` 등, ISO 시각, 없는 값은 빈 칸. 쉼표·따옴표·줄바꿈은 `csv` 모듈이 따옴표로 감싼다.
 - 수식 방지 `'`는 CSV에만 붙이고 JSON 값은 바꾸지 않는다.
 - 읽기 전용이다: `todo.json`, 템플릿 파일, 삭제 복구 버퍼를 바꾸지 않는다.
+- (7.0.0) '전체 목록'은 로그인한 사용자의 전체 목록(지운 대기 항목 제외, `position` 순)이다. 형식·파일명·CSV 규칙은 그대로다.
 
 ### 18. 캘린더 뷰 (8단계)
 - 서버 변경 없이 클라이언트에서 `allTodos`로 그린다.
@@ -251,6 +276,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 ### 21. 통계 대시보드 (1단계)
 - `GET /stats` → 200. 쿼리 파라미터 없음, **읽기 전용**(저장 파일·복구 버퍼를 바꾸지 않는다). 대시보드의 **유일한 집계 원천**이고 화면은 받은 값을 그리기만 한다.
 - 집계는 상위 할 일 기준이다(하위 할 일은 세지 않는다). 필터와 상관없이 전체 목록이다.
+  - (7.0.0) 로그인한 사용자의 데이터만 집계한다. 응답 형식은 그대로다.
 - 응답: `today`, `timezone`(`"Asia/Seoul"`), `total`, `completed`, `active`, `overdue`, `completion_rate`, `daily_completions`(오늘 포함 최근 30일, 오래된 날부터 `{date, count}`), `completions_7d`, `completions_30d`, `trend_excluded`, `active_by_priority`(`높음/보통/낮음` 순서 고정), `due_compliance`(`{eligible, on_time, rate}`).
 - 완료율 = 완료 ÷ 전체 × 100, 소수 1자리, 사사오입(ROUND_HALF_UP). 전체 0개면 `0.0`.
 - 완료 추이: `completed_at`이 있는 완료 항목만, 완료 시각의 Asia/Seoul 날짜로 센다. `completed_at`이 없는 완료 항목 수는 `trend_excluded`로 보여준다. (`completed_at` 형식이 깨진 데이터는 v5처럼 모델 검증에서 막힌다.)
@@ -279,6 +305,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - **서버 변경·새 API·저장 필드 없음.** `allTodos`로 화면에서 계산한다(`computeNotifications(todos, today)`). 필터와 상관없이 전체 목록 기준이고, 날짜는 §20(Asia/Seoul)이다. 그래서 목록·칸반·캘린더의 기한 초과, 통계 바·대시보드와 같은 기준이다.
 - 키 문자열은 `<id>|<due_date>|<overdue|today|tomorrow>`. 표시 순서는 기한 초과 → 오늘 → 내일, 같은 분류 안에서는 마감일·id 순.
 - 읽음 저장: localStorage `todo.v6.notifications.read` = 읽은 키 배열. 서버·Docker 볼륨에는 저장하지 않는다(브라우저에 있으므로 새로고침·컨테이너 재생성과 무관하게 유지되고, 다른 브라우저·기기와는 공유하지 않는다).
+  - (7.0.0, D-8) 키는 사용자별 `todo.v7.notifications.read.<userId>`다. v6 키는 읽지도 지우지도 않는다. 정리 규칙은 그 사용자 키 안에서만 적용한다. 서버에 저장하지 않는 것은 그대로다.
   - 목록을 받은 뒤에만 정리한다(불러오기 실패 시 읽음 기록을 지우지 않는다). 값이 깨졌거나 저장소를 쓸 수 없으면 모두 읽지 않음으로 시작하고, 그 화면 안에서는 읽음이 유지된다.
   - 완료·삭제·마감일 변경·날짜가 지나 분류가 바뀌면 이전 키는 지워지고, 새 분류는 새 알림(읽지 않음)이다. 삭제 후 실행 취소로 되살린 항목도 새 알림이다. 이미 기한 초과인 항목은 날이 바뀌어도 같은 키라 읽음이 유지된다.
 - UI: 제목 아래 🔔 버튼(읽지 않은 수 배지, `aria-label` "알림, 읽지 않은 알림 N개", `aria-expanded`), 펼치는 패널(분류 표시, 제목, `마감 YYYY-MM-DD (D-day)`, 읽지 않은 알림은 굵게 + `새 알림` 글자), [모두 읽음], [닫기], 없으면 '알림이 없습니다.'
@@ -315,28 +342,44 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 데이터 이전·백업·복구 절차는 README의 "배포와 데이터 관리"를 따른다. 이전한 데이터를 검증하기 전에는 이전 컨테이너와 백업을 지우지 않는다.
 - Prometheus는 `fastapi-app:8000`(서비스명·내부 포트)으로 수집하므로 외부 포트와 무관하다.
 
+### 배포 설정 변경 예정 (7.0.0 — 아직 적용하지 않음)
+- 위 표가 **현재 운영 명세**다. v7의 compose·Jenkins 변경안(postgres 서비스, `DATABASE_URL`·`APP_ENV`·`COOKIE_SECURE`·`REGISTRATION_ENABLED`, `alembic upgrade head` 단계)은 `V7_PLAN.md` §P10에 있고, Phase 6 이후 별도 승인을 받아 적용한다.
+- 운영 HTTPS가 확인되기 전에는 v7(로그인 기능)을 운영에 배포·공개하지 않는다(`V7_PLAN.md` §P7).
+- 전환 후에도 JSON 볼륨 `fastapi_todos_fastapi-data`는 지우거나 쓰지 않는다(롤백용). 전환·백업·롤백 절차는 `V7_PLAN.md` §P6.
+- 개발용 PostgreSQL은 개발 PC의 로컬 PostgreSQL 18.6(`127.0.0.1:5433`, DB `todo_dev`·`todo_test`)을 쓴다. Docker를 쓸 수 있는 PC에서는 운영 compose와 분리된 `docker-compose.dev.yml`(프로젝트 `fastapi-v7dev`, `127.0.0.1` 포트)을 선택으로 쓸 수 있다. 운영 서버·운영 compose에는 개발 DB를 두지 않는다.
+
 ## Out of Scope
-- DB 도입 (SQLite 등), 사용자 인증
+- ~~DB 도입 (SQLite 등), 사용자 인증~~ → (7.0.0) PostgreSQL·사용자 인증은 범위 안이다. SQLite 등 PostgreSQL 외 DB는 계속 범위 밖이다.
+- (7.0.0) OAuth·소셜 로그인, 이메일 인증·비밀번호 재설정 메일, 2단계 인증, 비밀번호 변경, 계정 삭제 UI, 관리자 역할, 데이터 공유·협업, 비동기 ORM, v6 롤백 데이터와 v7 데이터의 자동 병합 (`V7_SPEC.md` §34)
 - 프론트엔드 프레임워크(React 등)와 빌드 도구
 - 서버 측 검색·필터·정렬 쿼리 파라미터 (내보내기의 `format`은 예외), PATCH API
 - 이메일·푸시·브라우저 종료 중 알림, 백그라운드 스케줄러, 서버 측 알림 상태·다중 기기 동기화 (6.0.0의 다크 모드와 앱 내부 알림 센터는 범위 안이다)
 - 칸반 3열 이상과 새 status 필드, 외부 차트 라이브러리
 - "배포 설정"에 적힌 것 외의 배포 구성 변경 (다른 서비스의 포트·컨테이너 이름·볼륨 변경 등)
 - 검색 대상에 태그 포함
-- 동시 쓰기 잠금과 원자적 저장
+- 동시 쓰기 잠금과 원자적 저장 — (7.0.0) PostgreSQL 트랜잭션과 사용자 단위 행 잠금으로 처리하므로 v7에서는 범위 안이다. 파일 저장의 잠금은 계속 하지 않는다.
 - 삭제 항목의 영구 휴지통(재시작 후 복구), 하위 할 일 ↔ 상위 완료 자동 연동, 하위 할 일 순서 변경
+  - (7.0.0) soft delete로 재시작 뒤에도 **30초 안**이면 복구되지만, 30초가 지나면 완전히 지우므로 영구 휴지통은 계속 범위 밖이다.
 - 반복 규칙 확장(격주, 요일 지정, 종료일, 횟수), 템플릿 즉시 생성 API
 - 데이터 가져오기(import), 캘린더 드래그로 날짜 변경, 주간/일간 보기
 
 ## Constraints
 - 런타임 의존성(`requirements.txt`)은 fastapi, starlette, uvicorn과 `/metrics`용 prometheus-fastapi-instrumentator·prometheus-client뿐이다. 새로 추가하지 않는다. 테스트 도구는 `requirements-dev.txt`에만 넣는다.
+  - (7.0.0, D-1) `sqlalchemy`, `psycopg[binary]`, `alembic`, `argon2-cffi`를 추가한다. 이 밖의 런타임 의존성은 계속 추가하지 않는다.
 - 파일 구성을 유지한다: `main.py` 1개, `index.html` 1개. 외부 CDN이나 스크립트를 불러오지 않는다.
+  - (7.0.0, D-2) 서버는 `main.py` + `db.py` + `auth.py` + `migrate_json.py` + `alembic/`로 한다. `index.html` 1개와 외부 CDN 금지는 그대로다.
 - 기존 API 경로, 메서드, 상태 코드는 v3/v4와 호환되어야 한다. 새 경로만 추가한다.
+  - (7.0.0, D-11) 예외: 사용자 데이터 경로는 익명 요청에 401, CSRF 오류에 403, 로그인·가입 시도 초과에 429를 돌려준다. 다른 호환성 변경은 `V7_SPEC.md` §28.4에 적고 승인을 받는다.
 - 테스트는 실제 `todo.json`, `task_templates.json`을 건드리면 안 된다.
   - 저장 경로는 환경변수 `TODO_FILE`, `TEMPLATE_FILE`로 바꿀 수 있게 한다.
   - API 테스트는 `tmp_path` + monkeypatch, UI 테스트는 `conftest.py`가 임시 파일로 띄운 uvicorn을 쓴다.
   - `conftest.py`가 세션 종료 시 실제 `todo.json`, `task_templates.json`의 해시(없으면 없는 상태)가 그대로인지 확인한다.
+  - (7.0.0) DB 테스트는 `TEST_DATABASE_URL`의 PostgreSQL 테스트 DB에서만 돈다. 고정 대상 `todo_test_user@127.0.0.1:5433/todo_test`(18.x)가 아니면 테스트 세션을 시작하지 않고, 접속 후 실제 서버를 확인한 뒤에만 스키마를 지운다. 운영·개발 DB와 PostgreSQL 16(5432)에 연결하지 않는다. 대상 변경은 사용자 승인 사항이다.
+  - (7.0.0) 마이그레이션 왕복(downgrade)은 테스트 DB에서 pytest로만 한다. 다른 DB의 downgrade는 `V7_PLAN.md` §P1.2 승인 절차를 따른다. 비밀번호는 `pgpass.conf`에만 두고 읽거나 출력하지 않는다.
 - 배포 서버 테스트(`test_integration.py`)는 `integration` 마커로 분리하고 기본 실행에서 제외한다.
+  - (7.0.0) 외부 서버에 POST·DELETE를 보내므로 `pytest -m integration`을 포함해 **명시적 승인 없이 실행하지 않는다.**
+- (7.0.0) 운영 데이터 사본(백업 JSON, `pg_dump`, 개발 DB)은 커밋하지 않고, 출력·로그·보고에 내용(제목·설명·태그)을 넣지 않는다. 테스트 데이터는 합성 값만 쓴다(`V7_SPEC.md` §32).
+- (7.0.0) 비밀번호·해시·세션 토큰·CSRF 토큰은 로그·응답(정해진 필드 외)에 남기지 않는다. DB 비밀번호는 저장소에 넣지 않는다.
 - `tests/`와 `requirements-dev.txt`는 Docker 이미지에 넣지 않는다 (`.dockerignore`).
 - 사용자 입력은 계속 `textContent`로 출력한다. 사용자 데이터에 `innerHTML`을 쓰지 않는다.
 
@@ -353,6 +396,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - v4: `todo-item`, `todo-tag`, `tag-filter`, `edit-form`, `edit-save`, `edit-cancel`, `stat-total`, `stat-completed`, `stat-active`, `stat-overdue`, `stat-rate`, `dday`
   - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-toggle`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `template-load`, `template-edit`, `template-delete`, `template-name`, `template-save`, `template-edit-form`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`, `calendar-chip`
   - v6: `view-stats`, `dash-total`, `dash-completed`, `dash-active`, `dash-overdue`, `dash-rate`, `dash-trend`, `dash-trend-summary`, `dash-trend-table`, `dash-excluded`, `dash-priority`, `dash-compliance`, `dash-basis`, `kanban`, `kanban-column`(`data-status="active"|"completed"`), `kanban-count`, `kanban-card`(`data-id`), `kanban-move`, `kanban-status`, `notification-bell`, `notification-badge`, `notification-panel`, `notification-item`(`data-category`, `data-todo-id`), `notification-read-all`, `notification-live` `theme-select`, `status-message`. 목록 항목(`todo-item`)에는 `data-id`가 있다. 칸반 카드 안의 태그·배지·진행률·D-day·즐겨찾기는 목록과 같은 testid(`todo-tag`, `recurrence-badge`, `subtask-progress`, `dday`, `favorite-toggle`)를 쓴다.
+  - v7: `auth-panel`, `login-form`, `auth-mode-toggle`, `auth-username`, `auth-password`, `auth-submit`, `auth-error`, `current-user`, `logout`
+- (7.0.0) **Python DB**: SQLAlchemy 2.x 스타일(`DeclarativeBase`, `Mapped[]`, `select()`)을 쓴다. 요청마다 세션 1개·트랜잭션 1개이고, 사용자 데이터 조회는 `db.py`의 소유자 조건 헬퍼로만 한다. 스키마 변경은 Alembic 리비전으로만 한다(앱 시작 시 `create_all` 금지).
 - **커밋**: Conventional Commits 형식이다 (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
   - 기능 커밋 예: `feat: add favorites for Version 5.0.0`
 
@@ -412,6 +457,20 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - [x] 5-1. 전체 pytest 332 passed, 3 deselected. 런타임 의존성(`requirements.txt`)만 설치한 환경에서 `main.py`+`templates/`로 실행해 `/`·`/stats`·`/metrics`·POST·내보내기와 v3/v5 데이터 읽기, 빈 데이터 폴더의 `todo.json` 생성 확인.
   - [x] 5-2. `RELEASE_NOTES.md`, README 진행 상황·"6.0.0 배포 전 확인" 절차.
   - [ ] 5-3. 로컬 Docker 이미지 빌드, 이미지 내용(0-3), 격리된 Compose 프로젝트에서 실행·재생성 후 데이터 유지(C2, C5). 로컬 Docker 데몬이 꺼져 있어 미검증.
+
+### 7.0.0 단계별 DoD (상세 기준은 `V7_PLAN.md` 각 Phase)
+- [x] 0. 분석·설계: v6 기준 `332 passed, 3 deselected` 확인(2026-11-05), `V7_SPEC.md`·`V7_PLAN.md` 작성, 이 문서에 v7 변경 표시.
+- [x] 1. 개발용 PostgreSQL(로컬 18.6 `127.0.0.1:5433`, Docker compose는 선택), `db.py`·ORM, Alembic `0001` 왕복·모델 일치, 테스트 대상 외 DB 거부, 기존 테스트 유지. (2026-11-05 완료. **v7.0.0 전체는 미완료** — Phase 2~6이 남았고 앱은 아직 JSON 저장을 쓴다)
+  - [x] 1-A. (Docker 없이) ORM 6개 테이블, `db.py` 연결·세션, Alembic 설정·`0001`, 개발 compose·예시 env 작성(미실행), 테스트 DB 보호, 오프라인 스키마 테스트(`tests/test_db_schema.py`), 기존 테스트 유지.
+  - [x] 1-A 보강. 테스트 DB 보호를 고정 대상(`todo_test_user@127.0.0.1:5433/todo_test`, 18.x)으로 좁히고 접속 후 서버 확인을 `DROP SCHEMA` 앞에 둠, 비테스트 DB downgrade 차단(확인값 2개 + `V7_PLAN.md` §P1.2 승인 절차), 제약 위반 테스트 SAVEPOINT, 오프라인 거부 사례 테스트.
+  - [x] 1-B. (로컬 PostgreSQL 18.6, `127.0.0.1:5433`) `todo_test`에서 `tests/test_db_postgres.py` 실행: 서버 확인, upgrade·downgrade 왕복, autogenerate 비교, 제약 동작, UTC 세션, 시퀀스 이동, cascade. (선택·승인 후) `todo_dev`에 `alembic upgrade head`. Docker 개발 compose 기동·이미지 태그 확정은 Docker를 쓸 수 있는 환경에서 하는 선택 항목이다(미실행).
+    - 근거 (2026-11-05): PostgreSQL 통합 11 passed, 전체 pytest **424 passed, 3 deselected**(v6 332 + DB 오프라인 81 + PostgreSQL 11). `todo_dev`에 `0001` upgrade head 성공 — 테이블 7·IDENTITY 시퀀스 4·인덱스 14·CHECK 5·FK 5, `alembic_version` = `0001`, 나머지 테이블 0행.
+    - 후속 사항(`V7_PLAN.md` R-16~R-20): Windows 로캘과 C.UTF-8 차이(`lower(name)` 검증), 5433 `listen_addresses`·`pg_hba.conf`·방화벽 점검, `todo_test` public 스키마 소유자·ACL 변경, 테스트 재실행 전 사전 점검 기준, Python 3.13/Docker 검증.
+- [ ] 2. 회원가입·로그인·로그아웃, Argon2id, 쿠키 속성, 14일 만료, CSRF·Origin, **로그인 시도 제한(DB 기반, 다중 워커)**, 운영 시작 가드, 로그인 UI.
+- [ ] 3. 15개 데이터 경로 인증 필수, 익명 401·타 사용자 404 매트릭스, bulk·restore 격리, 템플릿 이름 사용자별, soft delete·position, 동시 요청.
+- [ ] 4. v6 기능 전체를 DB·인증 위에서 통과(기존 테스트는 픽스처만 교체, 변경 목록은 `V7_PLAN.md` §P8.3), 사용자별 알림 키, 두 사용자 UI 격리, `Version 7.0.0`.
+- [ ] 5. `migrate_json.py` import·verify·export-v6·diff, 백업 사본 리허설 2회, 원본 해시 불변, `pg_dump` 복원 검증, 내용 미출력.
+- [ ] 6. 전체 pytest, 이미지 빌드·격리 Compose 실행, OWASP 재점검, README·릴리스 노트, compose·Jenkins 변경안. 운영 공개는 HTTPS 게이트(`V7_PLAN.md` §P7)와 별도 승인 후.
 
 ## 회귀 기준 (v4.0.0) — 5.0.0의 모든 단계에서 계속 통과해야 한다
 

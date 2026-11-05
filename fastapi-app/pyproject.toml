@@ -5,5 +5,6 @@ pythonpath = ["."]            # sys.path.insert(...) 대신: main.py가 있는 �
 addopts = ["-ra", "-m", "not integration"]   # 배포 서버 테스트는 `pytest -m integration`으로 따로 실행
 markers = [
     "integration: 배포된 서버(INTEGRATION_BASE_URL)를 대상으로 하는 통합 테스트",
+    "postgres: PostgreSQL 테스트 DB(TEST_DATABASE_URL, 이름이 _test 로 끝남)가 있어야 하는 테스트 — 없으면 건너뛴다",
 ]
 # filterwarnings = ["error"]  # (선택) 경고를 에러로 처리 = pytest -W error
