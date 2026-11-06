@@ -6,16 +6,26 @@
 - 이 파일은 그 DB 의 public 스키마를 지웠다 만든다 (지우기 직전 같은 연결에서 db.verify_test_server).
 - 개발 DB(todo_dev)·운영 DB 에는 절대 연결하지 않는다.
 """
+import base64
 import hashlib
+import json
 import logging
 import os
+import re
+import secrets
+import signal
+import socket
+import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
@@ -31,6 +41,7 @@ from sqlalchemy.pool import NullPool
 import auth
 import db
 import main
+from conftest import free_port
 
 pytestmark = pytest.mark.postgres
 
@@ -920,6 +931,543 @@ def test_http_missing_own_attempt_is_500_without_session(http_app, monkeypatch):
     assert COOKIE not in res.headers.get("set-cookie", "")
     state = db_state(http_app)
     assert state["sessions"] == 1 and [k for _, k, _ in state["failures"]] == ["register"]
+
+
+# ---------- Phase 2-F: 다중 프로세스·다중 워커 (실제 uvicorn + todo_test) ----------
+# A: 독립 uvicorn 프로세스 2개(각 --workers 1, 포트 다름) — 요청을 보낼 프로세스를 정할 수 있어 결과가 결정적이다.
+# B: 실제 uvicorn --workers 2 — 요청 분산은 OS 가 정하므로 접근 로그의 PID 로 "관찰"한다. 분산을 확인하지 못하면
+#    기능 결함과 구별해 "[검증 미완료]" 로 실패시킨다(통과로 보지 않는다).
+# - 서버는 fresh_schema(R-19 게이트 → 초기화) 다음에 띄우고, 다음 테스트의 게이트 전에 반드시 내린다:
+#   CTRL_BREAK(정상 종료) → 감독은 Popen 핸들로 종료 → 식별을 확인한 자식만 PID 별 강제 종료(taskkill /T 미사용) →
+#   감독·워커 PID 와 포트가 모두 사라졌는지 → DB 연결 정리 확인. 식별이 불확실한 프로세스는 죽이지 않는다.
+#   하나라도 확인하지 못하면 pytest.exit 로 세션을 멈춘다(다음 스키마 삭제를 막는다).
+# - 자식 프로세스에는 검증된 todo_test URL 을 DATABASE_URL 로만 준다(TEST_DATABASE_URL·PG* 는 뺀다). 앱 코드는 바꾸지 않고
+#   워커 식별은 uvicorn 로그(Started server process [PID])와 접근 로그 형식의 %(process)d 로만 한다.
+
+SERVER_KEY_BYTES = secrets.token_bytes(32)                       # 이 실행에서만 쓰는 합성 키 (출력하지 않는다)
+SERVER_KEY = base64.urlsafe_b64encode(SERVER_KEY_BYTES).rstrip(b"=").decode("ascii")
+SERVER_FAILURE_KEY = auth.FailureKey(SERVER_KEY_BYTES)
+SERVER_START_TIMEOUT = 30                                        # 초 — 기동·준비 확인 상한
+SERVER_START_ATTEMPTS = 3                                        # 포트 충돌 등으로 바로 죽으면 새 포트로 다시 (상한)
+SERVER_STOP_TIMEOUT = 10                                         # 초 — 정상 종료 대기, 강제 종료 뒤 확인 대기
+HTTP_TIMEOUT = 30                                                # 초 — 요청 하나의 상한
+MW_WRONG_PW = "mw-wrong-password-1"
+MW_PW = "mw-correct-pass-9"
+SERVER_ENV_DROP = ("TEST_DATABASE_URL", "DATABASE_URL", "AUTH_FAILURE_KEY", "APP_ENV", "COOKIE_SECURE",
+                   "REGISTRATION_ENABLED", "FORWARDED_ALLOW_IPS")
+_STARTED_WORKER = re.compile(r"Started server process \[(\d+)\]")
+_STARTED_PARENT = re.compile(r"Started parent process \[(\d+)\]")
+_ACCESS = re.compile(r'ACCESS pid=(\d+) \S+ "(\w+) (\S+) [^"]*" (\d{3})')
+
+SERVER_LOG_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {"()": "uvicorn.logging.DefaultFormatter", "fmt": "%(levelprefix)s [%(process)d] %(message)s",
+                    "use_colors": False},
+        "access": {"()": "uvicorn.logging.AccessFormatter",
+                   "fmt": 'ACCESS pid=%(process)d %(client_addr)s "%(request_line)s" %(status_code)s',
+                   "use_colors": False},
+    },
+    "handlers": {
+        "default": {"formatter": "default", "class": "logging.StreamHandler", "stream": "ext://sys.stderr"},
+        "access": {"formatter": "access", "class": "logging.StreamHandler", "stream": "ext://sys.stdout"},
+    },
+    "loggers": {
+        "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+        "uvicorn.error": {"level": "INFO"},
+        "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+        "todo.auth": {"handlers": ["default"], "level": "WARNING", "propagate": False},
+    },
+}
+
+
+def server_database_url() -> str:
+    # 자식 프로세스의 DATABASE_URL — 고정 대상 검사를 통과한 todo_test URL 만 (값은 출력하지 않는다)
+    url = db.check_test_database_url(TEST_URL)
+    assert (url.username, url.host, url.port, url.database) == (db.TEST_DB_USER, db.TEST_DB_HOST,
+                                                                 db.TEST_DB_PORT, db.TEST_DB_NAME)
+    return url.render_as_string(hide_password=False)
+
+
+@dataclass
+class Server:
+    proc: subprocess.Popen
+    port: int
+    workers: int
+    folder: Path
+    worker_pids: list[int] = field(default_factory=list)
+    parent_pid: int | None = None
+    created: str | None = None                     # 감독(Popen) 프로세스의 생성 시각 (UTC ISO) — 식별에 쓴다
+    identities: dict[int, str] = field(default_factory=dict)   # 확인된 워커 PID → 생성 시각
+
+    @property
+    def base(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def log_text(self) -> str:
+        parts = []
+        for name in ("stdout.log", "stderr.log"):
+            path = self.folder / name
+            parts.append(path.read_text(encoding="utf-8", errors="replace") if path.exists() else "")
+        return "\n".join(parts)
+
+    def access(self) -> list[tuple[int, str, str, int]]:
+        # (워커 PID, 메서드, 경로, 상태) — 접근 로그에서만 읽는다
+        return [(int(p), m, path, int(s)) for p, m, path, s in _ACCESS.findall(self.log_text())]
+
+    def collect_pids(self) -> None:
+        text = self.log_text()
+        self.worker_pids = sorted({int(p) for p in _STARTED_WORKER.findall(text)})
+        parents = {int(p) for p in _STARTED_PARENT.findall(text)}
+        self.parent_pid = next(iter(parents)) if len(parents) == 1 else None
+
+
+@dataclass(frozen=True)
+class ProcInfo:
+    pid: int
+    ppid: int
+    created: str                                   # UTC ISO 8601 ('o' 형식, 같은 형식끼리 문자열 비교 가능)
+    cmd: str
+
+
+_PROCESS_QUERY = (
+    "$ErrorActionPreference='Stop'; "
+    "Get-CimInstance Win32_Process -Filter \"Name='{name}'\" | ForEach-Object {{ [pscustomobject]@{{ "
+    "pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; "
+    "created=$_.CreationDate.ToUniversalTime().ToString('o'); cmd=[string]$_.CommandLine }} }} "
+    "| ConvertTo-Json -Compress"
+)
+
+
+def _process_table() -> dict[int, ProcInfo] | None:
+    # 이 python 실행 파일과 같은 이름의 프로세스 메타데이터 (Windows CIM, 외부 패키지 없음). 확인할 수 없으면 None
+    if os.name != "nt":
+        return None
+    script = _PROCESS_QUERY.format(name=Path(sys.executable).name.replace("'", ""))
+    try:
+        done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                              capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if done.returncode != 0:
+        return None
+    raw = done.stdout.strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    rows = data if isinstance(data, list) else [data]
+    table = {}
+    for row in rows:
+        try:
+            info = ProcInfo(int(row["pid"]), int(row["ppid"]), str(row["created"]), str(row.get("cmd") or ""))
+        except (KeyError, TypeError, ValueError):
+            return None
+        table[info.pid] = info
+    return table
+
+
+def _is_supervisor(info: ProcInfo, server: Server) -> bool:
+    # 이 테스트가 띄운 uvicorn 명령(같은 포트)이고, 처음 기록한 생성 시각과 같아야 한다
+    return (info.pid == server.proc.pid and server.created is not None and info.created == server.created
+            and "-m uvicorn main:app" in info.cmd and f"--port {server.port}" in info.cmd)
+
+
+def _is_own_child(info: ProcInfo, server: Server) -> bool:
+    # 부모 PID 하나만으로 정하지 않는다: 부모 PID + multiprocessing spawn 명령의 parent_pid + 감독 이후 생성
+    return (server.created is not None and info.ppid == server.proc.pid and info.created >= server.created
+            and "spawn_main" in info.cmd and f"parent_pid={server.proc.pid}" in info.cmd)
+
+
+def _children(server: Server, table: dict[int, ProcInfo]) -> tuple[dict[int, ProcInfo], list[int]]:
+    # (확인된 자식, 감독이 만든 것으로 보이지만 명령이 달라 확인되지 않는 PID)
+    own, uncertain = {}, []
+    for info in table.values():
+        if info.pid == server.proc.pid or info.ppid != server.proc.pid:
+            continue
+        if server.created is not None and info.created < server.created:
+            continue                                                 # 예전에 같은 PID 번호를 쓰던 부모의 자식 — 무관
+        if _is_own_child(info, server):
+            own[info.pid] = info
+        else:
+            uncertain.append(info.pid)
+    return own, sorted(uncertain)
+
+
+def _pid_present(pid: int) -> bool:
+    # 프로세스 표를 얻지 못했을 때의 보조 확인 (종료 판단에만 쓰고, 이것으로 강제 종료하지 않는다)
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+    try:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return True                                                   # 모르면 남아 있다고 본다
+    return f'"{pid}"' in out
+
+
+def _port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _start_once(folder: Path, workers: int) -> Server:
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "log.json").write_text(json.dumps(SERVER_LOG_CONFIG), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PG") and k not in SERVER_ENV_DROP}
+    env.update(APP_ENV="test", AUTH_FAILURE_KEY=SERVER_KEY, DATABASE_URL=server_database_url(),
+               TODO_FILE=str(folder / "todo.json"), TEMPLATE_FILE=str(folder / "task_templates.json"))
+    port = free_port()
+    with open(folder / "stdout.log", "wb") as out, open(folder / "stderr.log", "wb") as err:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port),
+             "--workers", str(workers), "--no-proxy-headers", "--log-config", str(folder / "log.json")],
+            cwd=APP_DIR, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+    return Server(proc=proc, port=port, workers=workers, folder=folder)
+
+
+def _record_identity(server: Server) -> None:
+    # Popen 직후 감독의 생성 시각을 기록한다 (이 테스트가 띄운 명령인지도 함께). 확인하지 못하면 created 는 None
+    table = _process_table()
+    info = (table or {}).get(server.proc.pid)
+    if info is not None and "-m uvicorn main:app" in info.cmd and f"--port {server.port}" in info.cmd:
+        server.created = info.created
+
+
+def _wait_ready(server: Server) -> str | None:
+    # 준비되면 None, 아니면 이유. 워커 수만큼 PID 가 로그에 나오고 /auth/me 가 401 이어야 준비된 것
+    deadline = time.monotonic() + SERVER_START_TIMEOUT
+    while time.monotonic() < deadline:
+        if server.proc.poll() is not None:
+            return f"서버 프로세스가 바로 끝남 (exit {server.proc.returncode})"
+        server.collect_pids()
+        if len(server.worker_pids) >= server.workers:
+            try:
+                if httpx.get(server.base + "/auth/me", timeout=2).status_code == 401:
+                    return None
+            except httpx.HTTPError:
+                pass
+        time.sleep(0.2)
+    return "준비 시간 초과 또는 워커 PID 수집 실패"
+
+
+def _verify_workers(server: Server) -> str | None:
+    # 로그의 워커 PID 가 모두 이 테스트가 띄운 프로세스인지 확인하고 생성 시각을 기록한다. 아니면 이유
+    if os.name != "nt":
+        return None
+    table = _process_table()
+    if table is None or server.created is None:
+        return "프로세스 식별 정보(CIM)를 얻지 못함"
+    for pid in server.worker_pids:
+        info = table.get(pid)
+        if info is None:
+            return f"워커 PID {pid} 가 프로세스 목록에 없음"
+        ok = _is_supervisor(info, server) if pid == server.proc.pid else _is_own_child(info, server)
+        if not ok:
+            return f"워커 PID {pid} 를 이 테스트의 프로세스로 확인하지 못함"
+        server.identities[pid] = info.created
+    return None
+
+
+def start_server(folder: Path, workers: int) -> Server:
+    # 상한 있는 재시도. Popen 이후 어떤 예외(BaseException 포함)가 나도 그 시도의 프로세스를 정리하고 원래 예외를 다시 올린다.
+    # 정리하지 못하면 다음 fresh_schema 가 돌지 않게 세션을 멈춘다
+    reasons = []
+    for attempt in range(SERVER_START_ATTEMPTS):
+        server = _start_once(folder / f"try{attempt}", workers)
+        try:
+            _record_identity(server)
+            reason = _wait_ready(server) or _verify_workers(server)
+        except BaseException:
+            try:
+                problems = stop_server(server)
+            except BaseException as cleanup_error:                     # noqa: BLE001
+                pytest.exit(f"기동 중 예외 뒤 서버 정리도 실패 ({type(cleanup_error).__name__}) — 로그: {server.folder}",
+                            returncode=3)
+            if problems:
+                pytest.exit(f"기동 중 예외 뒤 서버를 정리하지 못했습니다 — {problems} (로그: {server.folder})",
+                            returncode=3)
+            raise
+        if reason is None:
+            return server
+        reasons.append(reason)
+        problems = stop_server(server)
+        if problems:
+            pytest.exit(f"기동 실패한 서버를 정리하지 못했습니다 — {problems} (로그: {server.folder})", returncode=3)
+    pytest.fail(f"uvicorn 서버 기동 실패 ({SERVER_START_ATTEMPTS}회): {reasons} (로그: {folder})")
+
+
+def stop_server(server: Server) -> list[str]:
+    # 정상 종료(CTRL_BREAK) → 감독은 Popen 핸들로 종료(핸들이 열려 있어 PID 재사용 없음) → 자식은 식별을 확인한 것만
+    # 하나씩 강제 종료 → 감독·자식 PID 와 포트가 사라졌는지 확인. 문제 목록을 돌려준다(빈 목록이면 정리됨).
+    # taskkill /T 는 부모 PID 번호만 보고 트리를 만들므로 쓰지 않는다. 식별이 불확실한 프로세스는 죽이지 않고 문제로 보고한다
+    problems: list[str] = []
+    try:
+        server.collect_pids()
+    except OSError:
+        problems.append("서버 로그를 읽지 못함")
+    tracked: dict[int, str] = dict(server.identities)                   # PID → 생성 시각 (확인된 것만)
+    table = _process_table()
+    if table is not None:
+        own, _ = _children(server, table)
+        tracked.update({pid: info.created for pid, info in own.items()})   # 로그에 아직 안 나온 워커 포함
+    if server.proc.poll() is None:
+        try:
+            if os.name == "nt":
+                server.proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                server.proc.terminate()
+            server.proc.wait(SERVER_STOP_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if server.proc.poll() is None:
+        server.proc.kill()                                             # 핸들 기반 — 우리 프로세스만
+        try:
+            server.proc.wait(SERVER_STOP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            problems.append(f"감독 PID {server.proc.pid} 종료 안 됨")
+    deadline = time.monotonic() + SERVER_STOP_TIMEOUT
+    uncertain: list[int] = []
+    while True:
+        table = _process_table()
+        if table is not None:
+            own, uncertain = _children(server, table)
+            tracked.update({pid: info.created for pid, info in own.items()})
+            alive = sorted(pid for pid, created in tracked.items()
+                           if pid != server.proc.pid and pid in table and table[pid].created == created)
+            for pid in alive:                                          # 직전에 PID·생성 시각을 다시 확인한 것만
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=30)
+        else:
+            alive = sorted(pid for pid in tracked if pid != server.proc.pid and _pid_present(pid))
+        port_open = _port_open(server.port)
+        if not alive and not uncertain and not port_open and server.proc.poll() is not None:
+            break
+        if time.monotonic() >= deadline:
+            problems += [f"남은 워커 PID {alive}"] * bool(alive)
+            problems += [f"식별되지 않은 자식 PID {uncertain} (강제 종료하지 않음)"] * bool(uncertain)
+            problems += [f"포트 {server.port} 열림"] * port_open
+            if table is None and alive:
+                problems.append("프로세스 식별 정보(CIM)를 얻지 못해 강제 종료하지 않음")
+            break
+        time.sleep(0.5)
+    return problems
+
+
+@contextmanager
+def running_servers(engine, tmp_path: Path, workers: list[int]):
+    # 서버들을 띄우고, 무슨 일이 있어도 내린 뒤 DB 연결 정리까지 확인한다. 로그는 tmp_path 에 남는다
+    servers: list[Server] = []
+    try:
+        for i, count in enumerate(workers):
+            servers.append(start_server(tmp_path / f"server{i}", count))
+        yield servers
+    finally:
+        problems = []
+        for s in servers:
+            try:
+                problems += stop_server(s)
+            except BaseException as cleanup_error:                       # noqa: BLE001 — 정리 실패로 본다
+                problems.append(f"정리 중 예외 {type(cleanup_error).__name__}")
+        if problems:
+            pytest.exit(f"서버 프로세스를 정리하지 못했습니다 — {problems} (로그: {tmp_path})", returncode=3)
+        try:
+            wait_for_backends_released(engine)
+        except pytest.fail.Exception as exc:
+            pytest.exit(f"서버 종료 뒤 DB 연결이 정리되지 않았습니다 — {exc} (로그: {tmp_path})", returncode=3)
+
+
+def http(server: Server, method: str, path: str, *, body: dict | None = None, token: str | None = None,
+         csrf: str | None = None) -> httpx.Response:
+    # 요청마다 새 연결(Connection: close)·쿠키·CSRF·Origin 을 명시한다
+    headers = {"Origin": server.base, "Connection": "close"}
+    if token is not None:
+        headers["Cookie"] = f"{COOKIE}={token}"
+    if csrf is not None:
+        headers["X-CSRF-Token"] = csrf
+    return httpx.request(method, server.base + path, json=body, headers=headers, timeout=HTTP_TIMEOUT)
+
+
+def mw_login(server: Server, username: str, password: str = MW_WRONG_PW) -> httpx.Response:
+    return http(server, "POST", "/auth/login", body={"username": username, "password": password})
+
+
+def in_parallel(calls: list) -> list:
+    # 상한 있는 동시 실행 — 모두 같은 순간에 시작하고, 끝나지 않는 스레드가 있으면 실패
+    start = threading.Barrier(len(calls))
+    results: list = [None] * len(calls)
+
+    def worker(i: int) -> None:
+        try:
+            start.wait(timeout=BARRIER_TIMEOUT)
+            results[i] = calls[i]()
+        except BaseException as exc:                                  # noqa: BLE001 — 아래에서 실패로 본다
+            results[i] = exc
+            start.abort()
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=False) for i in range(len(calls))]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + JOIN_TIMEOUT
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    assert not any(t.is_alive() for t in threads), "요청 스레드가 끝나지 않음"
+    errors = [type(r).__name__ for r in results if isinstance(r, BaseException)]
+    assert not errors, errors
+    return results
+
+
+def login_failure_rows(engine) -> list:
+    with engine.connect() as conn:
+        rows = [r for r in failure_rows(conn) if r.kind == "login"]
+        conn.rollback()
+    return rows
+
+
+def assert_retry_after(res: httpx.Response) -> None:
+    assert res.status_code == 429 and res.json() == {"detail": main.TOO_MANY_ATTEMPTS}
+    assert 1 <= int(res.headers["retry-after"]) <= 900
+
+
+def assert_clean_server_logs(servers: list[Server], *secrets: str) -> None:
+    # 실제 서버 로그(stdout·stderr)에 DETAIL·행 값·traceback·비밀값이 없다 (메시지에 값 자체는 넣지 않는다)
+    forbidden = {"DETAIL": "DETAIL", "Failing row": "Failing row", "Traceback": "Traceback",
+                 SERVER_KEY: "AUTH_FAILURE_KEY", MW_PW: "비밀번호", MW_WRONG_PW: "비밀번호"}
+    forbidden.update({s: "토큰·CSRF" for s in secrets if s})
+    for server in servers:
+        text = server.log_text()
+        found = sorted({label for needle, label in forbidden.items() if needle in text})
+        assert not found, f"서버 로그 노출: {found} (로그: {server.folder})"
+
+
+def test_mp_user_limit_shared_across_processes(fresh_schema, tmp_path):
+    # A1: 같은 username 의 실패를 두 프로세스에 번갈아 5번 → 6번째는 어느 프로세스든 429 (같은 IP 라 (username, IP) 규칙)
+    with running_servers(fresh_schema, tmp_path, [1, 1]) as servers:
+        p1, p2 = servers
+        for i in range(5):
+            res = mw_login(servers[i % 2], "mwuser")
+            assert res.status_code == 401 and res.json() == {"detail": main.LOGIN_FAILED}
+        for server in (p1, p2):
+            assert_retry_after(mw_login(server, "mwuser"))
+        served = [{pid for pid, m, path, s in srv.access() if path == "/auth/login"} for srv in servers]
+        assert served == [set(p1.worker_pids), set(p2.worker_pids)] and p1.worker_pids != p2.worker_pids
+    rows = login_failure_rows(fresh_schema)
+    assert len(rows) == 5                                                      # 429 는 기록하지 않는다
+    assert {(r.username_key, r.client_ip) for r in rows} == {(SERVER_FAILURE_KEY.username_key("mwuser"), "127.0.0.1")}
+    assert_clean_server_logs(servers)
+
+
+def test_mp_concurrent_failures_exact_across_processes(fresh_schema, tmp_path):
+    # A2: 같은 username 실패 10개를 두 프로세스에 5개씩 동시에 → 정확히 401 5개·429 5개, 503 없음, 기록 5건
+    with running_servers(fresh_schema, tmp_path, [1, 1]) as servers:
+        results = in_parallel([lambda s=servers[i % 2]: mw_login(s, "mwrace") for i in range(10)])
+        statuses = sorted(r.status_code for r in results)
+        assert statuses == [401] * 5 + [429] * 5, statuses
+        for res in results:
+            if res.status_code == 429:
+                assert_retry_after(res)
+        per_server = [sum(1 for _, m, path, _ in srv.access() if path == "/auth/login") for srv in servers]
+        assert per_server == [5, 5]
+    rows = login_failure_rows(fresh_schema)
+    assert len(rows) == 5 and {r.username_key for r in rows} == {SERVER_FAILURE_KEY.username_key("mwrace")}
+    assert_clean_server_logs(servers)
+
+
+def test_mp_ip_limit_shared_across_processes(fresh_schema, tmp_path):
+    # A3: 서로 다른 username 21개(각 1번)를 두 프로세스에 번갈아 → 20번째까지 401, 21번째 429 (IP 규칙 20 공유)
+    names = [f"mwip{i:02d}" for i in range(21)]
+    with running_servers(fresh_schema, tmp_path, [1, 1]) as servers:
+        for i, name in enumerate(names[:20]):
+            res = mw_login(servers[i % 2], name)
+            assert res.status_code == 401, (i, res.status_code)
+        assert_retry_after(mw_login(servers[1], names[20]))
+    rows = login_failure_rows(fresh_schema)
+    assert len(rows) == 20 and {r.client_ip for r in rows} == {"127.0.0.1"}
+    assert {r.username_key for r in rows} == {SERVER_FAILURE_KEY.username_key(n) for n in names[:20]}
+    assert_clean_server_logs(servers)
+
+
+def test_mp_session_and_csrf_shared_across_processes(fresh_schema, tmp_path):
+    # A4: 한 프로세스에서 만든 세션·CSRF 를 다른 프로세스가 그대로 쓴다 (로그아웃도 공유)
+    secrets_seen: list[str] = []
+    with running_servers(fresh_schema, tmp_path, [1, 1]) as servers:
+        p1, p2 = servers
+        created = http(p1, "POST", "/auth/register", body={"username": "mwsess", "password": MW_PW})
+        assert created.status_code == 201
+        token, csrf = created.cookies.get(COOKIE), created.json()["csrf_token"]
+        secrets_seen += [token, csrf]
+        me = http(p2, "GET", "/auth/me", token=token)
+        assert me.status_code == 200 and me.json() == created.json()
+        assert http(p2, "POST", "/auth/logout", token=token, csrf="wrong-csrf").status_code == 403
+        assert http(p1, "GET", "/auth/me", token=token).status_code == 200            # 403 은 세션을 지우지 않는다
+        assert http(p2, "POST", "/auth/logout", token=token, csrf=csrf).status_code == 204
+        assert http(p1, "GET", "/auth/me", token=token).status_code == 401
+        login = mw_login(p2, "mwsess", MW_PW)
+        assert login.status_code == 200
+        token2, csrf2 = login.cookies.get(COOKIE), login.json()["csrf_token"]
+        secrets_seen += [token2, csrf2]
+        assert http(p1, "GET", "/auth/me", token=token2).status_code == 200
+        assert http(p1, "POST", "/auth/logout", token=token2, csrf=csrf2).status_code == 204
+        assert http(p2, "GET", "/auth/me", token=token2).status_code == 401
+    state = db_state(fresh_schema)
+    assert state["users"] == 1 and state["sessions"] == 0
+    assert [k for _, k, _ in state["failures"]] == ["register"]                    # 성공 로그인의 선기록은 지워졌다
+    assert_clean_server_logs(servers, *secrets_seen)
+
+
+def test_uvicorn_two_workers_distribute_and_share_limit(fresh_schema, tmp_path):
+    # B1: 감독 1 + 워커 2 기동. B2: GET 요청이 두 워커 모두에서 처리됨(접근 로그 PID). B3: 같은 username 실패 8개를
+    # 동시에 → 정확히 401 5개·429 3개이고, 401(기록된 실패)이 두 워커에 나뉘었는지. 분산 확인은 상한 있는 반복으로만.
+    unverified: list[str] = []
+    with running_servers(fresh_schema, tmp_path, [2]) as (server,):
+        workers = set(server.worker_pids)
+        assert len(workers) == 2 and server.parent_pid not in workers                  # B1
+        assert server.parent_pid == server.proc.pid
+        seen: set[int] = set()
+        b2_start = len(server.access())                     # 준비 확인 요청(/auth/me)은 이 앞 — B2 분산 판단에서 뺀다
+        for round_no in range(5):                                                      # B2 — 최대 40 요청
+            results = in_parallel([lambda: http(server, "GET", "/auth/me") for _ in range(8)])
+            assert {r.status_code for r in results} == {401}
+            deadline = time.monotonic() + 5
+            while len(server.access()) < b2_start + 8 * (round_no + 1) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            seen = {pid for pid, m, path, s in server.access()[b2_start:] if path == "/auth/me"}
+            if seen >= workers:
+                break
+        if not seen >= workers:
+            unverified.append(f"B2 GET 분산 미확인 (처리한 워커 {len(seen & workers)}/2)")
+        distributed = False
+        for attempt in range(3):                                                       # B3 — 최대 3개 username
+            name = f"mwb{attempt}"
+            before = len(server.access())
+            results = in_parallel([lambda n=name: mw_login(server, n) for _ in range(8)])
+            statuses = sorted(r.status_code for r in results)
+            assert statuses == [401] * 5 + [429] * 3, statuses                          # 기능 — 분산과 무관하게 정확
+            deadline = time.monotonic() + 5
+            while len(server.access()) < before + 8 and time.monotonic() < deadline:
+                time.sleep(0.1)
+            lines = [a for a in server.access()[before:] if a[2] == "/auth/login"]
+            if {pid for pid, _, _, status in lines if status == 401} >= workers:
+                distributed = True
+                break
+        if not distributed:
+            unverified.append("B3 기록된 로그인 실패가 두 워커에 나뉘지 않음 (3회)")
+    rows = login_failure_rows(fresh_schema)
+    assert len(rows) == 5 * (attempt + 1)                                              # username 마다 정확히 5건
+    assert {r.username_key for r in rows} == {SERVER_FAILURE_KEY.username_key(f"mwb{i}") for i in range(attempt + 1)}
+    assert_clean_server_logs([server])
+    if unverified:
+        pytest.fail("[검증 미완료] 요청 분산을 확인하지 못함 — 기능 결함이 아니라 관찰 실패: " + "; ".join(unverified))
 
 
 def test_multiple_sessions_for_same_user(fresh_schema):
