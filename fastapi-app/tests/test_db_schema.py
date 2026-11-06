@@ -7,6 +7,7 @@
 import ast
 import dataclasses
 import io
+import json
 import os
 import re
 import subprocess
@@ -703,13 +704,97 @@ def test_every_revision_guards_downgrade_first():
 
 # ---------- v6 동작 보존 ----------
 
-def test_v6_app_does_not_use_database_yet(tmp_path):
-    # Phase 1-A 에서는 main.py 가 DB 모듈을 불러오지 않는다 (저장소는 JSON 그대로)
-    code = "import sys, main; print('db' in sys.modules, 'sqlalchemy' in sys.modules)"
-    env = {k: v for k, v in os.environ.items() if k not in ("DATABASE_URL", "TEST_DATABASE_URL")}
+_IMPORT_PROBE = r'''
+# 새 프로세스에서 main 을 import 하기 "전에" 감시 장치를 단다 — 엔진 생성·DB 연결·소켓 연결·Alembic 명령을 기록하고 막는다
+import json, socket, sys
+sys.path.insert(0, sys.argv[1])
+events = []
+
+def watch(label):
+    def blocked(*args, **kwargs):
+        events.append(label)
+        raise RuntimeError("blocked: " + label)
+    return blocked
+
+import sqlalchemy, sqlalchemy.engine, sqlalchemy.engine.create
+for mod in (sqlalchemy, sqlalchemy.engine, sqlalchemy.engine.create):
+    mod.create_engine = watch("create_engine")
+import psycopg
+psycopg.connect = watch("psycopg.connect")
+psycopg.Connection.connect = classmethod(lambda cls, *a, **k: watch("psycopg.Connection.connect")())
+# 소켓은 PostgreSQL 포트로 가는 연결만 막는다 (Windows asyncio 의 내부 루프백 socketpair 는 그대로 둔다)
+DB_PORTS = {5432, 5433, 15432}
+_socket_connect, _create_connection = socket.socket.connect, socket.create_connection
+
+def guarded_connect(self, address):
+    if isinstance(address, tuple) and len(address) >= 2 and address[1] in DB_PORTS:
+        events.append("socket.connect")
+        raise RuntimeError("blocked: socket.connect")
+    return _socket_connect(self, address)
+
+def guarded_create_connection(address, *args, **kwargs):
+    if address[1] in DB_PORTS:
+        events.append("socket.create_connection")
+        raise RuntimeError("blocked: socket.create_connection")
+    return _create_connection(address, *args, **kwargs)
+
+socket.socket.connect = guarded_connect
+socket.create_connection = guarded_create_connection
+import alembic.command
+for name in ("upgrade", "downgrade", "stamp", "revision"):
+    setattr(alembic.command, name, watch("alembic." + name))
+
+assert "main" not in sys.modules and "db" not in sys.modules       # 이 프로세스에서 처음 불러온다
+import main                                                         # 검사 대상
+import db
+result = {"after_import": list(events), "engine_cache": db.get_engine.cache_info().currsize,
+          "sessionmaker_cache": db.get_sessionmaker.cache_info().currsize}
+
+# v6 데이터 경로는 JSON 저장 그대로 — DB 를 건드리지 않고 TODO_FILE 에 쓴다
+from fastapi.testclient import TestClient
+client = TestClient(main.app)
+created = client.post("/todos", json={"title": "probe"})
+result["post_status"] = created.status_code
+result["get_titles"] = [t["title"] for t in client.get("/todos").json()]
+result["json_titles"] = [t["title"] for t in json.loads(main.TODO_FILE.read_text(encoding="utf-8"))]
+result["after_v6_requests"] = list(events)
+
+# 자체 확인: 감시 장치가 main·db 가 실제로 쓰는 경로에서 작동한다
+checks = {}
+for label, call in {
+    "db.make_engine": lambda: db.make_engine("postgresql://u@127.0.0.1:5433/x"),
+    "db.create_engine": lambda: db.create_engine("postgresql+psycopg://u@127.0.0.1:5433/x"),
+    "psycopg.connect": lambda: psycopg.connect("host=127.0.0.1 port=5433 dbname=x"),
+    "socket.connect": lambda: socket.socket().connect(("127.0.0.1", 5433)),
+    "socket.create_connection": lambda: socket.create_connection(("127.0.0.1", 5432)),
+}.items():
+    before = len(events)
+    try:
+        call()
+    except RuntimeError:
+        pass
+    checks[label] = len(events) > before
+result["self_check"] = checks
+print(json.dumps(result))
+'''
+
+
+def test_importing_main_creates_no_engine_or_connection_and_v6_stays_json(tmp_path):
+    # (7.0.0 Phase 2-E 계약 변경) main 은 인증 경로 때문에 db·sqlalchemy 를 import 해도 된다. 그러나 import 자체로는
+    # 엔진 생성·DB 연결·Alembic 명령(스키마 변경·마이그레이션)·DB 쓰기가 없어야 하고, v6 데이터 경로는 JSON 저장 그대로다.
+    # 다른 테스트의 모듈 캐시와 무관하게 새 격리 프로세스(-I)에서 감시 장치를 먼저 달고 확인한다. DB 서버·URL 이 없어도 돈다.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("DATABASE_URL", "TEST_DATABASE_URL", "AUTH_FAILURE_KEY", "APP_ENV") and not k.startswith("PG")}
     env["TODO_FILE"] = str(tmp_path / "todo.json")             # import 때 만들어지는 파일도 임시 폴더에
     env["TEMPLATE_FILE"] = str(tmp_path / "task_templates.json")
-    result = subprocess.run([sys.executable, "-c", code], cwd=APP_DIR, env=env,
-                            capture_output=True, text=True, timeout=60)
+    result = subprocess.run([sys.executable, "-I", "-c", _IMPORT_PROBE, str(APP_DIR)], cwd=tmp_path, env=env,
+                            capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.split() == ["False", "False"]
+    out = json.loads(result.stdout.strip().splitlines()[-1])
+    assert out["self_check"] == {"db.make_engine": True, "db.create_engine": True,
+                                 "psycopg.connect": True, "socket.connect": True,
+                                 "socket.create_connection": True}             # 감시 장치가 실제로 작동한다
+    assert out["after_import"] == [] and out["engine_cache"] == 0 and out["sessionmaker_cache"] == 0
+    assert out["post_status"] == 201 and out["get_titles"] == ["probe"] and out["json_titles"] == ["probe"]
+    assert out["after_v6_requests"] == []                       # v6 경로는 DB 를 쓰지 않는다
+    assert not (tmp_path / "task_templates.json").exists()      # 템플릿 파일은 처음 저장할 때만 만든다

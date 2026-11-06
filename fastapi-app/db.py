@@ -18,11 +18,13 @@ from functools import lru_cache
 from sqlalchemy import (
     CHAR, BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Identity, Index, Integer,
     LargeBinary, MetaData, String, Text, UniqueConstraint, create_engine, delete, func, insert, select, text,
+    update,
 )
 
 import auth                                      # 순수 함수만 (auth 는 db 를 import 하지 않는다)
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.engine import URL, Connection, Engine, make_url
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, MappedColumn, Session, mapped_column, sessionmaker
 
 DRIVER = "postgresql+psycopg"                    # psycopg 3
@@ -715,3 +717,56 @@ def purge_old_auth_failures(db: Session, now: datetime, limit: int = AUTH_FAILUR
     old = (select(AuthFailure.id).where(AuthFailure.created_at <= now - auth.FAILURE_RETENTION)
            .order_by(AuthFailure.id).limit(limit).with_for_update(skip_locked=True))
     return db.execute(delete(AuthFailure).where(AuthFailure.id.in_(old))).rowcount
+
+
+# ---------- 가입·rehash 헬퍼 (Phase 2-E, V7_SPEC §28.1·§29.1) ----------
+# - 호출자의 Session·트랜잭션 안에서만 동작한다. commit·rollback 하지 않는다 (트랜잭션은 라우트가 소유).
+# - 예외 메시지에 username·해시 값을 넣지 않는다. DB 오류는 그대로 올린다(가입 경쟁의 UNIQUE 위반만 바꾼다).
+
+USERNAME_UNIQUE_CONSTRAINT = "uq_users_username"   # 0001 의 users.username UNIQUE 제약 이름
+LOCK_NOT_AVAILABLE = "55P03"                       # lock_timeout 초과 (SQLSTATE)
+
+
+class UsernameTaken(Exception):
+    """동시 가입 경쟁에서 같은 username 이 먼저 저장됨 — 라우트가 409 로 바꾼다. 값은 담지 않는다."""
+
+
+def _sqlstate(exc: BaseException) -> str | None:
+    return getattr(getattr(exc, "orig", None), "sqlstate", None)
+
+
+def _constraint_name(exc: BaseException) -> str | None:
+    return getattr(getattr(getattr(exc, "orig", None), "diag", None), "constraint_name", None)
+
+
+def is_lock_timeout(exc: BaseException) -> bool:
+    # 잠금 대기 초과(55P03)인가 — 503 으로 응답할 오류. 그 밖의 DB 오류는 500
+    return isinstance(exc, DBAPIError) and _sqlstate(exc) == LOCK_NOT_AVAILABLE
+
+
+def username_exists(db: Session, username: str) -> bool:
+    # 가입 사전 중복 조회 — 정규화한 username(auth.normalize_username 결과)을 받는다
+    return db.execute(select(User.id).where(User.username == username).limit(1)).first() is not None
+
+
+def create_user(db: Session, username: str, password_hash: str, now: datetime) -> int:
+    # SAVEPOINT 안에서 INSERT 한다 — 동시 가입 경쟁의 UNIQUE 위반이 바깥 트랜잭션(가입 시도 기록)을 망가뜨리지 않게.
+    # uq_users_username 위반만 UsernameTaken, 그 밖의 제약 위반·DB 오류는 그대로 올린다
+    _require_aware(now)
+    try:
+        with db.begin_nested():
+            return db.execute(insert(User).values(
+                username=username, password_hash=password_hash, created_at=now,
+            ).returning(User.id)).scalar_one()
+    except IntegrityError as exc:
+        if _constraint_name(exc) == USERNAME_UNIQUE_CONSTRAINT:
+            raise UsernameTaken() from None
+        raise
+
+
+def update_password_hash_if_unchanged(db: Session, user_id: int, old_hash: str, new_hash: str) -> bool:
+    # 로그인 성공 Tx2 의 rehash 저장 — 저장된 해시가 검증한 값 그대로일 때만 바꾼다. 바꿨으면 True
+    result = db.execute(
+        update(User).where(User.id == user_id, User.password_hash == old_hash)
+        .values(password_hash=new_hash).execution_options(synchronize_session=False))
+    return result.rowcount > 0

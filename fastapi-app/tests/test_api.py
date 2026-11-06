@@ -1320,10 +1320,22 @@ TODO_RESPONSE_FIELDS = {"id", "title", "description", "completed", "priority", "
                         "recurrence", "created_at", "completed_at", "subtasks", "next_spawned"}
 
 
-def test_v6_routes_are_v5_plus_stats_only():
+# (7.0.0 Phase 2-E) 새 경로만 추가된다 — 인증 4개
+AUTH_ROUTES = {("POST", "/auth/register"), ("POST", "/auth/login"), ("POST", "/auth/logout"), ("GET", "/auth/me")}
+
+
+def test_routes_are_v6_plus_auth_only():
     from fastapi.routing import APIRoute
     routes = {(m, r.path) for r in app.routes if isinstance(r, APIRoute) for m in r.methods}
-    assert routes == V6_ROUTES                                       # 알림용 경로는 없다
+    assert routes == V6_ROUTES | AUTH_ROUTES                         # 알림용 경로는 없다, v6 경로는 그대로
+
+
+def test_v6_validation_error_body_is_unchanged():
+    # (7.0.0 Phase 2-E) 인증 경로 전용 422 처리기는 v6 경로의 기본 422 형식(input 포함)을 바꾸지 않는다
+    res = create(title="   ")
+    assert res.status_code == 422
+    (error,) = res.json()["detail"]
+    assert {"type", "loc", "msg", "input"} <= set(error) and error["input"] == "   "
 
 
 def test_todo_response_has_no_notification_fields():

@@ -71,7 +71,8 @@ def ui_template_file(ui_data_file) -> Path:
 def base_url(ui_data_file, ui_template_file):
     # UI 테스트용 서버 — 임시 TODO_FILE 로 uvicorn 을 띄운다 (pytest-playwright 의 base_url 을 덮어쓴다)
     port = free_port()
-    env = {**os.environ, "TODO_FILE": str(ui_data_file), "TEMPLATE_FILE": str(ui_template_file)}
+    # (7.0.0 Phase 2-E) 시작 가드가 APP_ENV 를 요구한다 — 테스트 서버는 test 로 명시(공개 대체 키, DB 연결 없음)
+    env = {**os.environ, "TODO_FILE": str(ui_data_file), "TEMPLATE_FILE": str(ui_template_file), "APP_ENV": "test"}
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port)],
         cwd=APP_DIR, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

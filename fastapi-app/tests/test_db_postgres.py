@@ -7,25 +7,30 @@
 - 개발 DB(todo_dev)·운영 DB 에는 절대 연결하지 않는다.
 """
 import hashlib
+import logging
 import os
 import threading
 import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import event, func, insert, inspect, select, text
+from argon2 import PasswordHasher
+from fastapi.testclient import TestClient
+from sqlalchemy import delete, event, func, insert, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
 import auth
 import db
+import main
 
 pytestmark = pytest.mark.postgres
 
@@ -657,6 +662,264 @@ def test_concurrent_ip_rule_is_approximate(fresh_schema):
     finally:
         other.dispose()
         wait_for_backends_released(fresh_schema)
+
+
+# ---------- Phase 2-E: /auth/* HTTP 흐름 (실제 PostgreSQL) ----------
+# 앱의 Session 팩토리 의존성(main.auth_session_factory)만 테스트 엔진의 sessionmaker 로 바꾼다 — DATABASE_URL 은 쓰지 않는다.
+# 이 테스트들은 실제로 commit 한다(다음 테스트의 fresh_schema 가 지운다). 마지막 테스트(rolled_back)보다 앞에 둔다.
+# 순서대로 하나씩 도는 요청은 fresh_schema 엔진(풀 연결 1개를 다시 쓴다), 동시·잠금 보유 연결은 NullPool 엔진을 쓰고
+# finally 에서 닫은 뒤 wait_for_backends_released 로 다음 R-19 게이트 조건을 확인한다.
+
+HTTP_SETTINGS = auth.AuthSettings(app_env="test", cookie_secure=False, registration_enabled=True)
+HTTP_ORIGIN = "http://testserver"
+HTTP_PW = "correct-horse-9"
+COOKIE = HTTP_SETTINGS.cookie_name
+REAL_VERIFY_LOGIN = auth.verify_login_password
+
+
+def use_app_engine(engine) -> None:
+    # 앱이 이 엔진으로 트랜잭션마다 새 Session 을 연다 (설정은 test, 키는 테스트 고정 키)
+    main.app.dependency_overrides[main.auth_config] = lambda: main.AuthConfig(settings=HTTP_SETTINGS,
+                                                                              failure_key=LIMIT_KEY)
+    main.app.dependency_overrides[main.auth_session_factory] = lambda: sessionmaker(bind=engine, expire_on_commit=False)
+
+
+@pytest.fixture
+def http_app(fresh_schema, monkeypatch):
+    # fresh_schema(R-19 게이트 → 초기화) 다음에 앱 의존성을 바꾸고, 끝나면(실패해도) 되돌린다
+    monkeypatch.setattr(logging.getLogger("todo.auth"), "disabled", False)   # Alembic fileConfig 가 끈 로거를 켠다
+    use_app_engine(fresh_schema)
+    try:
+        yield fresh_schema
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def http_client(ip: str = LIMIT_IP) -> TestClient:
+    return TestClient(main.app, client=(ip, 50000))                  # IP 를 명시한다 (기본 'testclient' 는 500)
+
+
+def call(client: TestClient, method: str, path: str, *, body: dict | None = None, token: str | None = None,
+         csrf: str | None = None):
+    # 쿠키 저장소에 기대지 않고 요청마다 쿠키·헤더를 명시한다
+    headers = {"Origin": HTTP_ORIGIN}
+    if token is not None:
+        headers["Cookie"] = f"{COOKIE}={token}"
+    if csrf is not None:
+        headers["X-CSRF-Token"] = csrf
+    client.cookies.clear()
+    res = client.request(method, path, json=body, headers=headers)
+    client.cookies.clear()
+    return res
+
+
+def creds(username: str = "alice", password: str = HTTP_PW) -> dict:
+    return {"username": username, "password": password}
+
+
+def db_state(engine) -> dict:
+    with engine.connect() as conn:
+        state = {"users": count(conn, db.User), "sessions": session_count(conn),
+                 "failures": [(r.id, r.kind, r.username_key) for r in failure_rows(conn)]}
+        conn.rollback()
+    return state
+
+
+def assert_no_secret(res, caplog, *secrets: str) -> None:
+    # PostgreSQL DETAIL·행 값·비밀번호가 응답과 앱 로그에 없다
+    for secret in ("DETAIL", "Failing row", "Key (", HTTP_PW, *secrets):
+        assert secret not in res.text and secret not in caplog.text, secret
+    assert "Traceback" not in caplog.text and all(r.exc_info is None for r in caplog.records)
+
+
+def test_http_register_me_logout_flow(http_app):
+    c = http_client()
+    created = call(c, "POST", "/auth/register", body=creds("Alice"))
+    assert created.status_code == 201
+    body, token = created.json(), created.cookies.get(COOKIE)
+    assert body["username"] == "alice" and token and token not in created.text
+    me = call(c, "GET", "/auth/me", token=token)
+    assert me.status_code == 200 and me.json() == body
+    assert db_state(http_app)["sessions"] == 1
+    assert call(c, "POST", "/auth/logout", token=token, csrf=body["csrf_token"]).status_code == 204
+    assert call(c, "GET", "/auth/me", token=token).status_code == 401
+    state = db_state(http_app)
+    assert state["users"] == 1 and state["sessions"] == 0
+    assert [(k, u) for _, k, u in state["failures"]] == [("register", None)]       # 201 은 가입 시도로 센다
+
+
+def test_http_login_failures_then_429(http_app):
+    c = http_client()
+    assert call(c, "POST", "/auth/register", body=creds()).status_code == 201
+    for _ in range(5):
+        res = call(c, "POST", "/auth/login", body=creds(password="wrong-password-1"))
+        assert res.status_code == 401 and res.json() == {"detail": main.LOGIN_FAILED}
+    blocked = call(c, "POST", "/auth/login", body=creds())                         # 맞는 비밀번호도 검증 전에 차단
+    assert blocked.status_code == 429 and 1 <= int(blocked.headers["retry-after"]) <= 900
+    assert COOKIE not in blocked.headers.get("set-cookie", "")
+    logins = [r for r in db_state(http_app)["failures"] if r[1] == "login"]
+    assert len(logins) == 5 and {u for _, _, u in logins} == {login_as().failure_key}   # 429 는 기록하지 않는다
+
+
+def test_http_login_success_deletes_only_own_attempt(http_app):
+    c = http_client()
+    assert call(c, "POST", "/auth/register", body=creds()).status_code == 201
+    assert call(c, "POST", "/auth/login", body=creds(password="wrong-password-1")).status_code == 401
+    with http_app.begin() as conn:                                                 # 다른 요청의 선기록(합성)
+        conn.execute(insert(db.AuthFailure).values(kind="login", username_key=login_as().failure_key,
+                                                   client_ip="198.51.100.1", created_at=datetime.now(timezone.utc)))
+    before = db_state(http_app)["failures"]
+    res = call(c, "POST", "/auth/login", body=creds())
+    assert res.status_code == 200 and res.cookies.get(COOKIE)
+    after = db_state(http_app)
+    assert after["failures"] == before                                             # 자기 선기록만 지워졌다
+    assert after["sessions"] == 2                                                  # 가입 세션 + 로그인 세션
+
+
+def test_http_duplicate_register_409_is_counted(http_app):
+    c = http_client()
+    assert call(c, "POST", "/auth/register", body=creds()).status_code == 201
+    dup = call(c, "POST", "/auth/register", body=creds("ALICE", "another-password-2"))
+    assert dup.status_code == 409 and dup.json() == {"detail": main.USERNAME_TAKEN}
+    assert COOKIE not in dup.headers.get("set-cookie", "")
+    state = db_state(http_app)
+    assert state["users"] == 1 and state["sessions"] == 1
+    assert [k for _, k, _ in state["failures"]] == ["register", "register"]        # 409 도 commit 되어 센다
+
+
+def test_http_register_unique_race_uses_savepoint(http_app, monkeypatch, caplog):
+    # 사전 조회를 지나친 경쟁을 재현한다 — 실제 UNIQUE 위반을 SAVEPOINT 가 받아 409, 시도 기록은 commit
+    c = http_client()
+    assert call(c, "POST", "/auth/register", body=creds()).status_code == 201
+    monkeypatch.setattr(db, "username_exists", lambda session, username: False)
+    caplog.set_level(logging.DEBUG)
+    dup = call(c, "POST", "/auth/register", body=creds(password="another-password-2"))
+    assert dup.status_code == 409
+    state = db_state(http_app)
+    assert state["users"] == 1 and [k for _, k, _ in state["failures"]] == ["register", "register"]
+    assert_no_secret(dup, caplog, "another-password-2")
+
+
+def test_http_other_constraint_violation_is_500_not_409(http_app, monkeypatch, caplog):
+    # NOT NULL 위반(다른 제약)은 409 로 바꾸지 않는다 → rollback·500, 시도로 세지 않음, DETAIL(행 값) 비노출
+    monkeypatch.setattr(auth, "hash_password_limited", lambda password: None)
+    caplog.set_level(logging.DEBUG)
+    res = call(http_client(), "POST", "/auth/register", body=creds("carol"))
+    assert res.status_code == 500 and res.json() == {"detail": main.SERVER_ERROR}
+    assert "auth_register_error exc_type=IntegrityError" in caplog.text
+    assert_no_secret(res, caplog, "carol")
+    assert db_state(http_app) == {"users": 0, "sessions": 0, "failures": []}
+
+
+def test_http_concurrent_same_username_register(fresh_schema, monkeypatch):
+    # 같은 username 동시 가입 2건 → 201 한 건, 409 한 건, 두 시도 모두 기록. 연결은 NullPool, 끝나면 정리 확인
+    monkeypatch.setattr(logging.getLogger("todo.auth"), "disabled", False)
+    other = nullpool_engine()
+    statuses: dict[int, int] = {}
+
+    def register_once(session, i):
+        statuses[i] = call(http_client(), "POST", "/auth/register", body=creds()).status_code
+        return SimpleNamespace(decision=SimpleNamespace(allowed=statuses[i] == 201))
+
+    try:
+        use_app_engine(other)
+        results = run_concurrently(other, 2, register_once)
+        assert sorted(statuses.values()) == [201, 409] and results.count(True) == 1
+        state = db_state(fresh_schema)
+        assert state["users"] == 1 and [k for _, k, _ in state["failures"]] == ["register", "register"]
+    finally:
+        main.app.dependency_overrides.clear()
+        other.dispose()
+        wait_for_backends_released(fresh_schema)
+
+
+def test_http_login_rehashes_outdated_hash(http_app):
+    c = http_client()
+    assert call(c, "POST", "/auth/register", body=creds()).status_code == 201
+    weak = PasswordHasher(time_cost=1, memory_cost=8 * 1024, parallelism=1).hash(HTTP_PW)
+    with http_app.begin() as conn:
+        conn.execute(update(db.User).where(db.User.username == "alice").values(password_hash=weak))
+    assert call(c, "POST", "/auth/login", body=creds()).status_code == 200
+    with http_app.connect() as conn:
+        stored = conn.execute(select(db.User.password_hash).where(db.User.username == "alice")).scalar_one()
+        conn.rollback()
+    assert stored != weak and not auth.needs_rehash(stored) and auth.verify_password(stored, HTTP_PW)
+
+
+def test_http_relogin_replaces_only_presented_session(http_app):
+    first = call(http_client(), "POST", "/auth/register", body=creds())
+    old_token = first.cookies.get(COOKIE)
+    other_device = call(http_client(), "POST", "/auth/login", body=creds()).cookies.get(COOKIE)
+    relogin = call(http_client(), "POST", "/auth/login", body=creds(), token=old_token)
+    assert relogin.status_code == 200
+    new_token = relogin.cookies.get(COOKIE)
+    c = http_client()
+    assert call(c, "GET", "/auth/me", token=old_token).status_code == 401          # 제시한 세션만 교체
+    assert call(c, "GET", "/auth/me", token=other_device).status_code == 200       # 다른 기기 세션은 유지
+    assert call(c, "GET", "/auth/me", token=new_token).status_code == 200
+    assert db_state(http_app)["sessions"] == 2
+
+
+def test_http_tx2_lock_contention_is_503_without_session(http_app, monkeypatch):
+    # Tx1 commit 뒤·Tx2 전에 다른 연결이 같은 username 잠금을 잡는다 → Tx2 가 2초 뒤 55P03 → 503, 세션 없음, 선기록 남음
+    assert call(http_client(), "POST", "/auth/register", body=creds()).status_code == 201
+    lock = text("SELECT pg_advisory_xact_lock(hashtextextended('login:' || :k, 0))")
+    other = nullpool_engine()
+    holder = {}
+
+    def verify_then_hold_lock(stored_hash, password):
+        verified = REAL_VERIFY_LOGIN(stored_hash, password)
+        conn = other.connect()
+        holder["conn"], holder["trans"] = conn, conn.begin()
+        conn.execute(lock, {"k": login_as().failure_key})
+        return verified
+
+    monkeypatch.setattr(auth, "verify_login_password", verify_then_hold_lock)
+    try:
+        res = call(http_client(), "POST", "/auth/login", body=creds())
+        assert res.status_code == 503 and res.json() == {"detail": main.SERVICE_BUSY}
+        assert COOKIE not in res.headers.get("set-cookie", "")
+    finally:
+        if "trans" in holder:
+            holder["trans"].rollback()
+            holder["conn"].close()
+        other.dispose()
+        wait_for_backends_released(http_app)
+    state = db_state(http_app)
+    assert state["sessions"] == 1                                                  # 가입 세션뿐 (로그인 세션 없음)
+    assert [k for _, k, _ in state["failures"]] == ["register", "login"]           # 선기록은 실패로 남는다
+
+
+def test_http_hash_busy_compensates_own_attempt(http_app, monkeypatch):
+    c = http_client()
+    assert call(c, "POST", "/auth/register", body=creds()).status_code == 201
+    assert call(c, "POST", "/auth/login", body=creds(password="wrong-password-1")).status_code == 401
+    before = db_state(http_app)["failures"]
+
+    def busy(stored_hash, password):
+        raise auth.HashBusy()
+
+    monkeypatch.setattr(auth, "verify_login_password", busy)
+    res = call(c, "POST", "/auth/login", body=creds())
+    assert res.status_code == 503 and COOKIE not in res.headers.get("set-cookie", "")
+    assert db_state(http_app)["failures"] == before                                # 보상 Tx 가 자기 선기록만 지웠다
+
+
+def test_http_missing_own_attempt_is_500_without_session(http_app, monkeypatch):
+    # Tx1 commit 뒤 자기 선기록이 사라지면(합성) finish_login_success 가 False → Tx2 rollback·500, 세션 없음
+    assert call(http_client(), "POST", "/auth/register", body=creds()).status_code == 201
+
+    def verify_then_delete_attempt(stored_hash, password):
+        with http_app.begin() as conn:
+            conn.execute(delete(db.AuthFailure).where(db.AuthFailure.kind == "login"))
+        return REAL_VERIFY_LOGIN(stored_hash, password)
+
+    monkeypatch.setattr(auth, "verify_login_password", verify_then_delete_attempt)
+    res = call(http_client(), "POST", "/auth/login", body=creds())
+    assert res.status_code == 500 and res.json() == {"detail": main.SERVER_ERROR}
+    assert COOKIE not in res.headers.get("set-cookie", "")
+    state = db_state(http_app)
+    assert state["sessions"] == 1 and [k for _, k, _ in state["failures"]] == ["register"]
 
 
 def test_multiple_sessions_for_same_user(fresh_schema):

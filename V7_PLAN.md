@@ -106,32 +106,47 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 5. Docker 포트 공개 시 원래 클라이언트 IP가 보이는지 격리 환경에서 확인(R-12).
 
 테스트·완료 기준 (T-A)
-- [ ] 가입: 길이·문자 규칙 422, 대소문자 무시 중복 409, 공백 정규화, 응답에 해시 없음, 해시가 `$argon2id$`로 시작
-- [ ] 로그인 성공 200 + 쿠키, 없는 아이디와 틀린 비밀번호의 401 본문 동일
-- [ ] 쿠키 속성: HttpOnly, SameSite=Lax, Path=/; `COOKIE_SECURE=true`면 Secure + `__Host-` 이름
-- [ ] 로그아웃 뒤 같은 쿠키로 `/auth/me` 401, 14일 지난 세션 401(시계 고정), 재로그인 시 토큰 교체
-- [ ] CSRF: 헤더 없음·틀림 403, 맞으면 통과. 로그인 Origin 불일치 403
-- [ ] 시도 제한: 5회 실패 후 6번째 429 + `Retry-After`, 15분 뒤 해제, ~~성공 시 기록 삭제~~ → (2026-11-06 변경, `V7_SPEC.md` §29.5 변경 기록) 성공 시 **그 요청의 선기록만** 삭제(이전 실패는 창 만료로 해제), 없는 계정도 같은 규칙, 가입 IP 제한(201·409만 셈), 429는 기록하지 않음
-- [ ] 동시성: 같은 username에 동시 로그인 실패 요청 N개(스레드)를 보내도 실패 기록이 한도를 넘어 통과하지 않음 (같은 username은 정확히 한도만큼, IP 규칙은 근사)
-- [ ] (2-D 추가) `username_key`는 HMAC 30자(평문 없음), `AUTH_FAILURE_KEY` 운영 필수, Argon2 슬롯 혼잡·잠금 대기 초과 503(인증 없음), 슬롯 대기 초과 시 자기 선기록만 보상 삭제, 비정상 IP는 인증하지 않음
+- [ ] 가입: 길이·문자 규칙 422, 대소문자 무시 중복 409, 공백 정규화, 응답에 해시 없음, 해시가 `$argon2id$`로 시작 — (2-E 확인: 422·대소문자 무시 409·응답에 해시 없음. HTTP 수준의 공백 정규화·`$argon2id$` 접두 검사는 아직 없음)
+- [x] 로그인 성공 200 + 쿠키, 없는 아이디와 틀린 비밀번호의 401 본문 동일 (2-E: DB 없는 테스트·실제 Argon2, PostgreSQL HTTP)
+- [x] 쿠키 속성: HttpOnly, SameSite=Lax, Path=/; `COOKIE_SECURE=true`면 Secure + `__Host-` 이름 (2-E)
+- [ ] 로그아웃 뒤 같은 쿠키로 `/auth/me` 401, 14일 지난 세션 401(시계 고정), 재로그인 시 토큰 교체 — (2-E 확인: 로그아웃 뒤 401·재로그인 시 제시된 세션만 교체. 14일 만료는 2-C DB 함수 수준만, HTTP 시계 고정 테스트는 아직 없음)
+- [x] CSRF: 헤더 없음·틀림 403, 맞으면 통과. 로그인 Origin 불일치 403 (2-E: logout·`require_csrf`·Origin. 데이터 경로 적용은 Phase 3)
+- [x] (2-D DB 함수 + 2-E HTTP) 시도 제한: 5회 실패 후 6번째 429 + `Retry-After`, 15분 뒤 해제, ~~성공 시 기록 삭제~~ → (2026-11-06 변경, `V7_SPEC.md` §29.5 변경 기록) 성공 시 **그 요청의 선기록만** 삭제(이전 실패는 창 만료로 해제), 없는 계정도 같은 규칙, 가입 IP 제한(201·409만 셈), 429는 기록하지 않음
+- [x] (2-D, DB 함수 수준 — HTTP 경로가 같은 함수를 쓴다) 동시성: 같은 username에 동시 로그인 실패 요청 N개(스레드)를 보내도 실패 기록이 한도를 넘어 통과하지 않음 (같은 username은 정확히 한도만큼, IP 규칙은 근사)
+- [x] (2-D 추가, 2-E HTTP 확인) `username_key`는 HMAC 30자(평문 없음), `AUTH_FAILURE_KEY` 운영 필수, Argon2 슬롯 혼잡·잠금 대기 초과 503(인증 없음), 슬롯 대기 초과 시 자기 선기록만 보상 삭제, 비정상 IP는 인증하지 않음
 - [ ] 다중 워커: `uvicorn --workers 2` 서버에 실패 요청을 나눠 보내도 한도 적용
-- [ ] `APP_ENV=production` + `COOKIE_SECURE` 미설정이면 시작 실패
-- [ ] `REGISTRATION_ENABLED=false`면 가입 403
+- [x] `APP_ENV=production` + `COOKIE_SECURE` 미설정이면 시작 실패 (2-E: 실제 lifespan 테스트)
+- [x] `REGISTRATION_ENABLED=false`면 가입 403 (2-E, 본문 검증 뒤·시도로 세지 않음)
 - [ ] UI: 로그인·가입·로그아웃, 오류 표시, 429 안내, 375px, 키보드
-- [ ] 기존 332 passed 유지
+- [x] 기존 332 passed 유지 (2-E 전체 회귀 1015 passed 안에 v6 테스트 전부 통과)
 
 하위 단계 (2026-11-05 설계 검토, 각 단계 보고·승인 후 진행)
 | 단계 | 내용 | 상태 |
 |---|---|---|
-| 2-A | Alembic `0002_auth_failures`, 모델, R-19 게이트 | **완료** (아래, `todo_dev` 0002 적용은 보류) |
+| 2-A | Alembic `0002_auth_failures`, 모델, R-19 게이트 | **완료** (아래, `todo_dev` 0002 적용 완료 2026-11-06) |
 | 2-B | `auth.py` DB 없는 순수 함수 + `tests/test_auth_unit.py` | **완료** (아래) |
 | 2-C | `db.py` 세션 저장·조회·삭제·만료 정리, 엔진 `hide_parameters` (`require_user`는 2-E) | **완료** (아래). 재로그인 교체 정책(잠정): `replace_token`이 가리키는 세션 하나만 삭제(그 세션의 사용자와 새 로그인 사용자가 달라도 같음), 양쪽 사용자의 다른 세션은 유지, 형식이 틀린 토큰이면 삭제 없음 |
-| 2-D | 시도 제한 (`auth_failures`, advisory lock, `Retry-After`, 클라이언트 IP) | **완료 — 로컬 커밋 대기** (아래, 2026-11-06 검증). 순수·DB 함수와 테스트(DB 없는 테스트·`todo_test` PostgreSQL 테스트). HTTP 연결은 2-E |
-| 2-E | `/auth/*` 4개 라우트, `require_user`, `get_db` 연결, 시작 가드(`load_settings`), 외부 Origin 결정 | 미완료 |
+| 2-D | 시도 제한 (`auth_failures`, advisory lock, `Retry-After`, 클라이언트 IP) | **완료 — 로컬 커밋 `7e3b80e`** (아래, 2026-11-06 검증). 순수·DB 함수와 테스트(DB 없는 테스트·`todo_test` PostgreSQL 테스트). HTTP 연결은 2-E |
+| 2-E | `/auth/*` 4개 라우트, `require_user`, `get_db` 연결, 시작 가드(`load_settings`), 외부 Origin 결정 | **완료 — 로컬 커밋 대기** (아래, 2026-11-06 검증). 외부 Origin은 요청 스킴·`Host`로 정했고 허용 호스트 목록은 R-23(열림) |
 | 2-F | 다중 워커 시도 제한 테스트 | 미완료 |
 | 2-G | 로그인·가입 UI, `api()` CSRF 헤더 (v6 화면 강제 로그인 게이트는 Phase 3까지 보류) | 미완료 |
 
-**2-D 구현·검증 완료 (2026-11-06, 로컬 커밋 대기)**
+**2-E 구현·검증 완료 (2026-11-06, 로컬 커밋 대기)**
+- 설계 A~F(2026-11-06 승인, 계약은 `V7_SPEC.md` §28.1 "Phase 2-E 구현"): 가입 409는 사전 조회 + SAVEPOINT(`uq_users_username`만 409, 다른 제약은 500)이고 409·429는 commit 뒤 응답, `finish_login_success`=False는 Tx2 rollback·500, rehash는 Tx2 전 트랜잭션 밖에서 계산하고 Tx2에서 기존 해시 조건부 UPDATE, 인증 경로 422는 입력값 제거·500은 고정 문구·로그는 사건·예외 종류·SQLSTATE만, 시작 가드는 lifespan, IP는 `request.client.host`만.
+- `main.py`: `/auth/register`·`/auth/login`·`/auth/logout`·`/auth/me`, 의존성 `auth_config`(시작 가드 결과)·`auth_session_factory`(트랜잭션마다 새 Session)·`require_same_origin`·`require_user`·`require_csrf`(데이터 경로 적용은 Phase 3), 인증 경로 422 처리기, 공통 오류 처리. v6 데이터 경로는 바꾸지 않았다(JSON, 인증 없음).
+- `db.py`: `username_exists`, `create_user`(SAVEPOINT, `UsernameTaken`), `update_password_hash_if_unchanged`, `is_lock_timeout` — commit 하지 않는다. `auth.py`·Alembic은 바꾸지 않았다.
+- 테스트: 새 `tests/test_auth_routes.py` **87개**(DB 없음, 가짜 Session·db 함수, 실제 엔진 생성 차단). `tests/test_api.py` 라우트 목록 = v6 + 인증 4개, v6 422 기본 형식 유지 1개. `tests/test_db_schema.py` 계약 변경(2026-11-06 승인): "import main 으로 db·sqlalchemy 미로드" → "import main 만으로 엔진 생성·DB 연결·Alembic 명령 없음, v6 경로는 JSON" — 새 격리 프로세스에서 감시 장치(자체 작동 확인 포함)로 검사. `tests/conftest.py` UI 서버 `APP_ENV=test`. `tests/test_db_postgres.py` HTTP 흐름 **12개** 추가(PostgreSQL 테스트 38 → **50**): 가입·me·logout, 실패 5회 뒤 429, 자기 선기록만 삭제, 409 commit, 실제 UNIQUE 경쟁(SAVEPOINT 409), 실제 NOT NULL 위반 500(409 아님), 동시 같은 이름 가입(201·409), rehash, 재로그인 세션 교체, Tx2 잠금 경합 503, HashBusy 보상, 자기 선기록 없음 500.
+- DB 없는 실행 결과(DB·`AUTH_FAILURE_KEY`·`APP_ENV` 환경변수 없음): `test_auth_routes.py` **87 passed**, 전체 회귀 **965 passed, 1 skipped, 3 deselected**(877 + 87 + 1; skipped 1은 `test_db_postgres.py`, 통과 아님).
+- `todo_test` 실행 결과(승인 실행 각 1회, 2026-11-06, 실행 전후 읽기 전용 점검: 0002·표 8·시퀀스 5·인덱스 18·타입 16·manifest 일치·게이트 `0002`·다른 세션 0·준비된 트랜잭션 0·연결 수 1·사용자 데이터 7개 표 0행·비슈퍼유저·연결 여유 96):
+  - PostgreSQL 단독 `pytest tests/test_db_postgres.py -m postgres -x -v -rP`: **50 passed**(실패 0·skip 0, 22.16초). 스키마 초기화 50회, R-19 게이트 함수 호출 53회.
+  - PostgreSQL 포함 전체 회귀 `pytest -m "not integration" -x -q`: **1015 passed, 0 failed, 0 skipped, 3 deselected**(175.23초). 스키마 초기화 50회, R-19 게이트 함수 호출 53회.
+  - 2-E 누적: 스키마 초기화 **100회**, R-19 게이트 함수 호출 **106회**. 게이트 호출 수는 별도 계측이 아니라 코드 구조(시작 1 + 테스트마다 지우기 전 1 × 50 + 테스트 안 읽기 전용 2)와 50개 모두 통과한 결과에 근거한 계산이다.
+  - 두 실행 모두 사후 `alembic_version` 0002, manifest 일치, **사용자 데이터 표 7개 모두 0행**, 다른 세션·잠금·준비된 트랜잭션 0, 남은 pytest 프로세스 없음. 동시성·잠금 테스트의 연결 정리 시간 초과·남은 스레드 없음. `todo.json` 불변, `task_templates.json` 없음.
+  - 실제 PostgreSQL UNIQUE·NOT NULL 위반에서 DETAIL·행 값·비밀번호·traceback이 HTTP 응답과 앱 로그에 없음을 테스트로 확인(단독 실행 로그 전체에서도 0건).
+- 앱 시작에 `APP_ENV` 등 설정이 필요해져 현재 운영 compose·Dockerfile 실행 명령으로는 시작이 거부된다(v7은 Phase 6·HTTPS 게이트 전에는 배포하지 않는다, §P10).
+- 남은 일: 2-F 다중 워커, 2-G 로그인 UI, Phase 3 데이터 경로 인증. 운영 전 결정: R-12(프록시 헤더), R-23(외부 Origin), R-24(요청 본문 크기). 남은 위험 R-19·R-26·R-27·R-30·R-31(§P12).
+
+**2-D 구현·검증 완료 (2026-11-06, 로컬 커밋 `7e3b80e`)**
 - 정책: §P0 "승인됨 (2026-11-06)"과 `V7_SPEC.md` §29.5(변경 기록 포함). 스키마·Alembic은 바꾸지 않았다(HMAC 30자는 VARCHAR(30), IPv6 /64는 VARCHAR(45)에 들어간다).
 - `auth.py`: 한도·창 상수, `LimitRule`·`LimitDecision`·`limit_decision`, `FailureKey`(repr·직렬화에 값 없음)·`load_failure_key`·`LoginName`·`login_name`, `InvalidClientAddress`·`normalize_client_ip`, `HashBusy`·`argon2_slot`(`BoundedSemaphore(2)`, 5초)·`verify_login_password`·`hash_password_limited`. 기존 함수와 `load_settings`는 바꾸지 않았다(`AUTH_FAILURE_KEY` 검사는 별도 함수 — 시작 가드 연결은 2-E).
 - `db.py`: `begin_login_attempt`(Tx1: `SET LOCAL lock_timeout '2s'` → READ COMMITTED 확인 → 잠금 → 세 규칙 → 선기록 → 해시 조회), `finish_login_success`·`cancel_login_attempt`(같은 잠금 → 자기 id만 삭제), `begin_register_attempt`, `purge_old_auth_failures`(SKIP LOCKED, 1000개씩), `lock_login_username`. commit 하지 않는다.
@@ -163,7 +178,7 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 - R-19 게이트(`db.verify_test_schema`): `fresh_schema`가 같은 트랜잭션에서 서버 확인 → 게이트 → `lock_timeout 5s` → `DROP SCHEMA` 순서로 실행하고, `engine` 픽스처도 처음에 한 번 확인한다. 허용 상태는 빈 스키마·base·0001·0002(리비전별 고정 목록, 오프라인 SQL과 일치를 테스트로 강제). 객체 종류·소유자·리비전·DB/스키마 소유자·함수·타입·확장·트리거·이벤트 트리거·같은 역할의 다른 세션(`pg_stat_activity`)과 **모든 역할의 연결 수(`pg_stat_database.numbackends` = 1)**를 확인하고, 어긋나거나 확인할 수 없으면 지우지 않고 세션을 멈춘다. 데이터는 알려진 표의 행 수만 센다.
 - 테스트: DB 없는 스키마 테스트 **146 passed**, DB 없는 전체 회귀 **669 passed, 1 skipped, 3 deselected**. `todo_test`(1회 승인 실행): PostgreSQL 테스트 **16 passed**, PostgreSQL 포함 전체 회귀 **685 passed, 3 deselected**. 스키마 초기화 32회·게이트 34회 모두 통과.
 - 종료 후 `todo_test`: `alembic_version` 0002, 표 8·시퀀스 5·인덱스 18, 사용자 데이터 0행, 게이트 판정 `0002`.
-- `todo_dev`는 0001에 머문다. 0002 적용(2-A4)은 2-E 직전에 별도 승인으로 한다(Phase 1과 같은 절차).
+- ~~`todo_dev`는 0001에 머문다. 0002 적용(2-A4)은 2-E 직전에 별도 승인으로 한다(Phase 1과 같은 절차).~~ → **2-A4 완료 (2026-11-06, 2-E 직전 별도 승인)**: `todo_dev`에 Alembic 0002를 1회 적용했다. 저장소 밖의 일회성 Python 래퍼가 Alembic CLI 진입점(`upgrade 0002`)을 호출하고, Alembic이 실제로 쓰는 연결에만 세션 한정 `lock_timeout=5s`·`statement_timeout=30s`를 기존 `-c TimeZone=UTC` 뒤에 덧붙였다(`PGOPTIONS`는 `db.make_engine`의 `options` 연결 인자에 가려 적용되지 않음을 확인해 쓰지 않았다). 그 연결의 첫 접속 훅에서 DDL 전에 대상·버전·두 타임아웃(설정 출처 `client`)·다른 세션 0을 확인했다. 적용 전 0001·7/4/14/14·사용자 데이터 0행, 적용 후 0002·표 8·시퀀스 5·인덱스 18·타입 16, 기존 열·제약·인덱스 불변, 모델과 차이 없음, 사용자 데이터 0행·`auth_failures` 0행. 서버·역할·DB 설정은 바꾸지 않았다.
 - R-19 잔여 위험은 §P12 R-19 행에 있다.
 
 ## P3. Phase 3 — 사용자별 데이터 분리와 접근 권한
@@ -395,23 +410,23 @@ stages {
 | R-9 | 롤백 시 v7 데이터 미표시 | §P6.4 (가입 제한·역내보내기·새 볼륨) |
 | R-10 | 통합 테스트 대상 `:5014`와 운영 `:5001` 불일치 | 대상 서버 확인 후 재작성 |
 | R-11 | 저장소에 개인정보로 보이는 값 | §P9 결정 |
-| R-12 | Docker NAT·프록시로 모든 요청이 같은 IP → IP 제한이 전역 제한이 됨 | Phase 2 격리 환경 확인, 프록시 헤더 신뢰 설정 |
+| R-12 | Docker NAT·프록시로 모든 요청이 같은 IP → IP 제한이 전역 제한이 됨 | Phase 2 격리 환경 확인, 프록시 헤더 신뢰 설정 (2-E, 2026-11-06) 앱은 ASGI `request.client.host`만 쓰고 `X-Forwarded-*`를 읽지 않는다. 그러나 uvicorn은 기본으로 프록시 헤더를 켜고 `--forwarded-allow-ips` 기본값(127.0.0.1)에서 온 연결의 `X-Forwarded-For`·`X-Forwarded-Proto`를 믿는다 — 같은 호스트의 로컬 프로세스나 로컬 리버스 프록시 구성에 따라 클라이언트 IP·스킴이 바뀔 수 있다. 현재 Dockerfile 실행 명령에는 이 설정이 명시되어 있지 않다. Docker NAT로 모든 요청이 같은 IP로 집계되는지 확인과 함께 **Phase 6에서 결정 (열림)** |
 | R-13 | 사용자 잠금(`FOR UPDATE`)으로 같은 사용자 동시 요청 지연 | 트랜잭션 짧게 유지, 사용자 단위라 다른 사용자에 영향 없음 |
 | R-14 | Argon2 해싱 CPU·메모리 비용 (가입·로그인 폭주) | 시도 제한이 검증 전에 차단, 비밀번호 최대 128자 |
 | R-15 | 이미지 크기·빌드 시간 증가 (psycopg binary, argon2) | Phase 6에서 측정 보고 |
 | R-16 | 로컬 `todo_dev`·`todo_test`는 Windows libc 로캘(`Korean_Korea.949`, `todo_test`는 2-A3 읽기 전용 점검에서 확인), 운영 예정 환경은 `C.UTF-8` → `lower(name)` 고유 인덱스·문자열 정렬이 일부 문자에서 다를 수 있음, 로캘 변경 시 텍스트 인덱스 REINDEX 필요 가능. `lc_messages` 한국어라 서버 오류 메시지가 깨져 보일 수 있음(동작 무관) | Phase 3 템플릿 이름 기준 테스트(§P3), Phase 6 C.UTF-8 재검증(§P11). 개발 DB를 운영으로 옮기지 않는다 |
 | R-17 | 로컬 PostgreSQL 18(5433)의 `listen_addresses = *` → 모든 네트워크 주소에서 연결 대기 | 사용자가 `pg_hba.conf`·Windows 방화벽 점검 또는 `listen_addresses`를 `127.0.0.1`로 제한 (사용자 설정, 미완료) |
 | R-18 | `todo_test`의 public 스키마를 테스트가 다시 만들어 소유자가 `pg_database_owner` → `todo_test_user`로 바뀌고 PUBLIC USAGE 권한이 없어짐 | 테스트 계정 전용 DB라 테스트 영향 없음. 원상 복구는 DB 관리자 작업이며 별도 승인 |
-| R-19 | PostgreSQL 테스트의 `DROP SCHEMA public CASCADE`는 스키마 소유자라면 다른 소유자의 객체까지 지운다 | **자동 게이트 구현 (2-A)**: 삭제 전 같은 트랜잭션에서 객체·소유자·리비전·연결 수(`numbackends` = 1)를 확인하고 어긋나면 멈춤(§P2 2-A). 게이트가 있어도 `todo_test` 실행은 계속 실행마다 승인받는다. **잔여 위험**: ① 확인과 삭제 사이의 몇 ms 틈에 새로 접속해 커밋까지 끝낸 객체는 막지 못함(PostgreSQL에 스키마 생성 차단 잠금이 없음) ② 게이트는 관계·함수·타입·확장·트리거·이벤트 트리거만 센다 — 통계 객체·연산자·콜레이션·텍스트 검색 객체 등은 미검사(2-A3 실측 0개) ③ 이름·종류·소유자 기준이라 CHECK 내용·기본값 같은 정의 수준 차이는 비교하지 않음 ④ 다른 역할의 세션이 `numbackends`에 잡히는지는 같은 역할 2번째 연결로만 실측했고 다른 역할로 직접 재현하지 않음 |
+| R-19 | PostgreSQL 테스트의 `DROP SCHEMA public CASCADE`는 스키마 소유자라면 다른 소유자의 객체까지 지운다 | **자동 게이트 구현 (2-A)**: 삭제 전 같은 트랜잭션에서 객체·소유자·리비전·연결 수(`numbackends` = 1)를 확인하고 어긋나면 멈춤(§P2 2-A). 게이트가 있어도 `todo_test` 실행은 계속 실행마다 승인받는다. **잔여 위험**: ① 확인과 삭제 사이의 몇 ms 틈에 새로 접속해 커밋까지 끝낸 객체는 막지 못함(PostgreSQL에 스키마 생성 차단 잠금이 없음) ② 게이트는 관계·함수·타입·확장·트리거·이벤트 트리거만 센다 — 통계 객체·연산자·콜레이션·텍스트 검색 객체 등은 미검사(2-A3 실측 0개) ③ 이름·종류·소유자 기준이라 CHECK 내용·기본값 같은 정의 수준 차이는 비교하지 않음 ④ 다른 역할의 세션이 `numbackends`에 잡히는지는 같은 역할 2번째 연결로만 실측했고 다른 역할로 직접 재현하지 않음 (2-E, 2026-11-06) PostgreSQL 테스트가 50개로 늘어 실행당 초기화 50회·게이트 호출 53회. 2-E HTTP 테스트 12개는 모두 실제로 commit 한다 — 단독(`-k`)·중단 시 합성 `users`·`sessions`·`auth_failures` 행이 남을 수 있다(복구는 승인 후 `rolled_back` 테스트 하나로 초기화, 수동 삭제 금지). 2-E 단독·전체 회귀 각 1회 모두 0행으로 끝났다. 파괴적 초기화이므로 실행마다 별도 승인 (열림) |
 | R-20 | 1-B 검증은 로컬 Python 3.14 기준, Docker 이미지는 Python 3.13 | Phase 6 이미지 안에서 전체 테스트 (§P11) |
-| R-21 | FastAPI 기본 422 응답은 Pydantic 오류의 `input`을 돌려준다 → 가입·로그인 검증 실패 시 **비밀번호 원문이 응답 본문에 실릴 수 있음** | 2-E에서 인증 경로의 422 응답에서 입력값을 빼고, 비밀번호가 응답·로그에 없음을 테스트 |
-| R-22 | `APP_ENV` 미설정이면 `development`로 동작 (가입 허용, Secure 쿠키 아님) | 운영 compose에 `APP_ENV=production`·`COOKIE_SECURE=true` 필수(§P10). Phase 6 배포 검증에서 확인. 빈 값은 시작 오류 |
-| R-23 | 기대 Origin을 요청 `Host`·스킴에서 만들면 DNS 리바인딩·Host 위조·TLS 종단 프록시에서 잘못 판정할 수 있음 | 2-E에서 외부 Origin 결정 방식(허용 호스트 목록 또는 공개 Origin 설정, 프록시 헤더 신뢰 범위)을 정하고 테스트 |
-| R-24 | 비밀번호 검증 경로에 길이 상한이 없으면 아주 긴 입력으로 Argon2 비용을 쓰게 할 수 있음 (5MB 입력 검증 약 0.2초) | **`auth.py` 방어선 완료 (2-B)**: 128자·512바이트 초과·인코딩 불가 입력은 Argon2에 넘기지 않음(테스트 포함). **남은 일 (2-E)**: HTTP 요청 본문 크기 제한, 인증 API 422 오류 응답 처리(R-21과 함께) |
+| R-21 | FastAPI 기본 422 응답은 Pydantic 오류의 `input`을 돌려준다 → 가입·로그인 검증 실패 시 **비밀번호 원문이 응답 본문에 실릴 수 있음** | 2-E에서 인증 경로의 422 응답에서 입력값을 빼고, 비밀번호가 응답·로그에 없음을 테스트 **완료 (2-E, 2026-11-06, 로컬 커밋 대기)**: 인증 경로 전용 422 처리기가 `input`·`ctx`를 빼고 `loc`·`msg`·`type`만 돌려준다(v6 경로는 기본 형식 유지). DB 없는 테스트로 비밀번호 비노출 확인 |
+| R-22 | `APP_ENV` 미설정이면 `development`로 동작 (가입 허용, Secure 쿠키 아님) | 운영 compose에 `APP_ENV=production`·`COOKIE_SECURE=true` 필수(§P10). Phase 6 배포 검증에서 확인. 빈 값은 시작 오류 (2-E) 시작 가드: `APP_ENV` 미설정이면 `AUTH_FAILURE_KEY`가 필수라 키 없이는 시작하지 않는다. 키가 있으면 development로 동작하는 점은 그대로 — 운영 compose 필수값(§P10)은 Phase 6 (열림) |
+| R-23 | 기대 Origin을 요청 `Host`·스킴에서 만들면 DNS 리바인딩·Host 위조·TLS 종단 프록시에서 잘못 판정할 수 있음 | 2-E에서 외부 Origin 결정 방식(허용 호스트 목록 또는 공개 Origin 설정, 프록시 헤더 신뢰 범위)을 정하고 테스트 (2-E) 현재 구현은 ASGI scope의 스킴(`request.url.scheme`)과 `Host` 헤더로 기대 Origin을 만든다(앱은 `X-Forwarded-*`를 읽지 않음). 허용 호스트 목록·공개 Origin 설정은 구현하지 않았다 — Host 위조·TLS 종단 프록시 판정 문제는 **열림**, HTTPS 게이트(§P7) 전 Phase 6에서 R-12와 함께 결정 |
+| R-24 | 비밀번호 검증 경로에 길이 상한이 없으면 아주 긴 입력으로 Argon2 비용을 쓰게 할 수 있음 (5MB 입력 검증 약 0.2초) | **`auth.py` 방어선 완료 (2-B)**: 128자·512바이트 초과·인코딩 불가 입력은 Argon2에 넘기지 않음(테스트 포함). **남은 일 (2-E)**: HTTP 요청 본문 크기 제한, 인증 API 422 오류 응답 처리(R-21과 함께) (2-E) 인증 API 422 처리 완료(R-21), 로그인 본문 필드는 1024자 구조 상한(넘으면 422, 그 안의 규칙 위반은 401). 요청 본문 전체 크기 제한은 구현하지 않았다 — **열림** (Phase 6 리버스 프록시 또는 별도 결정) |
 | R-25 | `urlsplit`이 탭·개행과 앞쪽 제어 문자를 지워, `http://test\tserver` 같은 비정상 Origin·Referer도 정상 값으로 판정됨 (브라우저는 보내지 않는 값이라 CSRF 우회 경로는 아님, 낮음) | **완료 (2-B)**: 파싱 전에 출력 가능한 ASCII(0x21~0x7E) 밖의 문자를 거부(지우지 않음), 제어 문자·비ASCII 거부와 정상 Origin·Referer 회귀 테스트 |
-| R-26 | 사용자당 동시 세션 수 상한이 없음 → 정상 로그인을 반복하면 `sessions` 행이 쌓인다(만료 14일 뒤 로그인·가입 때 정리) | 2-C 결정: 이번에는 상한 없음(명세에 없음). 로그인 시도 제한(2-D)·정리(`purge_expired_sessions`)로 완화. 상한이 필요하면 별도 결정. (2-D 확인) 시도 제한은 성공하지 않은 시도만 세므로 **성공 로그인 반복은 막지 않는다** — 이 위험은 그대로 |
-| R-27 | `hide_parameters=True`는 SQLAlchemy 가 만드는 오류 문자열·로그의 바인드 값만 숨긴다. 드라이버(PostgreSQL)의 오류 DETAIL(예: 중복 키 값)이나 앱이 직접 남기는 로그는 막지 못함 | 세 층으로 나눠 관리: ① SQLAlchemy 바인드 값 — `hide_parameters`로 숨김(실패 조건으로 테스트) ② PostgreSQL DETAIL — 중복 키 오류에 `token_hash`(토큰 원문이 아닌 SHA-256)가 실릴 수 있음 ③ 앱 로그·HTTP 응답 — 2-E에서 로그 설정과 500 응답 본문에 오류 내용이 나가지 않는지 확인. 세션 함수는 값을 로그·예외 메시지에 넣지 않음(테스트로 확인). **2-C3 관찰(2026-11-06, `todo_test`)**: ① 바인드 값 숨김 확인(`hide_parameters=True` 표시) · 세션 토큰 원문·CSRF 원문(기존 세션·두 번째 INSERT 모두)은 예외 문자열·DETAIL에 없음 ② `postgres_detail_contains_token_hash=True` — DETAIL에 `token_hash`가 실림을 확인(값은 출력하지 않음) ③ 미검증(2-E). users 고유 제약 위반 DETAIL에도 username 이 실릴 수 있음 → 2-E에서 중복을 먼저 조회해 409로 처리. **미해결(열림)** — ③ 확인 전까지 해결로 보지 않는다. (2-D 보강) `auth_failures`는 UNIQUE가 없어 중복 키 DETAIL은 없지만 CHECK 위반 DETAIL("Failing row contains …")에는 행 값(HMAC 키·IP)이 실린다. 코드는 `kind`를 고정값으로 넣어 정상 경로에서는 생기지 않는다. 잠금 대기 초과(55P03) 메시지에는 행 값이 없다. 2-D `todo_test` 실행(2026-11-06)에서도 `postgres_detail_contains_token_hash=True` 관찰이 같았다(값은 출력하지 않음) — 계속 미해결 |
+| R-26 | 사용자당 동시 세션 수 상한이 없음 → 정상 로그인을 반복하면 `sessions` 행이 쌓인다(만료 14일 뒤 로그인·가입 때 정리) | 2-C 결정: 이번에는 상한 없음(명세에 없음). 로그인 시도 제한(2-D)·정리(`purge_expired_sessions`)로 완화. 상한이 필요하면 별도 결정. (2-D 확인) 시도 제한은 성공하지 않은 시도만 세므로 **성공 로그인 반복은 막지 않는다** — 이 위험은 그대로 (2-E) HTTP 연결 후에도 사용자당 세션 수 상한은 없다 — 그대로 (열림) |
+| R-27 | `hide_parameters=True`는 SQLAlchemy 가 만드는 오류 문자열·로그의 바인드 값만 숨긴다. 드라이버(PostgreSQL)의 오류 DETAIL(예: 중복 키 값)이나 앱이 직접 남기는 로그는 막지 못함 | 세 층으로 나눠 관리: ① SQLAlchemy 바인드 값 — `hide_parameters`로 숨김(실패 조건으로 테스트) ② PostgreSQL DETAIL — 중복 키 오류에 `token_hash`(토큰 원문이 아닌 SHA-256)가 실릴 수 있음 ③ 앱 로그·HTTP 응답 — 2-E에서 로그 설정과 500 응답 본문에 오류 내용이 나가지 않는지 확인. 세션 함수는 값을 로그·예외 메시지에 넣지 않음(테스트로 확인). **2-C3 관찰(2026-11-06, `todo_test`)**: ① 바인드 값 숨김 확인(`hide_parameters=True` 표시) · 세션 토큰 원문·CSRF 원문(기존 세션·두 번째 INSERT 모두)은 예외 문자열·DETAIL에 없음 ② `postgres_detail_contains_token_hash=True` — DETAIL에 `token_hash`가 실림을 확인(값은 출력하지 않음) ③ 미검증(2-E). users 고유 제약 위반 DETAIL에도 username 이 실릴 수 있음 → 2-E에서 중복을 먼저 조회해 409로 처리. **미해결(열림)** — ③ 확인 전까지 해결로 보지 않는다. (2-D 보강) `auth_failures`는 UNIQUE가 없어 중복 키 DETAIL은 없지만 CHECK 위반 DETAIL("Failing row contains …")에는 행 값(HMAC 키·IP)이 실린다. 코드는 `kind`를 고정값으로 넣어 정상 경로에서는 생기지 않는다. 잠금 대기 초과(55P03) 메시지에는 행 값이 없다. 2-D `todo_test` 실행(2026-11-06)에서도 `postgres_detail_contains_token_hash=True` 관찰이 같았다(값은 출력하지 않음) — 계속 미해결 (2-E 검증, 2026-11-06) ③ 인증 HTTP 경로: 422 입력값 제거, 500·503 고정 문구, 로그는 사건·예외 종류·SQLSTATE만(traceback 없음). DB 없는 테스트와 실제 PostgreSQL UNIQUE·NOT NULL 위반 HTTP 테스트(단독·전체 회귀 각 1회)로 **인증 HTTP 응답·앱 로그 비노출을 확인**했다. 드라이버 예외 자체에는 DETAIL이 계속 실릴 수 있고(①②, `token_hash` 관찰 동일), Phase 3 데이터 경로는 아직 확인하지 않았으며, Alembic을 앱과 같은 프로세스에서 실행하면 `fileConfig`가 앱 로거를 끄는 현상은 테스트에서만 보완했다 — **열림 유지** |
 | R-28 | (2-D) `AUTH_FAILURE_KEY`가 워커·컨테이너마다 다르면 username 기준 제한이 워커별로 나뉜다(코드로 검출 불가). 키를 바꾸면 username 카운터가 초기화된다 | 운영 compose·secret 한 곳에서 모든 워커에 같은 값(§P10 변경안에 추가 예정). 교체는 드물게·점검 시간에, 교체 직후 1회 예산 초기화는 수용. 공개 개발용 키는 운영에서 거부, `APP_ENV` 미설정이면 키 필수 |
 | R-29 | (2-D) 선기록 방식의 오차단: 검증 중인 선기록도 한도에 세므로 같은 사용자의 동시 요청(더블클릭)이 한도 근처에서 429. 성공해도 이전 실패는 15분 창이 지나야 풀린다. 서버 중단·Tx2 실패 시 1회 과다 집계 | 승인된 의미 변경(`V7_SPEC.md` §29.5 변경 기록). 우회 방지를 우선. 성공 시 초기화가 꼭 필요해지면 상태 열(새 리비전)이 필요 — 별도 결정 |
-| R-30 | (2-D) Argon2 슬롯(프로세스당 2개, 5초)이 차면 정상 사용자도 503. 가입은 해시 동안 DB 연결을 잡는다(가입 트랜잭션 1개 유지 — 가입 제한·운영 가입 비활성 D-13으로 완화) | Phase 6에서 운영 서버 코어·메모리·Argon2 시간을 측정해 슬롯 수 조정. 503은 인증 없음(우회 없음). 로그인은 보상 Tx로 검증하지 않은 시도를 세지 않는다 |
-| R-31 | (2-D) PostgreSQL 동시성 테스트(스레드 10·25개)는 NullPool 연결을 여러 개 열고 커밋한다 → R-19 게이트의 `numbackends = 1`·종료 후 0행 조건과 맞물림 | 테스트마다 `finally`에서 `dispose`, 커밋 테스트는 마지막에 두지 않음(마지막은 `rolled_back`). 실행마다 승인. (2026-11-06 보강·검증) `connect_timeout`·비-daemon 스레드·남은 스레드 실패 처리·연결 정리 대기(최대 10초, 읽기만)를 넣고 단독 1회·전체 회귀 1회 모두 경합·남은 스레드 없이 0행으로 끝났다. **남은 위험(열림)**: 커밋하는 테스트 3개(잠금 직렬화 1행, 동시성 5행·20~25행)를 단독(`-k`)으로 돌리거나 중간에 실패하면 합성 `auth_failures` 행이 남는다(복구는 승인 후 `rolled_back` 테스트 하나로 초기화, 수동 삭제 금지). `statement_timeout`이 없어 서버에서 문장이 멈추면 대기 상한이 없다. 2회 실행으로 불안정성이 없다고 보장하지 않는다 |
+| R-30 | (2-D) Argon2 슬롯(프로세스당 2개, 5초)이 차면 정상 사용자도 503. 가입은 해시 동안 DB 연결을 잡는다(가입 트랜잭션 1개 유지 — 가입 제한·운영 가입 비활성 D-13으로 완화) | Phase 6에서 운영 서버 코어·메모리·Argon2 시간을 측정해 슬롯 수 조정. 503은 인증 없음(우회 없음). 로그인은 보상 Tx로 검증하지 않은 시도를 세지 않는다 (2-E) 가입 경로를 정책대로 구현했다(트랜잭션 1개 안에서 해시, 연결 보유). 동시 같은 이름 가입은 고유 인덱스 대기가 `lock_timeout` 2초를 넘으면 503이 된다. PostgreSQL 테스트의 동시 가입 2건은 2초 안에 끝났다. 슬롯 수 조정은 Phase 6 (열림) |
+| R-31 | (2-D) PostgreSQL 동시성 테스트(스레드 10·25개)는 NullPool 연결을 여러 개 열고 커밋한다 → R-19 게이트의 `numbackends = 1`·종료 후 0행 조건과 맞물림 | 테스트마다 `finally`에서 `dispose`, 커밋 테스트는 마지막에 두지 않음(마지막은 `rolled_back`). 실행마다 승인. (2026-11-06 보강·검증) `connect_timeout`·비-daemon 스레드·남은 스레드 실패 처리·연결 정리 대기(최대 10초, 읽기만)를 넣고 단독 1회·전체 회귀 1회 모두 경합·남은 스레드 없이 0행으로 끝났다. **남은 위험(열림)**: 커밋하는 테스트 3개(잠금 직렬화 1행, 동시성 5행·20~25행)를 단독(`-k`)으로 돌리거나 중간에 실패하면 합성 `auth_failures` 행이 남는다(복구는 승인 후 `rolled_back` 테스트 하나로 초기화, 수동 삭제 금지). `statement_timeout`이 없어 서버에서 문장이 멈추면 대기 상한이 없다. 2회 실행으로 불안정성이 없다고 보장하지 않는다 (2-E) 동시 가입 HTTP 테스트·Tx2 잠금 경합 테스트도 NullPool·`run_concurrently`·연결 정리 대기를 쓴다. 2-E 단독 1회·전체 회귀 1회 모두 경합·남은 스레드 없음. 실행 횟수가 적어 불안정성이 없다고 보장하지 않으며 `statement_timeout` 미설정도 그대로 (열림) |

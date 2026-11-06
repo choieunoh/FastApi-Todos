@@ -188,6 +188,23 @@ v6의 기본순은 `todo.json`의 배열 순서다. 새 항목·다음 반복 �
 - 응답에 `password_hash`·세션 토큰 원문을 넣지 않는다.
 - (Phase 2-D 정책, 2026-11-06) 로그인의 422는 **본문 구조 오류**(필드 누락, 문자열이 아님, 크기 상한 초과)만이다. username 형식 오류·비밀번호 길이 초과·없는 계정·틀린 비밀번호·깨진 해시는 모두 같은 401이고 시도로 기록한다(§29.5). 가입의 username·password 규칙 위반은 그대로 422다.
 - (Phase 2-D 정책) 인증 경로의 검사 순서: Origin(403) → 본문 구조(422) → (가입) 비활성(403) → 시도 제한(429) → 처리(401·409·201·200). DB 오류는 500, 잠금 대기 초과와 해시 슬롯 혼잡은 503이며 어느 경우에도 세션을 발급하지 않는다. 응답 연결은 Phase 2-E.
+- (Phase 2-E 구현, 2026-11-06 — 구현·검증 완료, 로컬 커밋 대기) 실제 응답 계약:
+
+  | 경로 | 성공 | 실패 (검사 순서) |
+  |---|---|---|
+  | POST `/auth/register` | 201 `{id, username, csrf_token}` + 쿠키 | Origin 불일치 403 → 본문·규칙 위반 422 → 가입 비활성 403 → 시도 초과 429(`Retry-After` 정수 초) → 중복 409. 해시 슬롯 혼잡·잠금 대기 초과(SQLSTATE 55P03) 503, 그 밖의 DB 오류·IP가 아닌 클라이언트 500 |
+  | POST `/auth/login` | 200 `{id, username, csrf_token}` + 쿠키 | Origin 403 → 본문 구조 422(필드 누락·문자열 아님·필드당 1024자 초과·JSON 아님) → 429 → 실패는 유형과 관계없이 **같은 401** → 503·500 |
+  | POST `/auth/logout` | 204 + 쿠키 삭제 (세션 없음·만료·형식 오류여도 204) | 유효한 세션이 있는데 `X-CSRF-Token`이 없거나 다름 403(세션 유지). DB 오류 500, 55P03 503 |
+  | GET `/auth/me` | 200 `{id, username, csrf_token}` | 세션 없음·만료 401. DB 오류 500, 55P03 503 |
+
+  - 가입은 트랜잭션 1개다. 시도 제한 판정·기록 → 중복 사전 조회 → 해시 → SAVEPOINT 안 사용자 INSERT → 만료 세션 정리 → 세션 생성 → commit. 409·429는 블록을 정상 종료(commit)한 **뒤** 응답하므로 409의 가입 시도 기록은 남는다(201·409만 센다). 동시 가입 경쟁의 UNIQUE 위반은 제약 이름이 `uq_users_username`일 때만 409이고, 다른 제약 위반은 rollback 후 500이다. 해시 슬롯 혼잡·55P03은 rollback 후 503(세지 않음).
+  - 로그인은 Tx1(`begin_login_attempt`, commit 후 Session·연결 반환) → **DB 연결·잠금 없이** Argon2 검증 → Tx2(`finish_login_success` → 필요하면 저장된 해시가 그대로일 때만 rehash UPDATE → 만료 세션 정리 → 세션 생성 → commit)다. 검증 중 해시 슬롯 혼잡은 보상 Tx(자기 선기록만 삭제) 후 503이고, 보상이 실패해도 503이다(선기록은 남는다). rehash용 새 해시는 Tx2 전에 트랜잭션 밖에서 계산하며 그때의 슬롯 혼잡은 rehash만 건너뛴다. `finish_login_success`가 False(자기 선기록 없음)이거나 rehash UPDATE·세션 생성 등 Tx2의 DB 오류면 Tx2를 rollback 하고 500(55P03은 503)이며 선기록은 실패로 남는다.
+  - 세션 쿠키와 성공 본문은 commit이 끝난 뒤에만 만든다. 로그인·가입 때 요청 쿠키의 세션만 교체한다(§29.2).
+  - 오류 정보: 인증 경로의 422는 `loc`·`msg`·`type`만 돌려주고 입력값(`input`)·`ctx`·비밀번호를 넣지 않는다. v6 경로의 422는 FastAPI 기본 형식 그대로다. 500·503은 고정 문구이고, 응답·로그에 예외 문자열·PostgreSQL DETAIL·traceback·비밀번호·토큰·해시를 넣지 않는다(로그는 사건·예외 종류·SQLSTATE만). 예상하지 못한 예외는 401·409로 바꾸지 않고 500이다.
+  - 시작 가드(lifespan): `auth.load_settings`·`auth.load_failure_key`, 운영이면 `DATABASE_URL` 존재(연결하지 않음). 틀리면 시작을 거부한다. 공개 대체 키는 `APP_ENV`가 development·test로 명시된 경우만이며 경고 로그에 값을 넣지 않는다. 시작 가드를 거치지 않은 앱에서 인증 경로는 500이다.
+  - 클라이언트 IP는 ASGI `request.client.host`만 `auth.normalize_client_ip`에 넘긴다. IP가 아니면 DB에 접근하지 않고 500이다. `X-Forwarded-For`·`X-Real-IP`·`Forwarded`는 읽지 않는다(uvicorn 프록시 헤더 설정은 `V7_PLAN.md` R-12, Phase 6).
+  - `require_user`·`require_csrf` 의존성은 `/auth/me`·`/auth/logout`에서 쓴다. v6 데이터 경로 적용은 Phase 3이다.
+  - 검증: DB 없는 인증 라우트 테스트 87개, `todo_test` PostgreSQL HTTP 테스트 12개(실제 UNIQUE·NOT NULL 위반의 응답·로그 비노출 포함), PostgreSQL 포함 전체 회귀 1015 passed·3 deselected(수치는 `V7_PLAN.md` §P2).
 
 ### 28.2 기존 API (경로·메서드·성공 상태 코드 유지)
 v6의 사용자 데이터 경로 15개는 모두 **로그인 필수**이고 자기 데이터만 다룬다.
@@ -259,6 +276,7 @@ v6의 사용자 데이터 경로 15개는 모두 **로그인 필수**이고 자�
 - `/auth/login`·`/auth/register`는 세션 전이므로 `Origin`(없으면 `Referer`)이 외부에서 본 요청 Origin과 같아야 한다. 다르면 403 (login CSRF 방지). 둘 다 없으면 허용(브라우저 아닌 클라이언트).
   - 비교는 정규화한 **스킴·호스트·포트**가 모두 같은지로 한다(기본 포트 생략 동일, 문자열 접두사 비교 금지). `null`·경로가 붙은 Origin·사용자 정보·파싱 실패는 거부한다.
   - 외부에서 본 요청 Origin(스킴과 호스트를 무엇으로 볼지, 프록시 헤더 신뢰 범위)은 Phase 2-E에서 정한다. 그전까지 `X-Forwarded-*`는 신뢰하지 않는다.
+  - (Phase 2-E 구현) 기대 Origin은 ASGI scope의 스킴(`request.url.scheme`)과 `Host` 헤더로 만들고, 앱은 `X-Forwarded-*`를 읽지 않는다. 허용 호스트 목록·공개 Origin 설정은 아직 없다(`V7_PLAN.md` R-23, Phase 6에서 결정).
 - SameSite=Lax와 JSON 본문 요구(`Content-Type: application/json`이 아니면 422)는 추가 방어선이다.
 - 내보내기 `<a download>`는 GET이라 CSRF 헤더가 필요 없다.
 
@@ -313,7 +331,7 @@ v6의 사용자 데이터 경로 15개는 모두 **로그인 필수**이고 자�
 
 **책임 경계**: Phase 2-D = `auth.py` 순수 함수(판정·키·IP 정규화·슬롯)와 `db.py` DB 함수(잠금·검사·기록·삭제·정리, commit 하지 않음). Phase 2-E = 실제 IP 결정, 트랜잭션 구성, 429·500·503과 `Retry-After` 응답, 시작 가드.
 
-**검증 상태 (2026-11-06)**: Phase 2-D 함수는 구현·검증 완료, 로컬 커밋 대기. DB 없는 테스트와 `todo_test` PostgreSQL 테스트(단독 38 passed, 전체 회귀 915 passed·3 deselected)로 확인했다(수치·횟수는 `V7_PLAN.md` §P2). 이 절의 HTTP 동작(429·500·503 응답, `Retry-After` 헤더, 가입 409 집계, 시작 거부)은 2-E에서 구현·검증하며 아직 미완료다.
+**검증 상태 (2026-11-06)**: Phase 2-D 함수는 구현·검증 완료, 로컬 커밋 `7e3b80e`. DB 없는 테스트와 `todo_test` PostgreSQL 테스트(단독 38 passed, 전체 회귀 915 passed·3 deselected)로 확인했다(수치·횟수는 `V7_PLAN.md` §P2). 이 절의 HTTP 동작(429·500·503 응답, `Retry-After` 헤더, 가입 409 집계, 시작 거부, 클라이언트 IP 결정)은 Phase 2-E에서 구현·검증했다(§28.1 "Phase 2-E 구현", 로컬 커밋 대기). 이 절의 제한 정책 자체는 바꾸지 않았다.
 - 시각은 `main.now()`를 써서 테스트에서 고정할 수 있다.
 
 ### 29.6 운영 공개 조건 (HTTPS 게이트)
@@ -321,6 +339,7 @@ v6의 사용자 데이터 경로 15개는 모두 **로그인 필수**이고 자�
 - `APP_ENV=production`이면 `COOKIE_SECURE=true`가 아닐 때 앱이 시작을 거부한다(설정 실수로 평문 HTTP에 세션 쿠키가 나가는 것 방지).
 - `REGISTRATION_ENABLED`(기본 `false` in production, `true` in dev/test, D-13): 운영 공개 직후에는 가입을 막고 이전 소유자 계정만 쓴다. 가입 공개는 별도 승인.
 - (Phase 2-D) `AUTH_FAILURE_KEY`: 운영에서 없거나 형식이 틀리면 시작을 거부한다(§29.5). 비밀값이라 저장소·로그에 넣지 않는다.
+- (Phase 2-E) 위 시작 거부 조건(`APP_ENV`·`COOKIE_SECURE`·`REGISTRATION_ENABLED`·`AUTH_FAILURE_KEY`, 운영이면 `DATABASE_URL` 존재)은 앱 시작 단계(lifespan)에 연결했다(§28.1).
 - 운영 공개 전 확인 목록은 `V7_PLAN.md` §P7.
 
 ## 30. UI 변경 (index.html 1개 유지)
