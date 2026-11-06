@@ -103,7 +103,7 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 3. `main.py`: `/auth/register`, `/auth/login`, `/auth/logout`, `/auth/me`.
 4. `index.html`: 로그인·가입 화면, 헤더 사용자명·로그아웃, `api()`의 CSRF 헤더·401 처리.
    - 이 Phase에서는 데이터 API를 아직 막지 않는다(기존 테스트 유지). 2-G는 로그인·가입 UI를 추가하되, 로그인하지 않아도 기존 v6 앱 영역과 목록 불러오기를 그대로 유지한다(`V7_SPEC.md` §30 과도기 예외). 강제 로그인 게이트는 Phase 3에서 적용한다.
-5. Docker 포트 공개 시 원래 클라이언트 IP가 보이는지 격리 환경에서 확인(R-12).
+5. Docker 포트 공개 시 원래 클라이언트 IP가 보이는지 격리 환경에서 확인(R-12) — (2026-11-06 결정) **Phase 6으로 이관, 면제가 아니다.** Phase 2에서는 앱 수준의 IP 처리(신뢰된 ASGI `request.client.host`만 사용, 프록시 헤더 무시, IP 정규화)를 구현·테스트로 검증했다. Docker 포트 공개·프록시 경로의 실제 클라이언트 IP 전달은 **미검증**이며 §P11에서 검증하고, 통과 전에는 운영에 공개하지 않는다(§P7). R-12는 열림.
 
 테스트·완료 기준 (T-A)
 - [x] 가입: 길이·문자 규칙 422, 대소문자 무시 중복 409, 공백 정규화, 응답에 해시 없음, 해시가 `$argon2id$`로 시작 — (2-E 확인: 422·대소문자 무시 409·응답에 해시 없음. T-A 잔여 2026-11-06: HTTP 수준의 공백 정규화·`$argon2id$` 접두 — DB 없는 R1~R4, PostgreSQL P1, 아래 블록)
@@ -140,6 +140,8 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 | 2-E | `/auth/*` 4개 라우트, `require_user`, `get_db` 연결, 시작 가드(`load_settings`), 외부 Origin 결정 | **완료 — 로컬 커밋 `bbe5227`** (아래, 2026-11-06 검증). 외부 Origin은 요청 스킴·`Host`로 정했고 허용 호스트 목록은 R-23(열림) |
 | 2-F | 다중 워커 시도 제한 테스트 | **검증 완료 — 로컬 커밋 `53d7534`** (아래, 2026-11-06). 테스트만 추가, 운영 코드·워커 수 설정 변경 없음 |
 | 2-G | 로그인·가입 UI, `api()` CSRF 헤더 (v6 화면 강제 로그인 게이트는 Phase 3까지 보류) | **2-G1 구현·검증 완료** (아래, 2026-11-06). 강제 로그인 게이트는 Phase 3(미완료) |
+
+**Phase 2 상태 (2026-11-06)**: 승인된 범위(2-A~2-G1, T-A)의 구현·검증 완료. R-12(Docker·프록시 실환경 클라이언트 IP) 검증은 Phase 6으로 이관했고 **아직 미검증**이다(§P7·§P11). 이 상태는 R-12 해결이나 운영 공개 가능을 뜻하지 않는다.
 
 **2-G1 로그인·가입 UI 구현·검증 완료 (2026-11-06)**
 - 범위: `fastapi-app/templates/index.html`(HTML·CSS·JS)과 새 `tests/test_ui_auth.py`. 서버 코드·기존 테스트·마이그레이션은 바꾸지 않았다. `V7_SPEC.md` §30 과도기 예외대로 로그인하지 않아도 v6 앱 영역과 목록 불러오기를 유지한다 — **강제 로그인 게이트와 데이터 API 인증은 Phase 3이고 미완료**, 사용자별 데이터 격리도 아직 없다.
@@ -355,7 +357,7 @@ python migrate_json.py diff      <v6 JSON 폴더 A> <v6 JSON 폴더 B 또는 --o
 - [ ] `REGISTRATION_ENABLED=false`
 - [ ] DB 비밀번호가 저장소에 없음 (Jenkins Credentials 또는 서버의 권한 600 `.env`)
 - [ ] PostgreSQL 포트 외부 미공개 (`ports` 없음)
-- [ ] 시도 제한이 실제 클라이언트 IP로 동작 (R-12)
+- [ ] 시도 제한이 실제 클라이언트 IP로 동작 (R-12, 2026-11-06 Phase 2에서 이관 — 검증 절차는 §P11). 확인할 것: 서로 다른 실제 출발지 IP가 Docker·프록시 경로에서 의도치 않게 같은 IP로 집계되지 않는다(같은 공인 IP를 공유하는 클라이언트는 구분되지 않을 수 있다는 한계는 인정한다), 신뢰하지 않는 출처의 `X-Forwarded-For`로 클라이언트가 IP 제한을 우회할 수 없다, 신뢰한 프록시가 전달한 주소만 명시적 신뢰 설정(`--forwarded-allow-ips`)에 따라 반영된다, 실제 IP 기준으로 시도 제한이 분리되어 동작한다. 통과 전에는 운영에 공개하지 않는다.
 
 ## P8. 기존 테스트 유지·변경 계획
 ### 8.1 기준
@@ -434,6 +436,7 @@ stages {
 - 전체 pytest(integration 제외), Alembic 왕복, 이미지 빌드(`alembic/`·`db.py`·`auth.py` 포함, `tests/` 제외 확인).
 - Python 3.13(Docker 이미지)과 C.UTF-8 PostgreSQL에서 DB 테스트·`lower(name)`·정렬 관련 테스트 재실행 (R-16, R-20). 로컬 1-B 검증은 Python 3.14·Windows 로캘 기준이다.
 - 격리 Compose 프로젝트(`fastapi-v7test`, `127.0.0.1` 포트, 테스트 볼륨)에서 postgres+앱 실행, 컨테이너 재생성 후 데이터 유지(C5), `/metrics` 확인.
+- (R-12, 2026-11-06 Phase 2에서 이관 — 계획만, 실행은 Phase 6 승인 후) 클라이언트 IP 실환경 검증: 운영과 프로젝트·컨테이너·볼륨 이름과 호스트 포트가 겹치지 않는 전용 Compose 프로젝트, 운영·개발·기존 `todo_test`와 분리된 일회용 PostgreSQL(외부 `ports` 없음), `APP_ENV=test`와 합성 키·계정. 이미지 안 uvicorn 버전과 프록시 헤더 기본값(`proxy_headers`, `forwarded_allow_ips`)을 기록한다. 외부 호스트, 같은 호스트의 localhost·LAN IP, 같은 Compose 네트워크의 다른 컨테이너에서 요청하고, 각 경우에 `X-Forwarded-For` 위조 요청의 영향을 확인한다. 관찰은 uvicorn 접근 로그와 일회용 DB의 `auth_failures.client_ip`로만 하고 앱에 디버그 엔드포인트를 넣지 않는다. 서로 다른 출발지 IP의 시도 제한이 분리되는지 확인한다. 운영 프록시 구성이 정해지면 프록시 + `--proxy-headers --forwarded-allow-ips=<프록시 주소>`의 명시적 신뢰 범위로 반복한다. 포트 5432·운영 DB·기존 Compose 프로젝트(`fastapi_todos`·`fastapi-v7dev` 등)는 쓰지 않는다. 판정 기준은 §P7 R-12 항목이다.
 - OWASP 재점검: A01 접근 제어(격리 매트릭스), A07 인증 실패(시도 제한·세션), CSRF, 보안 헤더, 의존성 CVE.
 - 문서: README(실행·DB·이전·백업·롤백), CLAUDE.md DoD 체크, `RELEASE_NOTES.md` 7.0.0, Jenkins 변경안.
 - `test_integration.py` 재작성. 실행은 승인 후.
@@ -452,7 +455,7 @@ stages {
 | R-9 | 롤백 시 v7 데이터 미표시 | §P6.4 (가입 제한·역내보내기·새 볼륨) |
 | R-10 | 통합 테스트 대상 `:5014`와 운영 `:5001` 불일치 | 대상 서버 확인 후 재작성 |
 | R-11 | 저장소에 개인정보로 보이는 값 | §P9 결정 |
-| R-12 | Docker NAT·프록시로 모든 요청이 같은 IP → IP 제한이 전역 제한이 됨 | Phase 2 격리 환경 확인, 프록시 헤더 신뢰 설정 (2-E, 2026-11-06) 앱은 ASGI `request.client.host`만 쓰고 `X-Forwarded-*`를 읽지 않는다. 그러나 uvicorn은 기본으로 프록시 헤더를 켜고 `--forwarded-allow-ips` 기본값(127.0.0.1)에서 온 연결의 `X-Forwarded-For`·`X-Forwarded-Proto`를 믿는다 — 같은 호스트의 로컬 프로세스나 로컬 리버스 프록시 구성에 따라 클라이언트 IP·스킴이 바뀔 수 있다. 현재 Dockerfile 실행 명령에는 이 설정이 명시되어 있지 않다. Docker NAT로 모든 요청이 같은 IP로 집계되는지 확인과 함께 **Phase 6에서 결정 (열림)** (2-F, 2026-11-06) 다중 워커 테스트는 `--no-proxy-headers` 구성에서만 실행했다(모든 요청 127.0.0.1). uvicorn 기본 프록시 헤더 설정과 실제 프록시 신뢰 범위는 검증하지 않았다 — Phase 6에서 결정 (열림) |
+| R-12 | Docker NAT·프록시로 모든 요청이 같은 IP → IP 제한이 전역 제한이 됨 | Phase 2 격리 환경 확인, 프록시 헤더 신뢰 설정 (2-E, 2026-11-06) 앱은 ASGI `request.client.host`만 쓰고 `X-Forwarded-*`를 읽지 않는다. 그러나 uvicorn은 기본으로 프록시 헤더를 켜고 `--forwarded-allow-ips` 기본값(127.0.0.1)에서 온 연결의 `X-Forwarded-For`·`X-Forwarded-Proto`를 믿는다 — 같은 호스트의 로컬 프로세스나 로컬 리버스 프록시 구성에 따라 클라이언트 IP·스킴이 바뀔 수 있다. 현재 Dockerfile 실행 명령에는 이 설정이 명시되어 있지 않다. Docker NAT로 모든 요청이 같은 IP로 집계되는지 확인과 함께 **Phase 6에서 결정 (열림)** (2-F, 2026-11-06) 다중 워커 테스트는 `--no-proxy-headers` 구성에서만 실행했다(모든 요청 127.0.0.1). uvicorn 기본 프록시 헤더 설정과 실제 프록시 신뢰 범위는 검증하지 않았다 — Phase 6에서 결정 (열림) (2026-11-06, 현재 기준) §P2 작업 5를 Phase 6으로 이관 — 실환경 검증은 §P11, 운영 공개 차단은 §P7. 위 2-E 기록의 기본 신뢰 주소 "127.0.0.1"은 보정한다: 로컬 uvicorn 0.54.0 소스 확인 결과 `FORWARDED_ALLOW_IPS`가 없으면 `127.0.0.1,::1`이다. `requirements.txt`는 `uvicorn[standard]>=0.54.0`(하한만)이므로 실제 이미지 안의 버전·기본값을 다시 확인한다. 현재 VDI의 Windows Docker Desktop(서비스 중지) 결과만으로는 운영 Linux 호스트의 네트워크 동작을 확정할 수 없다. 미검증 (열림) |
 | R-13 | 사용자 잠금(`FOR UPDATE`)으로 같은 사용자 동시 요청 지연 | 트랜잭션 짧게 유지, 사용자 단위라 다른 사용자에 영향 없음 |
 | R-14 | Argon2 해싱 CPU·메모리 비용 (가입·로그인 폭주) | 시도 제한이 검증 전에 차단, 비밀번호 최대 128자 |
 | R-15 | 이미지 크기·빌드 시간 증가 (psycopg binary, argon2) | Phase 6에서 측정 보고 |

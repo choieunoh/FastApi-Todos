@@ -325,7 +325,7 @@ v6의 사용자 데이터 경로 15개는 모두 **로그인 필수**이고 자�
 **클라이언트 IP**
 - 실제 주소는 2-E에서 신뢰된 ASGI `client` 값으로만 정한다. 기본은 소켓 주소이고, 리버스 프록시 뒤에서는 uvicorn `--proxy-headers --forwarded-allow-ips=<프록시 주소>`로만 프록시 헤더를 믿는다. 앱 코드는 요청 헤더·본문에서 IP를 읽지 않는다.
 - 정규화(`auth.normalize_client_ip`): IPv4는 주소 그대로, IPv4-mapped IPv6는 IPv4로, IPv6는 /64 네트워크로 묶고 zone ID는 버린다. IP가 아닌 값(없음, `testclient`, 형식 오류)은 `InvalidClientAddress`로 인증을 처리하지 않는다(2-E에서 500).
-- Docker 포트 공개 시 원래 IP가 보존되는지 확인한다(모두 같은 IP로 보이면 IP 규칙이 전역 제한이 된다 — R-12).
+- Docker 포트 공개 시 원래 IP가 보존되는지 확인한다(모두 같은 IP로 보이면 IP 규칙이 전역 제한이 된다 — R-12). 확인 시점은 Phase 6이며 격리 Docker 환경에서 한다(`V7_PLAN.md` §P11). 통과 전에는 운영에 공개하지 않는다(`V7_PLAN.md` §P7).
 
 **Argon2 동시 실행**: 프로세스당 `threading.BoundedSemaphore(2)`. 실제 검증·더미 검증·가입 해시 모두 슬롯 안에서만 Argon2를 실행한다(검증할 수 없는 입력은 슬롯 없이 바로 실패). 5초 안에 슬롯을 못 얻으면 `HashBusy` → 503, 인증·세션 발급 없음. 로그인은 보상 트랜잭션(같은 잠금 → 자기 선기록 id만 삭제)으로 검증에 들어가지 않은 시도를 지운다. 보상이 실패하면 선기록은 남는다.
 
