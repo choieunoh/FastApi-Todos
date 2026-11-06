@@ -44,7 +44,7 @@ FastApi_Todos/
     ├── auth.py                 # (7.0.0 Phase 2-B·2-D) 순수 인증 함수: 설정·입력 검증·Argon2id·토큰·CSRF 비교·Origin 판정·쿠키 속성, (2-D) 제한 판정·Retry-After·username HMAC 키·IP 정규화·Argon2 슬롯 (DB·라우트 없음). 트랜잭션 구성·429·503 응답·`require_user`·라우트 연결은 main.py(2-E)
     ├── migrate_json.py         # (7.0.0 예정) JSON → PostgreSQL 이전·검증·역내보내기·diff CLI
     ├── alembic.ini, alembic/   # (7.0.0 Phase 1·2-A) 스키마 마이그레이션, 리비전 versions/0001_initial.py·0002_auth_failures.py (DATABASE_URL로 접속)
-    ├── templates/index.html    # UI 전체
+    ├── templates/index.html    # UI 전체. (7.0.0 Phase 2-G1) 접힌 로그인·가입 패널, 헤더 사용자명·로그아웃, `api()` CSRF·401 처리 — 비로그인에도 v6 앱 유지(Phase 3 전 과도기)
     ├── todo.json               # 데이터
     ├── requirements.txt        # 런타임 의존성 (fastapi, starlette, uvicorn, prometheus 계측 + 7.0.0 sqlalchemy·psycopg·alembic·argon2-cffi)
     ├── requirements-dev.txt    # 테스트 의존성
@@ -54,6 +54,7 @@ FastApi_Todos/
         ├── conftest.py         # 실제 todo.json 보호, UI 테스트용 임시 서버, (7.0.0) TEST_DATABASE_URL 고정 대상 검사
         ├── test_api.py         # TestClient (A, 5.0.0 API)
         ├── test_ui.py          # Playwright (B, 5.0.0 UI)
+        ├── test_ui_auth.py     # (7.0.0 Phase 2-G1) 로그인·가입 UI Playwright, `/auth/*`는 라우트 모킹 (DB 없음)
         ├── test_db_schema.py   # (7.0.0) DB 없이 도는 스키마·보호 장치 테스트
         ├── test_db_postgres.py # (7.0.0) PostgreSQL 테스트 DB(todo_test) 통합 테스트, TEST_DATABASE_URL 없으면 skip
         └── test_integration.py # 배포 서버 대상, `pytest -m integration`
@@ -474,7 +475,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - [x] 2-D. 시도 제한(D-12 채택, 선기록 방식, HMAC username_key, IPv6 /64, Argon2 슬롯, 503) 순수·DB 함수 — **구현·검증 완료(2026-11-06), 로컬 커밋 `7e3b80e`**. DB 없는 `tests/test_auth_limits.py` 128 passed, `todo_test` PostgreSQL 단독 **38 passed**, PostgreSQL 포함 전체 회귀 **915 passed·3 deselected**(실패 0·skip 0), 종료 후 `todo_test` 0002·R-19 통과·사용자 데이터 7개 표 0행. 정책은 `V7_SPEC.md` §29.5(변경 기록 포함), 수치·횟수는 `V7_PLAN.md` §P2. HTTP 연결(429·500·503 응답, 가입 409 집계, 시작 가드 등)은 2-E이고 미완료다. R-26·R-27·R-31은 열려 있다.
   - [x] 2-E. `/auth/register`·`/auth/login`·`/auth/logout`·`/auth/me`, 시작 가드(lifespan), 로그인 Tx1 → 연결 없는 Argon2 → Tx2·보상 Tx, 가입 409 commit(SAVEPOINT, `uq_users_username`만 409), 429·500·503·`Retry-After`, 인증 422 입력값 제거, `request.client.host` IP — **구현·검증 완료(2026-11-06), 로컬 커밋 `bbe5227`**. DB 없는 `tests/test_auth_routes.py` 87 passed, `todo_test` PostgreSQL 단독 **50 passed**(HTTP 12개 추가), PostgreSQL 포함 전체 회귀 **1015 passed·3 deselected**(실패 0·skip 0), 종료 후 `todo_test` 0002·R-19 통과·사용자 데이터 7개 표 0행. 실제 PostgreSQL 오류 DETAIL의 응답·앱 로그 비노출 확인. 계약은 `V7_SPEC.md` §28.1, 수치는 `V7_PLAN.md` §P2. R-12·R-19·R-26·R-27·R-30·R-31은 열려 있다.
   - [x] 2-F. 다중 워커 간 시도 제한 공유 검증(테스트만 추가, 운영 코드·워커 수 설정 변경 없음) — **검증 완료(2026-11-06), 로컬 커밋 `53d7534`**. 독립 uvicorn 단일 워커 프로세스 2개(A1~A4: 사용자·IP 제한 공유, 동시 10개 401 정확히 5·429 정확히 5, 세션·CSRF 공유)와 실제 `uvicorn --workers 2`(B1~B3: 워커 2개 확인, 요청 분산 관찰, 서로 다른 워커의 실패 합산). `todo_test` PostgreSQL 단독 **55 passed**, PostgreSQL 포함 전체 회귀 **1020 passed·3 deselected**, 종료 후 사용자 데이터 0행·테스트용 프로세스 잔존 0. 수치·실행 이력은 `V7_PLAN.md` §P2. R-12·R-19·R-28·R-31은 열려 있다.
-  - [ ] 2-G(로그인 UI) — `V7_PLAN.md` §P2. Phase 2 전체는 미완료, 원격 push는 보류.
+  - [x] 2-G1. 로그인·가입 UI(접힌 진입 버튼 `#auth-open`, 폼 펼침·포커스, 로그인·가입 전환, `auth-error`·429 "약 N분", 메모리 CSRF, `/auth/` 외 401 무효화, 늦은 `/auth/me` 응답 무시, 로그아웃) — **구현·검증 완료(2026-11-06)**. 과도기 예외(`V7_SPEC.md` §30): 비로그인에도 v6 앱·목록 유지, 강제 로그인 게이트·데이터 API 인증·사용자별 격리는 Phase 3(미완료). 칸반 드래그 회귀를 막으려고 접힘 상태 세로 높이를 상쇄했다(A+B 보정: 폼 → 템플릿 8px, 템플릿 → 통계 8px, [칸반] 버튼 717.9/752.7px 유지, 종·진입 버튼 `outline-offset` 0) — 이 배치를 바꾸면 칸반 드래그 3개와 화면 실측을 다시 한다. 검증: 칸반 집중 3 passed, `tests/test_ui_auth.py` **31 passed**, `tests/test_ui.py` **125 passed**, DB 없는 전체 회귀 **996 passed·1 skipped·3 deselected**(31·125는 996에 포함, skipped는 PostgreSQL 모듈). **PostgreSQL 실DB 테스트 55개는 2-G1에서 실행하지 않았다**(마지막 실DB 검증은 2-F). 수치·위험은 `V7_PLAN.md` §P2 2-G1 블록, R-32·R-33.
+  - [ ] T-A 잔여(Phase 2 완료 전 별도 단계): 가입의 HTTP 수준 공백 정규화·`$argon2id$` 접두 검사, 고정 시계로 14일 만료 HTTP 검사. Phase 2 전체는 미완료, 원격 push는 보류.
 - [ ] 3. 15개 데이터 경로 인증 필수, 익명 401·타 사용자 404 매트릭스, bulk·restore 격리, 템플릿 이름 사용자별, soft delete·position, 동시 요청.
 - [ ] 4. v6 기능 전체를 DB·인증 위에서 통과(기존 테스트는 픽스처만 교체, 변경 목록은 `V7_PLAN.md` §P8.3), 사용자별 알림 키, 두 사용자 UI 격리, `Version 7.0.0`.
 - [ ] 5. `migrate_json.py` import·verify·export-v6·diff, 백업 사본 리허설 2회, 원본 해시 불변, `pg_dump` 복원 검증, 내용 미출력.
