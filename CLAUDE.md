@@ -40,8 +40,8 @@ FastApi_Todos/
 ├── scripts/dev-postgres-init/  # (7.0.0, 선택) Docker 개발 DB 첫 기동 때 테스트 DB 생성 SQL
 └── fastapi-app/
     ├── main.py                 # API + 모델 + 저장 로직 (7.0.0: 라우트·Pydantic 모델·순수 로직)
-    ├── db.py                   # (7.0.0 Phase 1·2-A·2-C) 엔진·ORM 7개(2-A `auth_failures`)·세션·테스트 DB 보호·삭제 전 스키마 게이트(R-19)·downgrade 보호, (2-C) 로그인 세션 저장·조회·삭제·만료 정리(commit 은 호출자). 소유자 조건 헬퍼는 Phase 3 예정
-    ├── auth.py                 # (7.0.0 Phase 2-B) 순수 인증 함수: 설정·입력 검증·Argon2id·토큰·CSRF 비교·Origin 판정·쿠키 속성 (DB·라우트 없음). 세션 저장은 db.py(2-C), 시도 제한은 2-D, `require_user`·라우트 연결은 main.py(2-E) 예정
+    ├── db.py                   # (7.0.0 Phase 1·2-A·2-C·2-D) 엔진·ORM 7개(2-A `auth_failures`)·세션·테스트 DB 보호·삭제 전 스키마 게이트(R-19)·downgrade 보호, (2-C) 로그인 세션 저장·조회·삭제·만료 정리, (2-D) 시도 제한 잠금·검사·선기록·자기 id 삭제·정리 (모두 commit 은 호출자). 소유자 조건 헬퍼는 Phase 3 예정
+    ├── auth.py                 # (7.0.0 Phase 2-B·2-D) 순수 인증 함수: 설정·입력 검증·Argon2id·토큰·CSRF 비교·Origin 판정·쿠키 속성, (2-D) 제한 판정·Retry-After·username HMAC 키·IP 정규화·Argon2 슬롯 (DB·라우트 없음). 트랜잭션 구성·429·503 응답·`require_user`·라우트 연결은 main.py(2-E) 예정
     ├── migrate_json.py         # (7.0.0 예정) JSON → PostgreSQL 이전·검증·역내보내기·diff CLI
     ├── alembic.ini, alembic/   # (7.0.0 Phase 1·2-A) 스키마 마이그레이션, 리비전 versions/0001_initial.py·0002_auth_failures.py (DATABASE_URL로 접속)
     ├── templates/index.html    # UI 전체
@@ -380,6 +380,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - (7.0.0) 외부 서버에 POST·DELETE를 보내므로 `pytest -m integration`을 포함해 **명시적 승인 없이 실행하지 않는다.**
 - (7.0.0) 운영 데이터 사본(백업 JSON, `pg_dump`, 개발 DB)은 커밋하지 않고, 출력·로그·보고에 내용(제목·설명·태그)을 넣지 않는다. 테스트 데이터는 합성 값만 쓴다(`V7_SPEC.md` §32).
 - (7.0.0) 비밀번호·해시·세션 토큰·CSRF 토큰은 로그·응답(정해진 필드 외)에 남기지 않는다. DB 비밀번호는 저장소에 넣지 않는다.
+  - (Phase 2-D) 시도 제한용 비밀키 `AUTH_FAILURE_KEY`(base64url, 32바이트 이상)도 같은 비밀값이다: 저장소·`.env.dev.example`·로그·예외·응답에 값을 넣지 않고, 운영은 필수(없으면 시작 거부), 모든 워커가 같은 값을 쓴다. 공개 개발용 대체 키는 `APP_ENV`가 `development`·`test`로 명시된 경우에만 쓴다. `auth_failures`에는 평문 username 대신 이 키의 HMAC 값만 저장한다.
 - `tests/`와 `requirements-dev.txt`는 Docker 이미지에 넣지 않는다 (`.dockerignore`).
 - 사용자 입력은 계속 `textContent`로 출력한다. 사용자 데이터에 `innerHTML`을 쓰지 않는다.
 
@@ -397,7 +398,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-toggle`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `template-load`, `template-edit`, `template-delete`, `template-name`, `template-save`, `template-edit-form`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`, `calendar-chip`
   - v6: `view-stats`, `dash-total`, `dash-completed`, `dash-active`, `dash-overdue`, `dash-rate`, `dash-trend`, `dash-trend-summary`, `dash-trend-table`, `dash-excluded`, `dash-priority`, `dash-compliance`, `dash-basis`, `kanban`, `kanban-column`(`data-status="active"|"completed"`), `kanban-count`, `kanban-card`(`data-id`), `kanban-move`, `kanban-status`, `notification-bell`, `notification-badge`, `notification-panel`, `notification-item`(`data-category`, `data-todo-id`), `notification-read-all`, `notification-live` `theme-select`, `status-message`. 목록 항목(`todo-item`)에는 `data-id`가 있다. 칸반 카드 안의 태그·배지·진행률·D-day·즐겨찾기는 목록과 같은 testid(`todo-tag`, `recurrence-badge`, `subtask-progress`, `dday`, `favorite-toggle`)를 쓴다.
   - v7: `auth-panel`, `login-form`, `auth-mode-toggle`, `auth-username`, `auth-password`, `auth-submit`, `auth-error`, `current-user`, `logout`
-- (7.0.0) **Python DB**: SQLAlchemy 2.x 스타일(`DeclarativeBase`, `Mapped[]`, `select()`)을 쓴다. 요청마다 세션 1개·트랜잭션 1개이고, 사용자 데이터 조회는 `db.py`의 소유자 조건 헬퍼로만 한다. 스키마 변경은 Alembic 리비전으로만 한다(앱 시작 시 `create_all` 금지).
+- (7.0.0) **Python DB**: SQLAlchemy 2.x 스타일(`DeclarativeBase`, `Mapped[]`, `select()`)을 쓴다. 요청마다 세션 1개·트랜잭션 1개이고(예외: 로그인 경로는 선기록 Tx1 → 트랜잭션 밖 Argon2 → 성공 Tx2 또는 보상 Tx로 나눈다 — Argon2 동안 DB 연결·잠금을 잡지 않기 위해, 2026-11-06 승인, `V7_SPEC.md` §29.5), 사용자 데이터 조회는 `db.py`의 소유자 조건 헬퍼로만 한다. 스키마 변경은 Alembic 리비전으로만 한다(앱 시작 시 `create_all` 금지).
 - **커밋**: Conventional Commits 형식이다 (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
   - 기능 커밋 예: `feat: add favorites for Version 5.0.0`
 
@@ -470,7 +471,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - [x] 2-B. DB 없는 순수 인증 함수(`auth.py`)와 단위 테스트(`tests/test_auth_unit.py` 191 passed, 전체 604 passed·1 skipped·3 deselected, 2026-11-05, 로컬 커밋 `b4d3ad4`). API·화면에는 아직 연결하지 않았다.
   - [x] 2-A. `auth_failures` 모델·Alembic `0002`, PostgreSQL 테스트 삭제 전 스키마 게이트(R-19, 연결 수 교차 확인). DB 없는 회귀 669 passed·1 skipped·3 deselected, `todo_test` PostgreSQL 16 passed·PostgreSQL 포함 회귀 685 passed·3 deselected(2026-11-05). `todo_dev`는 0001 그대로(0002 미적용).
   - [x] 2-C. `db.py` 로그인 세션 저장·조회·삭제·만료 정리(SHA-256만 저장, 14일 고정, 재로그인은 제시된 세션 하나만 교체, commit 은 호출자), 엔진 `hide_parameters`. DB 없는 회귀 749 passed·1 skipped·3 deselected, `todo_test` PostgreSQL 27 passed·PostgreSQL 포함 회귀 776 passed·3 deselected, 종료 후 `todo_test` 0002·사용자 데이터 0행. Phase 2-C 구현·검증 완료(2026-11-06). `require_user`는 2-E. R-27(오류 DETAIL의 `token_hash`)은 미해결.
-  - [ ] 2-D(시도 제한), 2-E(`/auth/*` 라우트·`require_user`·시작 가드), 2-F(다중 워커), 2-G(로그인 UI) — `V7_PLAN.md` §P2. Phase 2 전체는 미완료, `todo_dev`는 아직 Alembic 0001(0002 미적용), 원격 push는 보류.
+  - [x] 2-D. 시도 제한(D-12 채택, 선기록 방식, HMAC username_key, IPv6 /64, Argon2 슬롯, 503) 순수·DB 함수 — **구현·검증 완료(2026-11-06), 로컬 커밋 대기**. DB 없는 `tests/test_auth_limits.py` 128 passed, `todo_test` PostgreSQL 단독 **38 passed**, PostgreSQL 포함 전체 회귀 **915 passed·3 deselected**(실패 0·skip 0), 종료 후 `todo_test` 0002·R-19 통과·사용자 데이터 7개 표 0행. 정책은 `V7_SPEC.md` §29.5(변경 기록 포함), 수치·횟수는 `V7_PLAN.md` §P2. HTTP 연결(429·500·503 응답, 가입 409 집계, 시작 가드 등)은 2-E이고 미완료다. R-26·R-27·R-31은 열려 있다.
+  - [ ] 2-E(`/auth/*` 라우트·`require_user`·시작 가드·로그인 트랜잭션 구성·429/503 응답), 2-F(다중 워커), 2-G(로그인 UI) — `V7_PLAN.md` §P2. Phase 2 전체는 미완료, `todo_dev`는 아직 Alembic 0001(0002 미적용), 원격 push는 보류.
 - [ ] 3. 15개 데이터 경로 인증 필수, 익명 401·타 사용자 404 매트릭스, bulk·restore 격리, 템플릿 이름 사용자별, soft delete·position, 동시 요청.
 - [ ] 4. v6 기능 전체를 DB·인증 위에서 통과(기존 테스트는 픽스처만 교체, 변경 목록은 `V7_PLAN.md` §P8.3), 사용자별 알림 키, 두 사용자 UI 격리, `Version 7.0.0`.
 - [ ] 5. `migrate_json.py` import·verify·export-v6·diff, 백업 사본 리허설 2회, 원본 해시 불변, `pg_dump` 복원 검증, 내용 미출력.

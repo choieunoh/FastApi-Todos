@@ -11,13 +11,13 @@ import binascii
 import os
 import re
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from functools import lru_cache
 
 from sqlalchemy import (
     CHAR, BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Identity, Index, Integer,
-    LargeBinary, MetaData, String, Text, UniqueConstraint, create_engine, delete, func, select, text,
+    LargeBinary, MetaData, String, Text, UniqueConstraint, create_engine, delete, func, insert, select, text,
 )
 
 import auth                                      # 순수 함수만 (auth 는 db 를 import 하지 않는다)
@@ -154,8 +154,9 @@ class AuthFailure(Base):                         # (Phase 2-A) 로그인 실패�
     # users 와 연결하지 않는다 — 없는 계정에 대한 시도도 기록해야 한다
     id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
     kind: Mapped[str] = mapped_column(String(8), nullable=False)
-    username_key: Mapped[str | None] = mapped_column(String(30), nullable=True)   # 정규화한 username, 담을 수 없는 형식은 null
-    client_ip: Mapped[str] = mapped_column(String(45), nullable=False)           # 정규화한 개별 IP 주소 문자열
+    # (2-D) 정규화한 username 의 HMAC 30자(auth.FailureKey) — 평문 username 은 저장하지 않는다. 형식 오류·가입은 null
+    username_key: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    client_ip: Mapped[str] = mapped_column(String(45), nullable=False)   # auth.normalize_client_ip (IPv4 주소, IPv6 /64)
     created_at: Mapped[datetime] = utc_timestamp(nullable=False)
 
 
@@ -561,3 +562,156 @@ def purge_expired_sessions(db: Session, now: datetime) -> int:
     # 모든 사용자의 만료 세션(expires_at <= now)을 지우고 지운 수를 돌려준다 (로그인·가입 때 부른다)
     _require_aware(now)
     return db.execute(delete(UserSession).where(UserSession.expires_at <= now)).rowcount
+
+
+# ---------- 로그인·가입 시도 제한 (Phase 2-D, V7_SPEC §29.5) ----------
+# 로그인은 트랜잭션을 나눈다 (CLAUDE.md 의 로그인 경로 예외). 트랜잭션 구성·commit 은 호출자(2-E main.py)가 한다:
+#   Tx1  begin_login_attempt   — 잠금 → 검사 → (허용이면) 선기록 INSERT → 해시 조회 → COMMIT
+#        (트랜잭션 밖) auth.verify_login_password — Argon2 동안 DB 연결·잠금을 잡지 않는다
+#   성공 Tx2  finish_login_success — 같은 잠금 → 자기 선기록 id 만 삭제 → (세션 생성) → COMMIT
+#   실패      아무것도 하지 않는다 — 선기록이 실패 기록으로 남는다
+#   슬롯 대기 초과(auth.HashBusy)  보상 Tx  cancel_login_attempt — 같은 잠금 → 자기 선기록 id 만 삭제 → COMMIT
+# - 이전 실패와 다른 요청의 선기록은 지우지 않는다. 그래서 "검증에 들어간 시도는 성공이 확인되기 전까지 기록이 남는다"
+#   (같은 username 의 판정이 정확하려면 이 불변식이 필요하다). 프로세스 종료·Tx2 실패면 선기록은 실패로 남는다(fail-closed).
+# - 전제: READ COMMITTED, 잠금은 SET LOCAL 다음 첫 문장. 같은 username 은 잠금으로 직렬화, IP 규칙은 근사(잠금 없음).
+# - 모든 함수는 commit·rollback 하지 않고 DB 오류를 그대로 올린다. 키는 auth.LoginName 의 HMAC 값만 쓴다.
+
+AUTH_LOCK_TIMEOUT = "2s"                         # Tx1·Tx2 는 ms 단위 — 오래 기다리면 오류(55P03)로 실패(fail-closed)
+AUTH_FAILURE_PURGE_BATCH = 1000                  # 한 번에 정리하는 24시간 지난 기록 수
+LOGIN_LOCK_PREFIX = "login:"
+_SET_AUTH_LOCK_TIMEOUT = text(f"SET LOCAL lock_timeout = '{AUTH_LOCK_TIMEOUT}'")
+_SHOW_ISOLATION = text("SHOW transaction_isolation")
+_LOGIN_LOCK_SQL = text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_prefix || :username_key, 0))")
+
+
+@dataclass(frozen=True)
+class LoginAttempt:                              # begin_login_attempt 결과
+    decision: auth.LimitDecision
+    attempt_id: int | None                       # 선기록 id — 차단(429)이면 None (기록하지 않는다)
+    user_id: int | None                          # 계정이 없거나 형식 오류면 None
+    password_hash: str | None = field(repr=False)
+
+
+@dataclass(frozen=True)
+class RegisterAttempt:                           # begin_register_attempt 결과
+    decision: auth.LimitDecision
+    attempt_id: int | None
+
+
+def _begin_auth_transaction(db: Session) -> None:
+    # 잠금 대기 상한 + READ COMMITTED 확인 (다른 격리 수준이면 잠금 뒤에도 앞 요청의 기록이 안 보일 수 있다)
+    db.execute(_SET_AUTH_LOCK_TIMEOUT)
+    level = db.execute(_SHOW_ISOLATION).scalar_one()
+    if level != "read committed":
+        raise DatabaseConfigError("시도 제한은 READ COMMITTED 트랜잭션에서만 동작합니다")
+
+
+def lock_login_username(db: Session, username_key: str) -> None:
+    # 같은 username(HMAC 키)의 시도를 트랜잭션 끝까지 직렬화한다 (xact 잠금 — 커밋·롤백 때 풀린다). 값은 바인드로만
+    if not isinstance(username_key, str) or len(username_key) != auth.USERNAME_KEY_LENGTH:
+        raise ValueError("username_key 형식이 아닙니다")
+    db.execute(_LOGIN_LOCK_SQL.bindparams(lock_prefix=LOGIN_LOCK_PREFIX, username_key=username_key))
+
+
+def _newest_failure_times(db: Session, *conditions: object, since: datetime, limit: int) -> list[datetime]:
+    # 창 안(created_at > since)의 최신 limit 개 시각 — auth.limit_decision 에 충분하다
+    return list(db.execute(
+        select(AuthFailure.created_at).where(*conditions, AuthFailure.created_at > since)
+        .order_by(AuthFailure.created_at.desc()).limit(limit)
+    ).scalars())
+
+
+def _login_rules(db: Session, name: auth.LoginName, client_ip: str, now: datetime) -> list[auth.LimitRule]:
+    since = now - auth.LOGIN_WINDOW
+    login = AuthFailure.kind == "login"
+    rules = []
+    if name.failure_key is not None:
+        by_user = AuthFailure.username_key == name.failure_key
+        rules.append(auth.LimitRule(auth.LOGIN_LIMIT_USER_IP, auth.LOGIN_WINDOW, _newest_failure_times(
+            db, login, by_user, AuthFailure.client_ip == client_ip, since=since, limit=auth.LOGIN_LIMIT_USER_IP)))
+        rules.append(auth.LimitRule(auth.LOGIN_LIMIT_USER, auth.LOGIN_WINDOW, _newest_failure_times(
+            db, login, by_user, since=since, limit=auth.LOGIN_LIMIT_USER)))
+    rules.append(auth.LimitRule(auth.LOGIN_LIMIT_IP, auth.LOGIN_WINDOW, _newest_failure_times(
+        db, login, AuthFailure.client_ip == client_ip, since=since, limit=auth.LOGIN_LIMIT_IP)))
+    return rules
+
+
+def _check_login_name(name: auth.LoginName) -> None:
+    if not isinstance(name, auth.LoginName) or (name.username is None) != (name.failure_key is None):
+        raise ValueError("auth.login_name 결과가 필요합니다")
+
+
+def _record_attempt(db: Session, kind: str, username_key: str | None, client_ip: str, now: datetime) -> int:
+    purge_old_auth_failures(db, now)             # 기록할 때 정리한다 (§29.5)
+    return db.execute(insert(AuthFailure).values(
+        kind=kind, username_key=username_key, client_ip=client_ip, created_at=now,
+    ).returning(AuthFailure.id)).scalar_one()
+
+
+def begin_login_attempt(db: Session, name: auth.LoginName, client_ip: str, now: datetime) -> LoginAttempt:
+    # Tx1. 차단이면 아무것도 쓰지 않는다(429 는 기록하지 않음). 허용이면 선기록을 넣고 해시를 읽는다.
+    # username 형식 오류(name 이 None 쌍)는 잠금·사용자 조회 없이 IP 규칙만 — 계정이 될 수 없는 입력이다
+    _require_aware(now)
+    _check_login_name(name)
+    _begin_auth_transaction(db)
+    if name.failure_key is not None:
+        lock_login_username(db, name.failure_key)
+    decision = auth.limit_decision(_login_rules(db, name, client_ip, now), now)
+    if not decision.allowed:
+        return LoginAttempt(decision, None, None, None)
+    attempt_id = _record_attempt(db, "login", name.failure_key, client_ip, now)
+    row = None
+    if name.username is not None:
+        row = db.execute(select(User.id, User.password_hash).where(User.username == name.username)).one_or_none()
+    return LoginAttempt(decision, attempt_id, row[0] if row else None, row[1] if row else None)
+
+
+def _delete_own_login_attempt(db: Session, name: auth.LoginName, attempt_id: int) -> bool:
+    _check_login_name(name)
+    if not isinstance(attempt_id, int) or isinstance(attempt_id, bool):
+        raise ValueError("선기록 id 가 필요합니다")
+    _begin_auth_transaction(db)
+    if name.failure_key is not None:
+        lock_login_username(db, name.failure_key)
+        same_key = AuthFailure.username_key == name.failure_key
+    else:
+        same_key = AuthFailure.username_key.is_(None)
+    # 자기 선기록 id 하나만 — 이전 실패·다른 요청의 선기록은 지우지 않는다
+    result = db.execute(delete(AuthFailure).where(
+        AuthFailure.id == attempt_id, AuthFailure.kind == "login", same_key))
+    return result.rowcount > 0
+
+
+def finish_login_success(db: Session, name: auth.LoginName, attempt_id: int) -> bool:
+    # 성공 Tx2 의 앞부분 — 같은 잠금 아래에서 자기 선기록만 지운다. 세션 생성(create_session)은 같은 Tx2 에서 호출자가
+    if name.failure_key is None:
+        raise ValueError("형식이 틀린 username 은 로그인에 성공할 수 없습니다")
+    return _delete_own_login_attempt(db, name, attempt_id)
+
+
+def cancel_login_attempt(db: Session, name: auth.LoginName, attempt_id: int) -> bool:
+    # 보상 Tx — Argon2 슬롯을 얻지 못해(HashBusy) 검증에 들어가지 않은 시도의 자기 선기록만 지운다.
+    # 실패하면(예외) 선기록은 남는다 — 인증은 어느 쪽이든 하지 않는다
+    return _delete_own_login_attempt(db, name, attempt_id)
+
+
+def begin_register_attempt(db: Session, client_ip: str, now: datetime) -> RegisterAttempt:
+    # 가입은 IP 1시간 창만 (잠금 없음, 근사). 허용이면 시도를 기록한다 — 201·409 로 끝나면 커밋해 센다.
+    # 422·403 은 이 함수 전에 끝나고, 429 는 기록하지 않으며, 503(HashBusy)은 호출자가 트랜잭션을 되돌려 세지 않는다
+    _require_aware(now)
+    _begin_auth_transaction(db)
+    since = now - auth.REGISTER_WINDOW
+    decision = auth.limit_decision([auth.LimitRule(auth.REGISTER_LIMIT_IP, auth.REGISTER_WINDOW, _newest_failure_times(
+        db, AuthFailure.kind == "register", AuthFailure.client_ip == client_ip,
+        since=since, limit=auth.REGISTER_LIMIT_IP))], now)
+    if not decision.allowed:
+        return RegisterAttempt(decision, None)
+    return RegisterAttempt(decision, _record_attempt(db, "register", None, client_ip, now))
+
+
+def purge_old_auth_failures(db: Session, now: datetime, limit: int = AUTH_FAILURE_PURGE_BATCH) -> int:
+    # 24시간 지난 기록(created_at <= now − 24h)을 최대 limit 개 지운다. 다른 트랜잭션이 잡은 행은 건너뛴다(SKIP LOCKED)
+    _require_aware(now)
+    old = (select(AuthFailure.id).where(AuthFailure.created_at <= now - auth.FAILURE_RETENTION)
+           .order_by(AuthFailure.id).limit(limit).with_for_update(skip_locked=True))
+    return db.execute(delete(AuthFailure).where(AuthFailure.id.in_(old))).rowcount

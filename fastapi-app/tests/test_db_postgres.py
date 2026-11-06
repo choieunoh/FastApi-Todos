@@ -8,6 +8,8 @@
 """
 import hashlib
 import os
+import threading
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +19,7 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import func, insert, inspect, select, text
+from sqlalchemy import event, func, insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
@@ -406,6 +408,255 @@ def test_logout_commit_is_seen_by_other_connection(fresh_schema):
                     assert db.get_active_session(orm(conn2), token, T) is None
     finally:
         other.dispose()                                                      # 다음 게이트 전에 연결을 닫는다
+
+
+# ---------- Phase 2-D: 로그인·가입 시도 제한 (db.begin_login_attempt 등) ----------
+# 트랜잭션 구성은 2-E(main.py) 몫이라 여기서는 테스트가 직접 짠다. 커밋이 필요한 테스트(잠금·동시성)는 NullPool 엔진을
+# 쓰고 finally 에서 닫는다. 이 파일의 마지막 테스트는 rolled_back 형식으로 두어 종료 후 사용자 데이터가 0행이 되게 한다
+
+LIMIT_KEY = auth.FailureKey(b"t" * 32)            # 테스트 전용 고정 키 (공개값)
+LIMIT_IP = "203.0.113.7"
+
+
+def login_as(username: str = "alice") -> auth.LoginName:
+    return auth.login_name(username, LIMIT_KEY)
+
+
+def failure_rows(conn) -> list:
+    return conn.execute(select(db.AuthFailure.__table__).order_by(db.AuthFailure.id)).all()
+
+
+CONNECT_TIMEOUT = 10                              # 초 — 별도 연결의 접속 대기 상한 (libpq connect_timeout)
+BARRIER_TIMEOUT = 30                              # 초 — 동시 시작 대기 상한
+JOIN_TIMEOUT = 60                                 # 초 — 작업 스레드 전체 종료 대기 상한
+BACKEND_RELEASE_TIMEOUT = 10                      # 초 — 닫은 연결의 서버 백엔드가 사라질 때까지 기다리는 상한
+_UNFINISHED_WORKERS: list[threading.Thread] = []  # join 뒤에도 살아 있는 작업 스레드 — 있으면 연결 수 확인을 하지 않는다
+
+
+def nullpool_engine():
+    # 두 번째 이후 연결용. 풀에 남기지 않고(NullPool) 접속 대기에 상한을 둔다. URL·대상 검사는 그대로다
+    engine = db.make_engine(db.check_test_database_url(TEST_URL), poolclass=NullPool)
+
+    @event.listens_for(engine, "do_connect")
+    def _connect_timeout(dialect, conn_rec, cargs, cparams):
+        cparams["connect_timeout"] = CONNECT_TIMEOUT
+
+    return engine
+
+
+def wait_for_backends_released(engine) -> None:
+    # 별도 연결을 모두 닫은 "뒤"에 부른다. 다음 테스트의 R-19 게이트와 같은 조건(이 DB 연결 = 점검 연결 1개,
+    # 다른 세션 0)으로 돌아올 때까지 제한 시간 동안 읽기만 한다. 게이트 자체는 바꾸지 않고, 세션을 끊지 않는다.
+    # 끝나지 않은 작업 스레드가 있으면 그 연결이 언제 열리고 닫힐지 알 수 없으므로 확인하지 않고 세션을 멈춘다
+    if any(t.is_alive() for t in _UNFINISHED_WORKERS):
+        pytest.exit("끝나지 않은 작업 스레드가 있어 연결 수를 확인할 수 없습니다 — 이후 PostgreSQL 테스트를 진행하지 않습니다",
+                    returncode=3)
+    deadline = time.monotonic() + BACKEND_RELEASE_TIMEOUT
+    while True:
+        with engine.connect() as conn:                                       # 풀의 점검 연결 1개 — 매번 새 트랜잭션
+            backends = conn.execute(text(db.TEST_SCHEMA_SQL["database_backends"])).scalar_one()
+            others = conn.execute(text(db.TEST_SCHEMA_SQL["other_sessions"])).scalar_one()
+            conn.rollback()
+        if backends == 1 and others == 0:
+            return
+        if time.monotonic() >= deadline:
+            pytest.fail(f"닫은 연결이 {BACKEND_RELEASE_TIMEOUT}초 안에 정리되지 않음 (DB 연결 수 {backends}, 다른 세션 {others})")
+        time.sleep(0.05)
+
+
+def test_login_attempt_records_hmac_key_and_reads_hash(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        uid = make_user(conn, "alice")
+        attempt = db.begin_login_attempt(orm(conn), login_as("Alice"), LIMIT_IP, T)
+        assert attempt.decision.allowed and attempt.user_id == uid and attempt.password_hash == "x"
+        (row,) = failure_rows(conn)
+        assert (row.id, row.kind, row.client_ip, row.created_at) == (attempt.attempt_id, "login", LIMIT_IP, T)
+        assert row.username_key == login_as().failure_key and len(row.username_key) == 30
+        assert "alice" not in row.username_key                               # 평문 username 은 저장하지 않는다
+        missing = db.begin_login_attempt(orm(conn), login_as("nobody"), LIMIT_IP, T)
+        assert missing.decision.allowed and missing.user_id is None and missing.password_hash is None
+
+
+def test_login_user_ip_limit_and_retry_after_in_database(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        s = orm(conn)
+        for i in range(5):
+            assert db.begin_login_attempt(s, login_as(), LIMIT_IP, T + timedelta(seconds=i)).decision.allowed
+        blocked = db.begin_login_attempt(s, login_as(), LIMIT_IP, T + timedelta(seconds=5))
+        assert blocked.decision == auth.LimitDecision(False, 895) and blocked.attempt_id is None
+        assert count(conn, db.AuthFailure) == 5                              # 429 는 기록하지 않는다
+        other_ip = db.begin_login_attempt(s, login_as(), "198.51.100.1", T + timedelta(seconds=5))
+        assert other_ip.decision.allowed                                     # (username, IP) 규칙은 IP 별
+        after = db.begin_login_attempt(s, login_as(), LIMIT_IP, T + timedelta(minutes=15))
+        assert after.decision.allowed                                        # 첫 기록이 창 밖(같은 시각) → 풀림
+
+
+def test_login_username_and_ip_limits_in_database(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        s = orm(conn)
+        for i in range(50):                                                  # 서로 다른 IP 50개 → username 50
+            assert db.begin_login_attempt(s, login_as(), f"198.51.100.{i}", T).decision.allowed
+        assert not db.begin_login_attempt(s, login_as(), "198.51.100.200", T).decision.allowed
+        for i in range(20):                                                  # 같은 IP, 다른 username 20개 → IP 20
+            assert db.begin_login_attempt(s, login_as(f"user{i:02d}"), "192.0.2.9", T).decision.allowed
+        assert not db.begin_login_attempt(s, login_as("someone"), "192.0.2.9", T).decision.allowed
+        assert not db.begin_login_attempt(s, auth.LoginName(None, None), "192.0.2.9", T).decision.allowed
+
+
+def test_register_limit_in_database(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        s = orm(conn)
+        for i in range(10):
+            assert db.begin_register_attempt(s, LIMIT_IP, T + timedelta(minutes=i)).decision.allowed
+        blocked = db.begin_register_attempt(s, LIMIT_IP, T + timedelta(minutes=10))
+        assert blocked.decision == auth.LimitDecision(False, 50 * 60) and blocked.attempt_id is None
+        rows = failure_rows(conn)
+        assert len(rows) == 10 and {(r.kind, r.username_key) for r in rows} == {("register", None)}
+        assert db.begin_login_attempt(s, login_as(), LIMIT_IP, T).decision.allowed   # 가입과 로그인은 따로 센다
+
+
+def test_success_and_cancel_delete_only_own_attempt_in_database(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        s = orm(conn)
+        old = db.begin_login_attempt(s, login_as(), LIMIT_IP, T - timedelta(minutes=5)).attempt_id    # 이전 실패
+        a = db.begin_login_attempt(s, login_as(), LIMIT_IP, T).attempt_id
+        b = db.begin_login_attempt(s, login_as(), LIMIT_IP, T).attempt_id                            # 다른 요청
+        anon = db.begin_login_attempt(s, auth.LoginName(None, None), LIMIT_IP, T).attempt_id
+        assert db.finish_login_success(s, login_as(), a) is True
+        assert db.finish_login_success(s, login_as(), a) is False            # 이미 지움
+        assert db.finish_login_success(s, login_as("bob"), b) is False      # 다른 username 의 키로는 못 지운다
+        assert db.cancel_login_attempt(s, auth.LoginName(None, None), anon) is True
+        assert {r.id for r in failure_rows(conn)} == {old, b}                # 이전 실패·다른 선기록은 그대로
+
+
+def test_purge_old_auth_failures_in_database(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        for hours in (25, 24, 23):
+            conn.execute(insert(db.AuthFailure).values(kind="register", username_key=None, client_ip=LIMIT_IP,
+                                                       created_at=T - timedelta(hours=hours)))
+        assert db.purge_old_auth_failures(orm(conn), T) == 2                 # 24시간 이상 지난 것 (같으면 삭제)
+        assert [r.created_at for r in failure_rows(conn)] == [T - timedelta(hours=23)]
+
+
+def test_auth_transaction_settings(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        db._begin_auth_transaction(orm(conn))
+        assert conn.execute(text("SHOW lock_timeout")).scalar_one() == "2s"
+        assert conn.execute(text("SHOW transaction_isolation")).scalar_one() == "read committed"
+
+
+def test_login_lock_serializes_same_username(fresh_schema):
+    # 결정적 확인: A 가 Tx1 안에서 잠금을 잡은 동안 B 는 같은 키를 못 잡고(다른 username 은 잡는다), A 커밋 뒤에는
+    # 잡고 A 의 선기록을 본다
+    try_lock = text("SELECT pg_try_advisory_xact_lock(hashtextextended('login:' || :k, 0))")
+    other = nullpool_engine()
+    try:
+        with fresh_schema.connect() as conn_a, other.connect() as conn_b:
+            db.verify_test_server(conn_b)
+            conn_b.rollback()
+            trans_a = conn_a.begin()
+            db.begin_login_attempt(orm(conn_a), login_as(), LIMIT_IP, T)
+            with conn_b.begin():
+                assert conn_b.execute(try_lock, {"k": login_as().failure_key}).scalar_one() is False
+                assert conn_b.execute(try_lock, {"k": login_as("bob").failure_key}).scalar_one() is True
+            trans_a.commit()
+            with conn_b.begin():
+                assert conn_b.execute(try_lock, {"k": login_as().failure_key}).scalar_one() is True
+                assert count(conn_b, db.AuthFailure) == 1
+    finally:
+        other.dispose()                                                      # 다음 게이트 전에 연결을 닫는다
+        wait_for_backends_released(fresh_schema)
+
+
+def test_login_lock_timeout_fails_closed(fresh_schema):
+    # 잠금을 2초 안에 못 얻으면 오류(55P03)로 끝난다 — 허용으로 처리하지 않고 아무것도 기록하지 않는다
+    other = nullpool_engine()
+    try:
+        with fresh_schema.connect() as conn_a, other.connect() as conn_b:
+            trans_a = conn_a.begin()
+            db.begin_login_attempt(orm(conn_a), login_as(), LIMIT_IP, T)
+            trans_b = conn_b.begin()
+            with pytest.raises(SQLAlchemyError) as e:
+                db.begin_login_attempt(orm(conn_b), login_as(), LIMIT_IP, T)
+            timed_out = getattr(getattr(e.value, "orig", None), "sqlstate", None) == "55P03"
+            del e
+            trans_b.rollback()
+            trans_a.rollback()
+            assert timed_out, "잠금 대기 시간 초과(55P03)가 아님"
+            with conn_b.begin():
+                assert count(conn_b, db.AuthFailure) == 0
+    finally:
+        other.dispose()
+        wait_for_backends_released(fresh_schema)
+
+
+def run_concurrently(engine, attempts: int, call) -> list[bool]:
+    # 스레드마다 자기 연결·트랜잭션(커밋)으로 call(session, i) 을 동시에 시작한다. 결과(허용 여부) 목록.
+    # 스레드는 daemon 이 아니다(프로세스가 끝나기 전에 연결을 닫게). 예외는 이름만 기록하고 아래에서 실패로 본다
+    start = threading.Barrier(attempts)
+    results: list[bool | str] = [""] * attempts
+
+    def worker(i: int) -> None:
+        conn = None
+        try:
+            conn = engine.connect()
+            start.wait(timeout=BARRIER_TIMEOUT)
+            with conn.begin():
+                results[i] = call(orm(conn), i).decision.allowed
+        except BaseException as e:                                           # noqa: BLE001 — 아래에서 실패로 본다
+            results[i] = type(e).__name__
+            start.abort()                                                    # 다른 스레드가 Barrier 에서 오래 기다리지 않게
+        finally:
+            if conn is not None:
+                conn.close()                                                 # 정상·예외 모두 자기 연결을 닫는다
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=False) for i in range(attempts)]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + JOIN_TIMEOUT
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    alive = [t for t in threads if t.is_alive()]
+    if alive:
+        _UNFINISHED_WORKERS.extend(alive)                                    # 정리 단계에서 세션을 멈추게 한다
+        pytest.fail(f"작업 스레드 {len(alive)}개가 {JOIN_TIMEOUT}초 안에 끝나지 않음")
+    failures = sorted({r for r in results if not isinstance(r, bool)})
+    assert not failures, failures
+    return results  # type: ignore[return-value]
+
+
+def test_concurrent_same_username_is_exact(fresh_schema):
+    # 같은 username·IP 로 동시 10개 → 잠금 직렬화로 정확히 5개만 선기록, 5개는 차단
+    other = nullpool_engine()
+    try:
+        with other.connect() as check:
+            db.verify_test_server(check)
+            check.rollback()
+        results = run_concurrently(other, 10, lambda s, i: db.begin_login_attempt(s, login_as(), LIMIT_IP, T))
+        assert results.count(True) == 5 and results.count(False) == 5
+        with other.connect() as check, check.begin():
+            assert count(check, db.AuthFailure) == 5
+    finally:
+        other.dispose()
+        wait_for_backends_released(fresh_schema)
+
+
+def test_concurrent_ip_rule_is_approximate(fresh_schema):
+    # 같은 IP·서로 다른 username 동시 25개 → IP 규칙은 잠금이 없어 근사: 허용 ≥ 20 이고 ≤ 25, 끝난 뒤 다음 요청은 차단
+    other = nullpool_engine()
+    try:
+        with other.connect() as check:
+            db.verify_test_server(check)
+            check.rollback()
+        results = run_concurrently(
+            other, 25, lambda s, i: db.begin_login_attempt(s, login_as(f"user{i:02d}"), LIMIT_IP, T))
+        assert 20 <= results.count(True) <= 25
+        with other.connect() as check, check.begin():
+            assert count(check, db.AuthFailure) == results.count(True)
+            assert not db.begin_login_attempt(orm(check), login_as("late"), LIMIT_IP, T).decision.allowed
+    finally:
+        other.dispose()
+        wait_for_backends_released(fresh_schema)
 
 
 def test_multiple_sessions_for_same_user(fresh_schema):

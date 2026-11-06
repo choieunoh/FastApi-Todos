@@ -4,16 +4,22 @@
 - 현재 시각이 필요한 함수는 시각을 인자로 받는다 (테스트의 시계 고정은 main.now() 를 넘겨서 한다).
 - 비밀번호·해시·세션 토큰·CSRF 토큰 값은 예외 메시지와 로그에 넣지 않는다.
 - import 할 때 해시를 계산하지 않는다. 더미 해시는 처음 쓸 때 한 번만 만든다.
-- 세션 저장(2-C), 시도 제한(2-D), 라우트와 시작 가드 연결(2-E)은 여기 없다.
+- (2-D) 시도 제한의 순수 부분(판정·IP 정규화·username HMAC·Argon2 동시 실행 슬롯)은 여기, 기록·잠금은 db.py 에 있다.
+- 세션 저장(2-C, db.py), 라우트·HTTP 응답(429·503·Retry-After)과 시작 가드 연결(2-E)은 여기 없다.
 """
+import base64
+import binascii
 import hashlib
 import hmac
 import ipaddress
+import math
 import os
 import re
 import secrets
-from collections.abc import Mapping
-from dataclasses import dataclass
+import threading
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from functools import lru_cache
@@ -353,3 +359,192 @@ def cookie_delete_kwargs(settings: AuthSettings) -> dict[str, object]:
         "httponly": True,
         "samesite": "lax",
     }
+
+
+# ────────────────────────── 시도 제한 (§29.5, D-12, Phase 2-D) ──────────────────────────
+# - 여기는 순수 부분(판정·키·IP 정규화·Argon2 슬롯)만 둔다. 기록·잠금·조회는 db.py, HTTP 응답(429·503·Retry-After)과
+#   실제 클라이언트 주소 결정은 main.py(2-E)의 책임이다.
+# - 로그인 "시도"는 실패 횟수가 아니라 성공으로 확인되지 않은 시도 수다(실패 + 검증 중인 선기록). 429 는 기록하지 않는다.
+
+LOGIN_WINDOW = timedelta(minutes=15)
+REGISTER_WINDOW = timedelta(hours=1)
+FAILURE_RETENTION = timedelta(hours=24)          # 이보다 오래된 기록은 기록할 때 정리한다 (모든 창보다 길다)
+LOGIN_LIMIT_USER_IP = 5                          # 같은 (username, IP)
+LOGIN_LIMIT_USER = 50                            # 같은 username (IP 무관, 분산 공격)
+LOGIN_LIMIT_IP = 20                              # 같은 IP
+REGISTER_LIMIT_IP = 10                           # 같은 IP 의 가입 시도 (201·409 만 센다)
+
+
+@dataclass(frozen=True)
+class LimitRule:
+    limit: int
+    window: timedelta
+    newest: Sequence[datetime]                   # 이 규칙에 해당하는 기록의 created_at — 최신 limit 개면 충분하다
+
+
+@dataclass(frozen=True)
+class LimitDecision:
+    allowed: bool
+    retry_after: int = 0                         # 차단이면 초(1 이상), 허용이면 0
+
+
+def limit_decision(rules: Iterable[LimitRule], now: datetime) -> LimitDecision:
+    # 규칙마다 창 안(created_at > now − window, 같으면 창 밖) 기록이 limit 개 이상이면 차단한다.
+    # 한도 미만이 되려면 오래된 (개수 − limit + 1)개가 창을 벗어나야 한다 = 최신 limit 번째 기록.
+    # Retry-After = 그 기록 + window − now (올림, 최소 1초). 여러 규칙에 걸리면 가장 긴 값
+    _require_aware(now)
+    wait = 0
+    for rule in rules:
+        if rule.limit < 1 or rule.window <= timedelta(0):
+            raise ValueError("한도는 1 이상, 창은 0보다 커야 합니다")
+        for moment in rule.newest:
+            _require_aware(moment)
+        start = now - rule.window
+        inside = sorted((t for t in rule.newest if t > start), reverse=True)
+        if len(inside) >= rule.limit:
+            release = inside[rule.limit - 1] + rule.window
+            wait = max(wait, max(1, math.ceil((release - now).total_seconds())))
+    return LimitDecision(allowed=wait == 0, retry_after=wait)
+
+
+# ── username_key: HMAC-SHA256 (평문 username 을 auth_failures·잠금 키에 넣지 않는다) ──
+FAILURE_KEY_ENV = "AUTH_FAILURE_KEY"
+FAILURE_KEY_MIN_BYTES = 32                       # 디코드한 비밀키 최소 길이
+USERNAME_KEY_BYTES = 22                          # HMAC 앞 22바이트 → 패딩 없는 base64url 30자 (VARCHAR(30))
+USERNAME_KEY_LENGTH = 30
+_USERNAME_KEY_CONTEXT = b"auth-failure:v1:"     # 다른 용도의 HMAC 과 섞이지 않게 (형식을 바꾸면 v2)
+_FALLBACK_APP_ENVS = ("development", "test")
+_DEV_FAILURE_KEY = b"todo-v7 PUBLIC development/test-only auth_failures key"   # 공개값 — 운영에서 거부
+_FAILURE_KEY_RE = re.compile(r"[A-Za-z0-9_-]+={0,2}", re.ASCII)
+
+
+class FailureKey:
+    """auth_failures.username_key 용 HMAC 비밀키 — repr·예외·직렬화에 값을 넣지 않는다."""
+
+    __slots__ = ("_secret", "development_fallback")
+
+    def __init__(self, secret: bytes, *, development_fallback: bool = False) -> None:
+        if not isinstance(secret, bytes) or len(secret) < FAILURE_KEY_MIN_BYTES:
+            raise AuthConfigError(f"{FAILURE_KEY_ENV} 는 디코드해서 {FAILURE_KEY_MIN_BYTES}바이트 이상이어야 합니다")
+        self._secret = secret
+        self.development_fallback = development_fallback
+
+    def __repr__(self) -> str:
+        return "FailureKey(<hidden>)"
+
+    def __reduce__(self) -> object:
+        raise TypeError("FailureKey 는 직렬화할 수 없습니다")
+
+    def username_key(self, username: str) -> str:
+        # normalize_username 결과(ASCII 소문자)만 받는다 — 잠금 키·기록·조회·삭제가 모두 이 값 하나를 쓴다
+        digest = hmac.new(self._secret, _USERNAME_KEY_CONTEXT + username.encode("ascii"), hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(digest[:USERNAME_KEY_BYTES]).rstrip(b"=").decode("ascii")
+
+
+def load_failure_key(environ: Mapping[str, str] | None = None) -> FailureKey:
+    # AUTH_FAILURE_KEY 가 없으면 APP_ENV 가 development·test 로 **명시된** 경우에만 공개 대체 키를 쓴다.
+    # APP_ENV 미설정(기본값 development 에 기대지 않는다, R-22)·production 이면 반드시 필요하다. 시작 가드 연결은 2-E
+    env = os.environ if environ is None else environ
+    raw_env = env.get("APP_ENV")
+    app_env = None if raw_env is None else raw_env.strip().lower()
+    if app_env is not None and app_env not in APP_ENVS:
+        raise AuthConfigError(f"APP_ENV 는 {', '.join(APP_ENVS)} 중 하나여야 합니다")
+    fallback_allowed = app_env in _FALLBACK_APP_ENVS
+    raw = env.get(FAILURE_KEY_ENV)
+    if raw is None:
+        if fallback_allowed:
+            return FailureKey(_DEV_FAILURE_KEY, development_fallback=True)
+        raise AuthConfigError(f"{FAILURE_KEY_ENV} 가 필요합니다 (APP_ENV=development·test 로 명시한 경우만 생략 가능)")
+    if not isinstance(raw, str) or not _FAILURE_KEY_RE.fullmatch(raw):
+        raise AuthConfigError(f"{FAILURE_KEY_ENV} 는 공백 없는 base64url 문자열이어야 합니다")
+    body = raw.rstrip("=")
+    try:
+        secret = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+    except (binascii.Error, ValueError):
+        raise AuthConfigError(f"{FAILURE_KEY_ENV} 는 공백 없는 base64url 문자열이어야 합니다") from None
+    if secret == _DEV_FAILURE_KEY and not fallback_allowed:
+        raise AuthConfigError(f"{FAILURE_KEY_ENV} 에 공개 개발용 키를 쓸 수 없습니다")
+    return FailureKey(secret)
+
+
+@dataclass(frozen=True)
+class LoginName:
+    username: str | None = field(repr=False)     # 정규화 username (users 조회용). 형식이 틀리면 None
+    failure_key: str | None = field(repr=False)  # HMAC 값 (잠금·auth_failures 용). 형식이 틀리면 None
+
+
+def login_name(raw: object, key: FailureKey) -> LoginName:
+    # 형식이 틀린 username 도 예외 없이 (None, None) — 로그인은 같은 401 로 처리하고 IP 규칙만 적용한다
+    try:
+        username = normalize_username(raw)       # type: ignore[arg-type]
+    except ValueError:
+        return LoginName(None, None)
+    return LoginName(username, key.username_key(username))
+
+
+# ── 클라이언트 IP 정규화 (2-E 가 신뢰된 ASGI client 주소만 넘긴다 — 요청 헤더·본문의 값은 받지 않는다) ──
+IPV6_PREFIX = 64                                 # IPv6 는 /64 로 묶는다 (한 가입자 /64 안의 주소 바꾸기 방지)
+_CLIENT_HOST_MAX = 100
+
+
+class InvalidClientAddress(ValueError):
+    """클라이언트 주소를 IP 로 볼 수 없음 — 인증을 처리하지 않는다. 값은 메시지에 넣지 않는다."""
+
+
+def normalize_client_ip(host: object) -> str:
+    # IPv4 → 주소 그대로, IPv4-mapped IPv6 → IPv4, IPv6 → /64 네트워크(zone ID 는 버린다). 그 밖은 InvalidClientAddress
+    if not isinstance(host, str) or not 0 < len(host) <= _CLIENT_HOST_MAX or not _PRINTABLE_ASCII_RE.fullmatch(host):
+        raise InvalidClientAddress("클라이언트 주소가 IP 가 아닙니다")
+    text, percent, zone = host.partition("%")
+    if percent and (not zone or ":" not in text):   # zone 은 IPv6 에만, 비어 있으면 거부
+        raise InvalidClientAddress("클라이언트 주소가 IP 가 아닙니다")
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        raise InvalidClientAddress("클라이언트 주소가 IP 가 아닙니다") from None
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return ipaddress.IPv6Network((addr, IPV6_PREFIX), strict=False).compressed
+    return str(addr)
+
+
+# ── Argon2 동시 실행 슬롯 (프로세스당) ──
+ARGON2_MAX_CONCURRENT = 2                        # 64MiB × 2 — 운영 서버 측정(Phase 6) 후 조정
+ARGON2_SLOT_TIMEOUT = 5.0                        # 초 — 넘으면 HashBusy (2-E 에서 503)
+_ARGON2_SLOTS = threading.BoundedSemaphore(ARGON2_MAX_CONCURRENT)
+
+
+class HashBusy(RuntimeError):
+    """Argon2 슬롯을 제한 시간 안에 얻지 못함 — 인증하지 않는다(세션 발급 없음)."""
+
+
+@contextmanager
+def argon2_slot(timeout: float | None = None) -> Iterator[None]:
+    # 얻은 경우에만 반환한다 — 안에서 예외가 나도 finally 에서 반드시 돌려준다
+    slots = _ARGON2_SLOTS
+    if not slots.acquire(timeout=ARGON2_SLOT_TIMEOUT if timeout is None else timeout):
+        raise HashBusy("Argon2 슬롯을 제한 시간 안에 얻지 못했습니다")
+    try:
+        yield
+    finally:
+        slots.release()
+
+
+def verify_login_password(stored_hash: str | None, password: object) -> bool:
+    # 로그인 검증 — 계정이 있으면 실제 해시, 없으면 더미 해시. 둘 다 같은 슬롯 안에서만 Argon2 를 실행한다.
+    # 검증할 수 없는 입력(R-24)은 슬롯·Argon2 없이 바로 False (계정 유무와 관계없이 같다). HashBusy 는 그대로 올린다
+    if not _verifiable(password):
+        return False
+    with argon2_slot():
+        if stored_hash is None:
+            verify_dummy(password)               # type: ignore[arg-type]
+            return False
+        return check_password_hash(stored_hash, password) is PasswordCheck.OK   # type: ignore[arg-type]
+
+
+def hash_password_limited(password: str) -> str:
+    # 가입·rehash 용 — 규칙 검사(ValueError)는 슬롯 전에, 해시 계산은 슬롯 안에서
+    checked = check_password(password)
+    with argon2_slot():
+        return _HASHER.hash(checked)
