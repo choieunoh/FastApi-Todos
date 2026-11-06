@@ -102,7 +102,7 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
    - `main.py`: **HTTP 계층** — `require_user` 의존성(쿠키 → `db.get_active_session` → 401), CSRF·Origin 검사 적용, 클라이언트 IP 결정, `APP_ENV=production` 시작 가드 연결 (2-E). (2-D 확정) 로그인 트랜잭션 구성(Tx1 → Argon2 → Tx2 또는 보상 Tx), 429·500·503과 `Retry-After` 응답, `load_failure_key` 시작 가드도 2-E.
 3. `main.py`: `/auth/register`, `/auth/login`, `/auth/logout`, `/auth/me`.
 4. `index.html`: 로그인·가입 화면, 헤더 사용자명·로그아웃, `api()`의 CSRF 헤더·401 처리.
-   - 이 Phase에서는 데이터 API를 아직 막지 않는다(기존 테스트 유지). 화면은 로그인 후 앱을 보여준다.
+   - 이 Phase에서는 데이터 API를 아직 막지 않는다(기존 테스트 유지). 2-G는 로그인·가입 UI를 추가하되, 로그인하지 않아도 기존 v6 앱 영역과 목록 불러오기를 그대로 유지한다(`V7_SPEC.md` §30 과도기 예외). 강제 로그인 게이트는 Phase 3에서 적용한다.
 5. Docker 포트 공개 시 원래 클라이언트 IP가 보이는지 격리 환경에서 확인(R-12).
 
 테스트·완료 기준 (T-A)
