@@ -106,10 +106,10 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 5. Docker 포트 공개 시 원래 클라이언트 IP가 보이는지 격리 환경에서 확인(R-12).
 
 테스트·완료 기준 (T-A)
-- [ ] 가입: 길이·문자 규칙 422, 대소문자 무시 중복 409, 공백 정규화, 응답에 해시 없음, 해시가 `$argon2id$`로 시작 — (2-E 확인: 422·대소문자 무시 409·응답에 해시 없음. HTTP 수준의 공백 정규화·`$argon2id$` 접두 검사는 아직 없음)
+- [x] 가입: 길이·문자 규칙 422, 대소문자 무시 중복 409, 공백 정규화, 응답에 해시 없음, 해시가 `$argon2id$`로 시작 — (2-E 확인: 422·대소문자 무시 409·응답에 해시 없음. T-A 잔여 2026-11-06: HTTP 수준의 공백 정규화·`$argon2id$` 접두 — DB 없는 R1~R4, PostgreSQL P1, 아래 블록)
 - [x] 로그인 성공 200 + 쿠키, 없는 아이디와 틀린 비밀번호의 401 본문 동일 (2-E: DB 없는 테스트·실제 Argon2, PostgreSQL HTTP)
 - [x] 쿠키 속성: HttpOnly, SameSite=Lax, Path=/; `COOKIE_SECURE=true`면 Secure + `__Host-` 이름 (2-E)
-- [ ] 로그아웃 뒤 같은 쿠키로 `/auth/me` 401, 14일 지난 세션 401(시계 고정), 재로그인 시 토큰 교체 — (2-E 확인: 로그아웃 뒤 401·재로그인 시 제시된 세션만 교체. 14일 만료는 2-C DB 함수 수준만, HTTP 시계 고정 테스트는 아직 없음)
+- [x] 로그아웃 뒤 같은 쿠키로 `/auth/me` 401, 14일 지난 세션 401(시계 고정), 재로그인 시 토큰 교체 — (2-E 확인: 로그아웃 뒤 401·재로그인 시 제시된 세션만 교체. T-A 잔여 2026-11-06: 고정 시계 14일 만료 HTTP — DB 없는 R5(시계 전달), PostgreSQL P2(경계 200/401·정리), 아래 블록)
 - [x] CSRF: 헤더 없음·틀림 403, 맞으면 통과. 로그인 Origin 불일치 403 (2-E: logout·`require_csrf`·Origin. 데이터 경로 적용은 Phase 3)
 - [x] (2-D DB 함수 + 2-E HTTP) 시도 제한: 5회 실패 후 6번째 429 + `Retry-After`, 15분 뒤 해제, ~~성공 시 기록 삭제~~ → (2026-11-06 변경, `V7_SPEC.md` §29.5 변경 기록) 성공 시 **그 요청의 선기록만** 삭제(이전 실패는 창 만료로 해제), 없는 계정도 같은 규칙, 가입 IP 제한(201·409만 셈), 429는 기록하지 않음
 - [x] (2-D, DB 함수 수준 — HTTP 경로가 같은 함수를 쓴다) 동시성: 같은 username에 동시 로그인 실패 요청 N개(스레드)를 보내도 실패 기록이 한도를 넘어 통과하지 않음 (같은 username은 정확히 한도만큼, IP 규칙은 근사)
@@ -119,6 +119,16 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 - [x] `REGISTRATION_ENABLED=false`면 가입 403 (2-E, 본문 검증 뒤·시도로 세지 않음)
 - [x] UI: 로그인·가입·로그아웃, 오류 표시, 429 안내, 375px, 키보드 (2-G1, 2026-11-06: `tests/test_ui_auth.py` 31개, `/auth/*` 모킹 기준. 실제 PostgreSQL 위 UI E2E는 Phase 4)
 - [x] 기존 332 passed 유지 (2-E 전체 회귀 1015 passed 안에 v6 테스트 전부 통과)
+
+**T-A 잔여 검증 완료 (2026-11-06, 테스트만 추가 — 운영 코드 변경 없음)**
+- DB 없는 HTTP `tests/test_auth_routes.py` R1~R5(새 함수 5개·사례 9개): R1 앞뒤 공백·탭·대문자 username → 응답·중복 검사·저장 인자 `alice`, R2 공백 제거 뒤에도 틀린 username 422(입력값 비노출·시도 기록 없음), R3 실제 Argon2id 해시 `$argon2id$`·검증 성공·비노출, R4 비밀번호 앞뒤 공백 보존, R5 가입·`/auth/me`가 앱 시계(`main.now`)를 세션 함수에 전달(시계 전달만 — 14일 경계 판정은 P2).
+- PostgreSQL HTTP `tests/test_db_postgres.py` P1·P2(새 함수 2개): P1 `" Alice "` 가입 201 → DB `users.username` `alice` 1명·`password_hash` `$argon2id$`·검증 성공, `"\tALICE "` 409(사용자 추가·쿠키 없음), `" alice "` 로그인 200. P2 고정 시계(앞으로만, sleep 없음): 가입 T, `expires_at` T+14일(TIMESTAMPTZ 실제 값)·`Max-Age=1209600`, T+14일−1µs `/auth/me` 200, 정확히 T+14일 401, `/auth/me`는 만료 행을 지우지 않음, T+15일 401, T+15일 로그인 200 뒤 만료 세션 정리·새 세션만, 옛 쿠키 401·새 쿠키 200.
+- 실행 결과(각 승인 실행 1회, 실행 범위별):
+  - DB 없음: `tests/test_auth_routes.py` 단독 **96 passed**, 전체 회귀 **1005 passed, 1 skipped, 3 deselected**(skipped 1은 `test_db_postgres.py` 모듈 — 통과 아님).
+  - `todo_test` PostgreSQL 단독 `pytest tests/test_db_postgres.py -m postgres -x -v -rP`: **57 passed**(기존 55 + P1·P2).
+  - `todo_test` PostgreSQL 포함 전체 회귀 `pytest -m "not integration" -x -q`: **1062 passed, 0 failed, 0 skipped, 3 deselected**(DB 없는 1005 + PostgreSQL 57).
+  - deselected 3은 운영 IP 대상 통합 테스트이며 의도적으로 제외했다(통과가 아니다).
+  - 두 PostgreSQL 실행 모두 실행 전후 읽기 전용 R-19 점검 통과: 18.6·127.0.0.1:5433·`todo_test`·비슈퍼유저, 0002, 8/5/18/16(manifest 일치), 다른 세션·잠금·준비된 트랜잭션 0. 종료 후 `todo_test`는 0002·사용자 데이터 7개 표 0행. 포트 5432·`todo_dev`는 접근하지 않았다.
 
 하위 단계 (2026-11-05 설계 검토, 각 단계 보고·승인 후 진행)
 | 단계 | 내용 | 상태 |
@@ -148,7 +158,7 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
   - 기존 `tests/test_ui.py`: **125 passed**.
   - DB 없는 전체 회귀: **996 passed, 0 failed, 1 skipped, 3 deselected**(181.70초). 31개·125개는 996개 안에 포함된다. skipped 1은 `tests/test_db_postgres.py` 모듈(`TEST_DATABASE_URL` 없음)이며 통과가 아니다. deselected 3은 운영 IP 대상 통합 테스트다.
   - **PostgreSQL 실DB 테스트 55개는 2-G1에서 실행하지 않았다.** 마지막 실DB 검증은 2-F(PostgreSQL 포함 1020 passed)다. 실제 PostgreSQL·인증 서버 위의 UI E2E는 Phase 4(T-E)에서 한다.
-- 남은 일(Phase 2 완료 전, 별도 단계): T-A 잔여 — 가입의 HTTP 수준 공백 정규화·`$argon2id$` 접두 검사, 고정 시계로 14일 만료 HTTP 검사. 남은 시각 위험은 R-32·R-33(§P12).
+- 남은 일(Phase 2 완료 전, 별도 단계): T-A 잔여 — 가입의 HTTP 수준 공백 정규화·`$argon2id$` 접두 검사, 고정 시계로 14일 만료 HTTP 검사(→ 2026-11-06 완료, 위 T-A "T-A 잔여 검증 완료" 블록). 남은 시각 위험은 R-32·R-33(§P12).
 
 **2-F 다중 워커 검증 완료 (2026-11-06, 로컬 커밋 `53d7534`)**
 - 범위: 인증 기능의 재구현이 아니라 **다중 프로세스·다중 워커 사이의 시도 제한(과 세션·CSRF) 공유 검증**이다. 바꾼 파일은 `tests/test_db_postgres.py`뿐이다(운영 코드·마이그레이션·설정 변경 없음, 운영 워커 수는 §P10대로 기본 1개·별도 결정).

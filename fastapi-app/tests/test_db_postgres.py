@@ -933,6 +933,82 @@ def test_http_missing_own_attempt_is_500_without_session(http_app, monkeypatch):
     assert state["sessions"] == 1 and [k for _, k, _ in state["failures"]] == ["register"]
 
 
+# ---------- (T-A) 가입 정규화·실제 DB 해시, 고정 시계 14일 만료 HTTP 흐름 ----------
+# 비밀번호·해시·세션 토큰·CSRF 값이 실패 메시지에 나오지 않도록, 비교 결과를 변수에 먼저 담고 그 값만 단정한다.
+
+def test_http_register_normalizes_username_and_stores_argon2id(http_app, caplog):
+    caplog.set_level(logging.DEBUG)
+    created = call(http_client(), "POST", "/auth/register", body=creds(" Alice "))
+    created_username = created.json().get("username")
+    assert created.status_code == 201 and created_username == "alice"
+    with http_app.connect() as conn:
+        rows = conn.execute(select(db.User.username, db.User.password_hash)).all()
+        conn.rollback()
+    assert [r.username for r in rows] == ["alice"]                                 # 정규화한 값으로 정확히 1명
+    stored = rows[0].password_hash
+    hash_ok = stored.startswith("$argon2id$") and auth.verify_password(stored, HTTP_PW) and HTTP_PW not in stored
+    assert hash_ok
+    dup = call(http_client(), "POST", "/auth/register", body=creds("\tALICE ", "another-password-2"))
+    assert dup.status_code == 409 and dup.json() == {"detail": main.USERNAME_TAKEN}
+    dup_has_cookie = COOKIE in dup.headers.get("set-cookie", "")
+    assert not dup_has_cookie
+    login = call(http_client(), "POST", "/auth/login", body=creds(" alice "))
+    login_username = login.json().get("username")
+    assert login.status_code == 200 and login_username == "alice"
+    state = db_state(http_app)
+    assert state["users"] == 1 and state["sessions"] == 2                         # 가입 + 로그인 세션 (409 는 세션 없음)
+    hash_leaked = any(stored in r.text for r in (created, dup, login)) or stored in caplog.text
+    assert not hash_leaked
+    for res in (created, dup, login):
+        assert_no_secret(res, caplog)
+
+
+def test_http_session_expires_after_14_days_with_fixed_clock(http_app, monkeypatch):
+    # 시계는 앞으로만 옮긴다(sleep 없음). 정확히 14일이 되는 순간부터 401. /auth/me 는 만료 세션을 지우지 않고
+    # 다음 로그인(가입·로그인 때의 purge_expired_sessions)이 정리한다. 옛 쿠키 없이 로그인해 교체가 아니라 정리임을 본다
+    start = datetime(2026, 11, 6, 9, 0, tzinfo=timezone.utc)
+    clock = [start]
+    monkeypatch.setattr(main, "now", lambda: clock[0])
+    c = http_client()
+
+    def me_status(token) -> int:
+        return call(c, "GET", "/auth/me", token=token).status_code
+
+    def stored_expiries() -> list:
+        with http_app.connect() as conn:
+            values = conn.execute(select(db.UserSession.expires_at)).scalars().all()
+            conn.rollback()
+        return values
+
+    created = call(http_client(), "POST", "/auth/register", body=creds())
+    assert created.status_code == 201
+    old_token = created.cookies.get(COOKIE)
+    has_old_token = old_token is not None
+    max_age_ok = "Max-Age=1209600" in created.headers.get("set-cookie", "")
+    assert has_old_token and max_age_ok
+    assert stored_expiries() == [start + timedelta(days=14)]                     # 실제 TIMESTAMPTZ 저장값
+
+    clock[0] = start + timedelta(days=14) - timedelta(microseconds=1)
+    status = me_status(old_token)
+    assert status == 200                                                          # 만료 1µs 전
+    clock[0] = start + timedelta(days=14)
+    status = me_status(old_token)
+    assert status == 401                                                          # 같으면 만료
+    assert stored_expiries() == [start + timedelta(days=14)]                     # /auth/me 는 지우지 않는다
+    clock[0] = start + timedelta(days=15)
+    status = me_status(old_token)
+    assert status == 401
+
+    login = call(http_client(), "POST", "/auth/login", body=creds())
+    assert login.status_code == 200
+    new_token = login.cookies.get(COOKIE)
+    tokens_distinct = new_token is not None and new_token != old_token
+    assert tokens_distinct
+    assert stored_expiries() == [clock[0] + timedelta(days=14)]                  # 만료 세션은 정리되고 새 세션만
+    old_status, new_status = me_status(old_token), me_status(new_token)
+    assert (old_status, new_status) == (401, 200)
+
+
 # ---------- Phase 2-F: 다중 프로세스·다중 워커 (실제 uvicorn + todo_test) ----------
 # A: 독립 uvicorn 프로세스 2개(각 --workers 1, 포트 다름) — 요청을 보낼 프로세스를 정할 수 있어 결과가 결정적이다.
 # B: 실제 uvicorn --workers 2 — 요청 분산은 OS 가 정하므로 접근 로그의 PID 로 "관찰"한다. 분산을 확인하지 못하면

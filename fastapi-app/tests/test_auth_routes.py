@@ -8,6 +8,7 @@ import ast
 import inspect
 import logging
 import re
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +31,7 @@ CSRF = "csrf-value-1"
 STORED = "$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaGhhc2g"   # 합성 해시 문자열
 NEW_HASH = "$argon2id$new"
 REAL_VERIFY = auth.verify_login_password
+REAL_HASH_LIMITED = auth.hash_password_limited   # (T-A) world 가 가짜로 바꾸기 전의 실제 Argon2id 해시 함수
 DEV = auth.AuthSettings(app_env="test", cookie_secure=False, registration_enabled=True)
 AUTH_ENV = ("APP_ENV", "AUTH_FAILURE_KEY", "COOKIE_SECURE", "REGISTRATION_ENABLED", "DATABASE_URL")
 
@@ -592,6 +594,80 @@ def test_register_unexpected_error_is_500_not_409(world, client, caplog):
     res = register(client)
     assert res.status_code == 500
     assert_clean_logs(caplog)
+
+
+# ---------- (T-A) 가입 HTTP 수준: username 정규화·실제 Argon2id·비밀번호 공백·시계 전달 ----------
+
+@pytest.mark.parametrize("raw", [" Alice ", "\tALICE\n", "Alice "], ids=["spaces", "tab-newline", "trailing"])
+def test_register_normalizes_username_whitespace_and_case(world, client, raw):
+    res = register(client, username=raw)
+    assert res.status_code == 201 and res.json()["username"] == "alice"
+    assert world.call("username_exists")[1] == ("alice",)              # 중복 검사도 정규화한 값으로
+    assert world.call("create_user")[1][0] == "alice"                  # 저장도 정규화한 값으로
+    assert res.headers["set-cookie"].startswith(f"todo_session={TOKEN};")
+
+
+@pytest.mark.parametrize("raw", [" ab ", " ", " ali ce "], ids=["short-after-strip", "blank", "inner-space"])
+def test_register_rejects_username_invalid_after_strip(world, client, raw):
+    res = client.post("/auth/register", json={"username": raw, "password": SECRET_PW}, headers={"Origin": ORIGIN})
+    assert res.status_code == 422
+    for error in res.json()["detail"]:
+        assert set(error) == {"loc", "msg", "type"}                    # input·ctx 없음
+    if raw.strip():                                                     # 공백만인 값은 문구의 띄어쓰기와 겹쳐 비교하지 않는다
+        assert raw not in res.text
+    assert SECRET_PW not in res.text
+    assert world.events == []                                           # 422 는 DB·시도 기록 전에 끝난다
+
+
+def test_register_stores_real_argon2id_hash(world, client, monkeypatch, caplog):
+    monkeypatch.setattr(auth, "hash_password_limited", REAL_HASH_LIMITED)   # 이 테스트만 실제 해시
+    caplog.set_level(logging.DEBUG)
+    res = register(client)
+    assert res.status_code == 201
+    stored = world.call("create_user")[1][1]
+    # 실패해도 해시·비밀번호 원문이 assert 메시지에 나오지 않게 결과만 비교한다
+    is_argon2id = stored.startswith("$argon2id$")
+    verifies = auth.verify_password(stored, SECRET_PW)
+    leaked = SECRET_PW in stored or stored in res.text or stored in caplog.text
+    assert is_argon2id and verifies and not leaked
+    assert_clean_logs(caplog)
+
+
+def test_register_keeps_password_whitespace(world, client, monkeypatch):
+    spaced = " spaced pass 1 "                                         # 비밀번호는 앞뒤 공백을 지우지 않는다
+    monkeypatch.setattr(auth, "hash_password_limited", REAL_HASH_LIMITED)
+    res = register(client, password=spaced)
+    assert res.status_code == 201
+    stored = world.call("create_user")[1][1]
+    accepts_original = auth.verify_password(stored, spaced)
+    accepts_stripped = auth.verify_password(stored, spaced.strip())
+    leaked = spaced in res.text or stored in res.text
+    assert accepts_original and not accepts_stripped and not leaked
+
+
+def test_register_and_me_pass_app_clock_to_session_functions(world, client, monkeypatch):
+    # 시계 전달만 확인한다 — 정확히 14일 경계의 HTTP 판정(401)은 PostgreSQL 테스트(P2) 몫이다
+    fixed = datetime(2026, 11, 6, 9, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(main, "now", lambda: fixed)
+    seen: dict[str, datetime] = {}
+    fake_create, fake_lookup = db.create_session, db.get_active_session      # world 의 가짜 함수에 위임
+
+    def create_session(s, user_id, now, *, replace_token=None):
+        seen["create_session"] = now
+        return fake_create(s, user_id, now, replace_token=replace_token)
+
+    def get_active_session(s, token, now):
+        seen["get_active_session"] = now
+        return fake_lookup(s, token, now)
+
+    monkeypatch.setattr(db, "create_session", create_session)
+    monkeypatch.setattr(db, "get_active_session", get_active_session)
+    assert register(client).status_code == 201
+    world.active = active_session()
+    client.cookies.clear()
+    client.cookies.set("todo_session", TOKEN)
+    assert client.get("/auth/me").status_code == 200
+    assert seen == {"create_session": fixed, "get_active_session": fixed}
 
 
 # ---------- me · logout · CSRF ----------
