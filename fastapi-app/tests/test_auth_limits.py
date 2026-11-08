@@ -99,6 +99,54 @@ def test_register_window_is_one_hour():
     assert d == auth.LimitDecision(False, 50 * 60)
 
 
+# ---------- (2026-11-08) Retry-After 는 규칙별 window 이하 ----------
+# 다른 프로세스가 기록한 시각이 now 보다 약간 늦을 수 있다(now 를 정한 뒤 잠금을 기다림) — 계산값이 window 를 넘으면 window
+
+MICRO = timedelta(microseconds=1)
+
+
+@pytest.mark.parametrize("newest, expected", [
+    (ago(seconds=100), 800),                            # 900 미만 — 그대로
+    (NOW, 900),                                         # 정확히 900
+    (NOW + MICRO, 900),                                 # 900.000001 → 올림 901 → 900
+    (NOW + timedelta(minutes=10), 900),                 # 크게 넘어도 900
+], ids=["below", "exact", "over-1us", "far-over"])
+def test_login_retry_after_capped_at_login_window(newest, expected):
+    d = auth.limit_decision([rule(1, newest)], NOW)
+    assert d == auth.LimitDecision(False, expected)     # 차단 판정은 그대로
+
+
+@pytest.mark.parametrize("newest, expected", [
+    (ago(seconds=100), 3500),                           # 기존 정상값 (test_register_limit… 와 같은 값)
+    (NOW, 3600),
+    (NOW + MICRO, 3600),
+    (NOW + timedelta(minutes=30), 3600),
+], ids=["normal", "exact", "over-1us", "far-over"])
+def test_register_retry_after_capped_at_register_window(newest, expected):
+    d = auth.limit_decision([rule(1, newest, window=auth.REGISTER_WINDOW)], NOW)
+    assert d == auth.LimitDecision(False, expected)     # 900 으로 줄이지 않는다
+
+
+def test_retry_after_minimum_one_second_kept_with_cap():
+    d = auth.limit_decision([rule(1, ago(minutes=15) + MICRO)], NOW)
+    assert d == auth.LimitDecision(False, 1)
+
+
+def test_retry_after_cap_is_per_rule_then_longest_wins():
+    login_over = rule(1, NOW + MICRO)                                    # 901 → 900
+    login_short = rule(1, ago(minutes=10))                               # 300
+    register_over = rule(1, NOW + MICRO, window=auth.REGISTER_WINDOW)    # 3601 → 3600
+    assert auth.limit_decision([login_short, login_over], NOW) == auth.LimitDecision(False, 900)
+    assert auth.limit_decision([login_over, register_over], NOW) == auth.LimitDecision(False, 3600)
+    assert auth.limit_decision([rule(2, NOW + MICRO), login_short], NOW) == auth.LimitDecision(False, 300)  # 한도 미만 규칙은 무관
+
+
+def test_cap_does_not_change_allowed_decision():
+    assert auth.limit_decision([rule(2, NOW + MICRO)], NOW).allowed            # 한도 미만이면 그대로 허용
+    assert not auth.limit_decision([rule(1, NOW + MICRO)], NOW).allowed        # 한도 이상이면 그대로 차단
+    assert auth.limit_decision([rule(1, ago(minutes=15))], NOW).allowed       # 창 경계(같으면 창 밖) 그대로
+
+
 @pytest.mark.parametrize("now, times", [
     (NOW.replace(tzinfo=None), [ago(minutes=1)]),
     (NOW, [ago(minutes=1).replace(tzinfo=None)]),

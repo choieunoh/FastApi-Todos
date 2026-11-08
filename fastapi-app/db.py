@@ -10,9 +10,9 @@ import base64
 import binascii
 import os
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 
 from sqlalchemy import (
@@ -770,3 +770,265 @@ def update_password_hash_if_unchanged(db: Session, user_id: int, old_hash: str, 
         update(User).where(User.id == user_id, User.password_hash == old_hash)
         .values(password_hash=new_hash).execution_options(synchronize_session=False))
     return result.rowcount > 0
+
+
+# ---------- 사용자 데이터 헬퍼 (Phase 3-1A, V7_SPEC §27.3·§27.4·§29.4) ----------
+# - 아직 데이터 경로 15개는 이 헬퍼를 쓰지 않는다(템플릿 3-4, 할 일 3-5 에서 연결).
+# - 모든 조회·변경 SQL 에 user_id 조건을 직접 넣는다. 다른 사용자의 행은 "없는 행"과 같게 None·False·빈 결과다.
+# - 할 일 조회는 활성 행(deleted_at IS NULL)만 본다. 기본 정렬은 position, id.
+# - 쓰기 헬퍼는 같은 트랜잭션에서 먼저 lock_user 를 부른 뒤에만 동작한다(_require_user_lock). UPDATE·DELETE 에도 user_id 조건.
+# - commit·rollback 하지 않는다(트랜잭션은 main.request_db 가 소유). DB 오류는 잡지 않고 그대로 올린다.
+# - 시각은 호출자의 now 만 쓴다(DB now() 없음). 예외 메시지에는 값(제목 등)을 넣지 않는다.
+# - 지난 대기 행 정리(purge_expired_deleted_todos)는 호출 경로와 분리해 둔다. 삭제·복구·생성 요청에서 부르는 것은
+#   확정(§27.4)이고, bulk complete·uncomplete 와 반복 다음 일정 생성 때 부를지는 미결정이다(3-5 전에 결정).
+# - 데이터 쓰기의 잠금 대기 상한(lock_timeout)은 미결정이라 여기서 설정하지 않는다(V7_PLAN §P3 "잠금 대기").
+
+UNDO_WINDOW = timedelta(seconds=30)              # soft delete 복구 가능 시간 (§27.4)
+UNDO_LIMIT_PER_USER = 100                        # 사용자당 대기 행 최대 수 (§12·§27.4)
+_LOCKED_USER_KEY = "todo_locked_user"            # Session.info — (user_id, 그 잠금을 잡은 트랜잭션)
+
+# 헬퍼로 쓸 수 있는 열 — id·user_id·position·deleted_at 은 헬퍼가 정한다(본문 값으로 바꾸지 않는다)
+TODO_INSERT_FIELDS = frozenset({
+    "title", "description", "completed", "priority", "due_date", "tags", "favorite", "recurrence",
+    "next_spawned", "created_at", "completed_at",
+})
+TODO_UPDATE_FIELDS = TODO_INSERT_FIELDS - {"created_at"}        # PUT 은 created_at 을 유지한다 (§3)
+SUBTASK_UPDATE_FIELDS = frozenset({"title", "completed"})
+TEMPLATE_FIELDS = frozenset({"name", "title", "description", "priority", "tags", "recurrence", "subtasks"})
+
+
+def _check_fields(values: Mapping[str, object], allowed: frozenset[str]) -> None:
+    unknown = set(values) - allowed
+    if unknown:
+        raise ValueError("헬퍼가 받지 않는 열: " + ", ".join(sorted(unknown)))   # 열 이름만 (값은 넣지 않는다)
+
+
+def _unique_ids(ids: Sequence[int]) -> list[int]:
+    return list(dict.fromkeys(ids))              # 중복 제거, 처음 순서 유지 (§13)
+
+
+def lock_user(db: Session, user_id: int) -> bool:
+    # 사용자 행 FOR UPDATE — 같은 사용자의 쓰기를 트랜잭션 끝까지 직렬화한다(§27.1). 사용자가 없으면 False(잠금 없음)
+    found = db.execute(select(User.id).where(User.id == user_id).with_for_update()).scalar_one_or_none()
+    if found is None:
+        return False
+    db.info[_LOCKED_USER_KEY] = (user_id, db.get_transaction())
+    return True
+
+
+def _require_user_lock(db: Session, user_id: int) -> None:
+    # 쓰기 헬퍼의 전제 — 이 트랜잭션에서 같은 사용자로 lock_user 를 불렀어야 한다
+    locked = db.info.get(_LOCKED_USER_KEY)
+    if locked is None or locked[0] != user_id or locked[1] is not db.get_transaction():
+        raise RuntimeError("쓰기 전에 같은 트랜잭션에서 lock_user 를 불러야 합니다")
+
+
+def _active_todo(user_id: int) -> tuple:
+    return Todo.user_id == user_id, Todo.deleted_at.is_(None)
+
+
+def _owned_active_todo_id(user_id: int, todo_id: int):  # noqa: ANN202 — select 서브쿼리
+    return select(Todo.id).where(Todo.id == todo_id, *_active_todo(user_id))
+
+
+# --- 할 일 조회 (잠금 불필요) ---
+
+def active_todos(db: Session, user_id: int) -> list[Todo]:
+    # 그 사용자의 활성 할 일 전체, position·id 순 (GET /todos·내보내기·통계의 입력)
+    return list(db.scalars(
+        select(Todo).where(*_active_todo(user_id)).order_by(Todo.position, Todo.id)
+        .execution_options(populate_existing=True)))
+
+
+def get_owned_todo(db: Session, user_id: int, todo_id: int) -> Todo | None:
+    # 활성이고 그 사용자의 것일 때만. 다른 사용자·삭제 대기·없는 id 는 모두 None (404 로 같게)
+    return db.scalars(
+        select(Todo).where(Todo.id == todo_id, *_active_todo(user_id))
+        .execution_options(populate_existing=True)).one_or_none()
+
+
+def owned_todos_by_ids(db: Session, user_id: int, todo_ids: Sequence[int]) -> dict[int, Todo]:
+    # bulk 용 — 찾은 것만 담는다. 호출자는 요청 id 가 모두 있는지 보고 하나라도 없으면 아무것도 바꾸지 않는다(404)
+    ids = _unique_ids(todo_ids)
+    rows = db.scalars(
+        select(Todo).where(Todo.id.in_(ids), *_active_todo(user_id))
+        .execution_options(populate_existing=True))
+    return {row.id: row for row in rows}
+
+
+def subtasks_of(db: Session, user_id: int, todo_ids: Sequence[int]) -> dict[int, list[Subtask]]:
+    # 활성이고 그 사용자의 것인 할 일의 하위 할 일만, sid 순 (subtasks 에는 user_id 가 없어 상위를 조인해 거른다)
+    rows = db.scalars(
+        select(Subtask).join(Todo, Todo.id == Subtask.todo_id)
+        .where(Subtask.todo_id.in_(_unique_ids(todo_ids)), *_active_todo(user_id))
+        .order_by(Subtask.todo_id, Subtask.id).execution_options(populate_existing=True))
+    grouped: dict[int, list[Subtask]] = {}
+    for row in rows:
+        grouped.setdefault(row.todo_id, []).append(row)
+    return grouped
+
+
+# --- 할 일 쓰기 (lock_user 다음에만) ---
+
+def next_todo_position(db: Session, user_id: int) -> int:
+    # max(position) + 1 — 삭제 대기 행도 포함한다(§27.3: 대기 행 번호를 다시 쓰지 않는다)
+    _require_user_lock(db, user_id)
+    return db.execute(
+        select(func.coalesce(func.max(Todo.position), 0) + 1).where(Todo.user_id == user_id)).scalar_one()
+
+
+def insert_todo(db: Session, user_id: int, values: Mapping[str, object],
+                subtasks: Sequence[tuple[str, bool]] = ()) -> int:
+    # 새 할 일(POST·반복 다음 일정)을 끝에 붙이고 id 를 돌려준다. id 는 전역 시퀀스(§27.5), 하위 sid 는 1부터
+    _require_user_lock(db, user_id)
+    _check_fields(values, TODO_INSERT_FIELDS)
+    position = next_todo_position(db, user_id)
+    todo_id = db.execute(insert(Todo).values(**values, user_id=user_id, position=position)
+                         .returning(Todo.id)).scalar_one()
+    if subtasks:
+        db.execute(insert(Subtask), [{"todo_id": todo_id, "id": sid, "title": title, "completed": completed}
+                                     for sid, (title, completed) in enumerate(subtasks, start=1)])
+    return todo_id
+
+
+def update_owned_todo(db: Session, user_id: int, todo_id: int, values: Mapping[str, object]) -> bool:
+    # 활성이고 그 사용자의 것일 때만 바꾼다. 바꿨으면 True (없음·다른 사용자·삭제 대기는 False)
+    _require_user_lock(db, user_id)
+    _check_fields(values, TODO_UPDATE_FIELDS)
+    if not values:
+        return get_owned_todo(db, user_id, todo_id) is not None
+    result = db.execute(update(Todo).where(Todo.id == todo_id, *_active_todo(user_id))
+                        .values(**values).execution_options(synchronize_session=False))
+    return result.rowcount == 1
+
+
+def soft_delete_todos(db: Session, user_id: int, todo_ids: Sequence[int], now: datetime) -> list[int]:
+    # deleted_at = now. 지운 id 를 요청 순서대로 돌려준다. 원자성(하나라도 없으면 아무것도 안 함)은 호출자가
+    # owned_todos_by_ids 로 먼저 확인한다. 지운 뒤 사용자당 대기 행이 100건을 넘으면 오래된 것부터 완전 삭제한다
+    _require_aware(now)
+    _require_user_lock(db, user_id)
+    ids = _unique_ids(todo_ids)
+    deleted = set(db.execute(
+        update(Todo).where(Todo.id.in_(ids), *_active_todo(user_id)).values(deleted_at=now)
+        .returning(Todo.id).execution_options(synchronize_session=False)).scalars())
+    trim_deleted_todos(db, user_id)
+    return [i for i in ids if i in deleted]
+
+
+def trim_deleted_todos(db: Session, user_id: int, limit: int = UNDO_LIMIT_PER_USER) -> int:
+    # 대기 행을 최신 limit 개만 남기고 완전 삭제한다(하위 할 일은 FK CASCADE). 같은 시각이면 id 가 큰 쪽을 남긴다
+    _require_user_lock(db, user_id)
+    pending = (Todo.user_id == user_id, Todo.deleted_at.is_not(None))
+    keep = select(Todo.id).where(*pending).order_by(Todo.deleted_at.desc(), Todo.id.desc()).limit(limit)
+    return db.execute(delete(Todo).where(*pending, Todo.id.not_in(keep))
+                      .execution_options(synchronize_session=False)).rowcount
+
+
+def restore_todos(db: Session, user_id: int, todo_ids: Sequence[int], now: datetime) -> list[int] | None:
+    # 같은 사용자의 30초 안 대기 행만 복구한다. 하나라도 조건에 맞지 않으면 아무것도 바꾸지 않고 None(404).
+    # 성공하면 요청 순서의 id 목록 (position 은 그대로라 원래 자리로 돌아간다)
+    _require_aware(now)
+    _require_user_lock(db, user_id)
+    ids = _unique_ids(todo_ids)
+    restorable = (Todo.id.in_(ids), Todo.user_id == user_id, Todo.deleted_at.is_not(None),
+                  Todo.deleted_at > now - UNDO_WINDOW)
+    if set(db.scalars(select(Todo.id).where(*restorable))) != set(ids):
+        return None
+    db.execute(update(Todo).where(*restorable).values(deleted_at=None)
+               .execution_options(synchronize_session=False))
+    return ids
+
+
+def purge_expired_deleted_todos(db: Session, user_id: int, now: datetime) -> int:
+    # 30초가 지난 대기 행(deleted_at <= now − 30초)을 완전 삭제한다. 정리 전에도 조회 헬퍼는 대기 행을 보지 않는다
+    _require_aware(now)
+    _require_user_lock(db, user_id)
+    return db.execute(delete(Todo).where(
+        Todo.user_id == user_id, Todo.deleted_at.is_not(None), Todo.deleted_at <= now - UNDO_WINDOW,
+    ).execution_options(synchronize_session=False)).rowcount
+
+
+# --- 하위 할 일 쓰기 (lock_user 다음에만, 상위가 활성이고 그 사용자의 것일 때만) ---
+
+def add_subtask(db: Session, user_id: int, todo_id: int, title: str, completed: bool = False) -> int | None:
+    # sid = 그 할 일 안의 max(sid) + 1 (§14). 상위가 없거나 다른 사용자·삭제 대기면 None. 20개 한도는 호출자가 본다
+    _require_user_lock(db, user_id)
+    if db.execute(_owned_active_todo_id(user_id, todo_id)).scalar_one_or_none() is None:
+        return None
+    sid = db.execute(select(func.coalesce(func.max(Subtask.id), 0) + 1)
+                     .where(Subtask.todo_id == todo_id)).scalar_one()
+    db.execute(insert(Subtask).values(todo_id=todo_id, id=sid, title=title, completed=completed))
+    return sid
+
+
+def update_owned_subtask(db: Session, user_id: int, todo_id: int, subtask_id: int,
+                         values: Mapping[str, object]) -> bool:
+    _require_user_lock(db, user_id)
+    _check_fields(values, SUBTASK_UPDATE_FIELDS)
+    owned = (Subtask.todo_id == todo_id, Subtask.id == subtask_id,
+             Subtask.todo_id.in_(_owned_active_todo_id(user_id, todo_id)))
+    if not values:
+        return db.execute(select(Subtask.id).where(*owned)).scalar_one_or_none() is not None
+    result = db.execute(update(Subtask).where(*owned).values(**values)
+                        .execution_options(synchronize_session=False))
+    return result.rowcount == 1
+
+
+def delete_owned_subtask(db: Session, user_id: int, todo_id: int, subtask_id: int) -> bool:
+    _require_user_lock(db, user_id)
+    result = db.execute(delete(Subtask).where(
+        Subtask.todo_id == todo_id, Subtask.id == subtask_id,
+        Subtask.todo_id.in_(_owned_active_todo_id(user_id, todo_id)),
+    ).execution_options(synchronize_session=False))
+    return result.rowcount == 1
+
+
+# --- 템플릿 (조회는 잠금 불필요, 쓰기는 lock_user 다음에만, 삭제는 즉시 완전 삭제) ---
+
+def owned_templates(db: Session, user_id: int) -> list[TaskTemplate]:
+    return list(db.scalars(
+        select(TaskTemplate).where(TaskTemplate.user_id == user_id)
+        .order_by(TaskTemplate.position, TaskTemplate.id).execution_options(populate_existing=True)))
+
+
+def get_owned_template(db: Session, user_id: int, template_id: int) -> TaskTemplate | None:
+    return db.scalars(
+        select(TaskTemplate).where(TaskTemplate.id == template_id, TaskTemplate.user_id == user_id)
+        .execution_options(populate_existing=True)).one_or_none()
+
+
+def template_name_taken(db: Session, user_id: int, name: str, *, exclude_id: int | None = None) -> bool:
+    # 같은 사용자 안에서 lower(name) 이 같은 템플릿이 있는가 — DB 고유 인덱스(user_id, lower(name))와 같은 식 (R-16 확인 대상)
+    conditions = [TaskTemplate.user_id == user_id, func.lower(TaskTemplate.name) == func.lower(name)]
+    if exclude_id is not None:
+        conditions.append(TaskTemplate.id != exclude_id)          # 자기 자신으로 바꾸는 것은 허용 (§16)
+    return db.execute(select(TaskTemplate.id).where(*conditions).limit(1)).first() is not None
+
+
+def insert_template(db: Session, user_id: int, values: Mapping[str, object]) -> int:
+    # 끝에 붙인다(그 사용자의 max(position) + 1). id 는 전역 시퀀스
+    _require_user_lock(db, user_id)
+    _check_fields(values, TEMPLATE_FIELDS)
+    position = db.execute(select(func.coalesce(func.max(TaskTemplate.position), 0) + 1)
+                          .where(TaskTemplate.user_id == user_id)).scalar_one()
+    return db.execute(insert(TaskTemplate).values(**values, user_id=user_id, position=position)
+                      .returning(TaskTemplate.id)).scalar_one()
+
+
+def update_owned_template(db: Session, user_id: int, template_id: int, values: Mapping[str, object]) -> bool:
+    _require_user_lock(db, user_id)
+    _check_fields(values, TEMPLATE_FIELDS)
+    owned = (TaskTemplate.id == template_id, TaskTemplate.user_id == user_id)
+    if not values:
+        return db.execute(select(TaskTemplate.id).where(*owned)).scalar_one_or_none() is not None
+    result = db.execute(update(TaskTemplate).where(*owned).values(**values)
+                        .execution_options(synchronize_session=False))
+    return result.rowcount == 1
+
+
+def delete_owned_template(db: Session, user_id: int, template_id: int) -> bool:
+    _require_user_lock(db, user_id)
+    result = db.execute(delete(TaskTemplate).where(
+        TaskTemplate.id == template_id, TaskTemplate.user_id == user_id,
+    ).execution_options(synchronize_session=False))
+    return result.rowcount == 1

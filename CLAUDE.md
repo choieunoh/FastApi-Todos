@@ -39,8 +39,8 @@ FastApi_Todos/
 ├── scripts/load-data.sh        # 백업 → 데이터 볼륨 이전·복구 (README "배포와 데이터 관리")
 ├── scripts/dev-postgres-init/  # (7.0.0, 선택) Docker 개발 DB 첫 기동 때 테스트 DB 생성 SQL
 └── fastapi-app/
-    ├── main.py                 # API + 모델 + 저장 로직 (7.0.0: 라우트·Pydantic 모델·순수 로직). (Phase 2-E) `/auth/*` 4개·시작 가드(lifespan)·`require_user`·`require_csrf`·인증 경로 422 처리기 — v6 데이터 경로는 아직 JSON·인증 없음(Phase 3)
-    ├── db.py                   # (7.0.0 Phase 1·2-A·2-C·2-D) 엔진·ORM 7개(2-A `auth_failures`)·세션·테스트 DB 보호·삭제 전 스키마 게이트(R-19)·downgrade 보호, (2-C) 로그인 세션 저장·조회·삭제·만료 정리, (2-D) 시도 제한 잠금·검사·선기록·자기 id 삭제·정리, (2-E) 가입·rehash 헬퍼(`username_exists`·SAVEPOINT `create_user`·`update_password_hash_if_unchanged`·`is_lock_timeout`) (모두 commit 은 호출자). 소유자 조건 헬퍼는 Phase 3 예정
+    ├── main.py                 # API + 모델 + 저장 로직 (7.0.0: 라우트·Pydantic 모델·순수 로직). (Phase 2-E) `/auth/*` 4개·시작 가드(lifespan)·`require_user`·`require_csrf`·인증 경로 422 처리기, (3-1) 요청 Session 의존성 `RequestDbDep`(응답 전 commit, DB 오류 고정 500·R-27)·`require_user`가 같은 Session 사용 — v6 데이터 경로는 아직 JSON·인증 없음(3-4·3-5)
+    ├── db.py                   # (7.0.0 Phase 1·2-A·2-C·2-D) 엔진·ORM 7개(2-A `auth_failures`)·세션·테스트 DB 보호·삭제 전 스키마 게이트(R-19)·downgrade 보호, (2-C) 로그인 세션 저장·조회·삭제·만료 정리, (2-D) 시도 제한 잠금·검사·선기록·자기 id 삭제·정리, (2-E) 가입·rehash 헬퍼(`username_exists`·SAVEPOINT `create_user`·`update_password_hash_if_unchanged`·`is_lock_timeout`) (모두 commit 은 호출자), (3-1) 사용자 데이터 헬퍼(`lock_user`·잠금 확인, 할 일·하위 할 일·템플릿 소유자 조건 조회·쓰기, soft delete·100건 정리·30초 복구·`position`) — 데이터 경로 연결은 3-4·3-5
     ├── auth.py                 # (7.0.0 Phase 2-B·2-D) 순수 인증 함수: 설정·입력 검증·Argon2id·토큰·CSRF 비교·Origin 판정·쿠키 속성, (2-D) 제한 판정·Retry-After·username HMAC 키·IP 정규화·Argon2 슬롯 (DB·라우트 없음). 트랜잭션 구성·429·503 응답·`require_user`·라우트 연결은 main.py(2-E)
     ├── migrate_json.py         # (7.0.0 예정) JSON → PostgreSQL 이전·검증·역내보내기·diff CLI
     ├── alembic.ini, alembic/   # (7.0.0 Phase 1·2-A) 스키마 마이그레이션, 리비전 versions/0001_initial.py·0002_auth_failures.py (DATABASE_URL로 접속)
@@ -56,7 +56,8 @@ FastApi_Todos/
         ├── test_ui.py          # Playwright (B, 5.0.0 UI)
         ├── test_ui_auth.py     # (7.0.0 Phase 2-G1) 로그인·가입 UI Playwright, `/auth/*`는 라우트 모킹 (DB 없음)
         ├── test_db_schema.py   # (7.0.0) DB 없이 도는 스키마·보호 장치 테스트
-        ├── test_db_postgres.py # (7.0.0) PostgreSQL 테스트 DB(todo_test) 통합 테스트, TEST_DATABASE_URL 없으면 skip
+        ├── test_request_db.py  # (7.0.0 Phase 3-1) DB 없는 요청 Session·응답 전 commit·R-27·사용자 데이터 헬퍼 SQL 테스트
+        ├── test_db_postgres.py # (7.0.0) PostgreSQL 테스트 DB(todo_test) 통합 테스트, TEST_DATABASE_URL 없으면 skip. (3-1) 연결 반환·사용자 격리·soft delete·잠금·R-27·R-16 관찰
         └── test_integration.py # 배포 서버 대상, `pytest -m integration`
 ```
 
@@ -399,7 +400,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-toggle`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `template-load`, `template-edit`, `template-delete`, `template-name`, `template-save`, `template-edit-form`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`, `calendar-chip`
   - v6: `view-stats`, `dash-total`, `dash-completed`, `dash-active`, `dash-overdue`, `dash-rate`, `dash-trend`, `dash-trend-summary`, `dash-trend-table`, `dash-excluded`, `dash-priority`, `dash-compliance`, `dash-basis`, `kanban`, `kanban-column`(`data-status="active"|"completed"`), `kanban-count`, `kanban-card`(`data-id`), `kanban-move`, `kanban-status`, `notification-bell`, `notification-badge`, `notification-panel`, `notification-item`(`data-category`, `data-todo-id`), `notification-read-all`, `notification-live` `theme-select`, `status-message`. 목록 항목(`todo-item`)에는 `data-id`가 있다. 칸반 카드 안의 태그·배지·진행률·D-day·즐겨찾기는 목록과 같은 testid(`todo-tag`, `recurrence-badge`, `subtask-progress`, `dday`, `favorite-toggle`)를 쓴다.
   - v7: `auth-panel`, `login-form`, `auth-mode-toggle`, `auth-username`, `auth-password`, `auth-submit`, `auth-error`, `current-user`, `logout`
-- (7.0.0) **Python DB**: SQLAlchemy 2.x 스타일(`DeclarativeBase`, `Mapped[]`, `select()`)을 쓴다. 요청마다 세션 1개·트랜잭션 1개이고 — 데이터 경로는 인증 조회와 데이터 작업이 같은 Session을 쓰고 commit은 성공 응답 전에 끝나며, commit이 실패하면 성공 응답을 보내지 않는다(`V7_SPEC.md` §29.4, Phase 3-1 구현·검증 예정) — (예외: 로그인 경로는 선기록 Tx1 → 트랜잭션 밖 Argon2 → 성공 Tx2 또는 보상 Tx로 나눈다 — Argon2 동안 DB 연결·잠금을 잡지 않기 위해, 2026-11-06 승인, `V7_SPEC.md` §29.5), 사용자 데이터 조회는 `db.py`의 소유자 조건 헬퍼로만 한다. 스키마 변경은 Alembic 리비전으로만 한다(앱 시작 시 `create_all` 금지).
+- (7.0.0) **Python DB**: SQLAlchemy 2.x 스타일(`DeclarativeBase`, `Mapped[]`, `select()`)을 쓴다. 요청마다 세션 1개·트랜잭션 1개이고 — 데이터 경로는 인증 조회와 데이터 작업이 같은 Session을 쓰고 commit은 성공 응답 전에 끝나며, commit이 실패하면 성공 응답을 보내지 않는다(`V7_SPEC.md` §29.4, Phase 3-1 구현·검증 완료 2026-11-08 — 데이터 경로 연결은 3-4·3-5) — (예외: 로그인 경로는 선기록 Tx1 → 트랜잭션 밖 Argon2 → 성공 Tx2 또는 보상 Tx로 나눈다 — Argon2 동안 DB 연결·잠금을 잡지 않기 위해, 2026-11-06 승인, `V7_SPEC.md` §29.5), 사용자 데이터 조회는 `db.py`의 소유자 조건 헬퍼로만 한다. 스키마 변경은 Alembic 리비전으로만 한다(앱 시작 시 `create_all` 금지).
 - **커밋**: Conventional Commits 형식이다 (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
   - 기능 커밋 예: `feat: add favorites for Version 5.0.0`
 
@@ -479,6 +480,8 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - [x] T-A 잔여: 가입의 HTTP 수준 공백 정규화·`$argon2id$` 접두 검사, 고정 시계로 14일 만료 HTTP 검사 — **검증 완료(2026-11-06), 테스트만 추가(운영 코드 변경 없음)**. DB 없는 `tests/test_auth_routes.py` R1~R5(사례 9개, 단독 96 passed), `todo_test` PostgreSQL HTTP P1·P2(정규화 저장·`$argon2id$`·409·공백 로그인, T+14일−1µs 200·정확히 14일 401·로그인 때 만료 정리). DB 없는 전체 회귀 **1005 passed·1 skipped·3 deselected**, PostgreSQL 단독 **57 passed**, PostgreSQL 포함 전체 회귀 **1062 passed·0 failed·0 skipped·3 deselected**(deselected 3은 운영 IP 통합 테스트, 의도적 제외). PostgreSQL 실행 전후 읽기 전용 R-19 점검 통과, 종료 후 `todo_test` 0002·사용자 데이터 0행. 수치·범위는 `V7_PLAN.md` §P2 "T-A 잔여 검증 완료" 블록. R-12(Docker·프록시 실환경 클라이언트 IP)는 2026-11-06 Phase 6으로 이관 — 미검증, 운영 공개 전 필수(`V7_PLAN.md` §P7·§P11). 원격 push는 보류.
 - [ ] 3. 15개 데이터 경로 인증 필수, 익명 401·타 사용자 404 매트릭스, bulk·restore 격리, 템플릿 이름 사용자별, soft delete·position, 동시 요청.
   - 하위 단계 3-0~3-6(2026-11-08 채택, B 방식 — 경로 묶음마다 인증·CSRF·DB 격리 함께, `V7_PLAN.md` §P3): 3-0 결정·문서, 3-1 요청 Session 구조·DB 헬퍼, 3-2 UI 테스트 기반, 3-3 UI 로그인 게이트, 3-4 템플릿 4개, 3-5 할 일 11개, 3-6 JSON 런타임 제거·계약 정리. 각 단계의 구현·검증은 별도 승인이며, 데이터 경로 15개 전체 격리 검증 전에는 운영에 공개하지 않는다(`V7_PLAN.md` §P7). D-6·D-7 승인(2026-11-08).
+  - [x] 3-0. 결정·문서(D-6·D-7, B 방식, 하위 단계 3-0~3-6) — 2026-11-08, 로컬 커밋 `978bb4e`.
+  - [x] 3-1. 요청 Session 구조·DB 헬퍼 — **구현·검증 완료(2026-11-08)**. 데이터 경로 15개는 바꾸지 않았다. DB 없는 회귀 **992 passed·3 deselected**(새 `tests/test_request_db.py` 132 포함), UI **156 passed**, `todo_test` PostgreSQL **83 passed**, 합계 **1,231 passed**(deselected 3은 운영 IP 통합 테스트, 의도적 제외). PostgreSQL 실행 전후 읽기 전용 R-19 점검 통과, 종료 후 사용자 데이터 7개 표 0행. 테스트 초기화는 A(`fresh_schema`) 채택(`V7_PLAN.md` §P8.6, 실행마다 승인 유지). 잠금 대기 정책·템플릿 이름 기준(R-16)·purge 호출 위치는 미결정, R-16·R-19·R-27은 열림. 수치·경위는 `V7_PLAN.md` §P3 "3-1 결과".
 - [ ] 4. v6 기능 전체를 DB·인증 위에서 통과(기존 테스트는 픽스처만 교체, 변경 목록은 `V7_PLAN.md` §P8.3), 사용자별 알림 키, 두 사용자 UI 격리, `Version 7.0.0`.
 - [ ] 5. `migrate_json.py` import·verify·export-v6·diff, 백업 사본 리허설 2회, 원본 해시 불변, `pg_dump` 복원 검증, 내용 미출력.
 - [ ] 6. 전체 pytest, 이미지 빌드·격리 Compose 실행, **R-12 실환경 클라이언트 IP 검증(Phase 2에서 이관, `V7_PLAN.md` §P11)**, OWASP 재점검, README·릴리스 노트, compose·Jenkins 변경안. 운영 공개는 HTTPS 게이트(`V7_PLAN.md` §P7 — R-12 통과 포함)와 별도 승인 후이며, R-12 검증 전에는 운영에 공개하지 않는다.

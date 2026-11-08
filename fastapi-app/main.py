@@ -4,8 +4,8 @@ import io
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -21,6 +21,8 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import (
     AfterValidator, BaseModel, Field, StrictBool, StringConstraints, field_validator, model_validator,
 )
+import psycopg
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import auth                                      # (7.0.0) 순수 인증 함수
@@ -724,23 +726,118 @@ def require_same_origin(request: Request) -> None:
         raise HTTPException(403, ORIGIN_INVALID)
 
 
-def _load_current_user(request: Request, config: AuthConfig, factory: Callable[[], Session]) -> CurrentUser | None:
+class RequestDb:
+    """(Phase 3-1A) 요청 하나의 Session·트랜잭션 — 처음 session() 을 부를 때 연다(쿠키 없는 401 은 DB 를 열지 않는다).
+
+    commit·rollback 은 request_db 의존성만 한다. 헬퍼·핸들러·require_user 는 commit 하지 않는다.
+    Session 은 auth_session_factory 로 만든다(테스트의 dependency_overrides 지점을 그대로 쓴다).
+    """
+
+    def __init__(self, factory: Callable[[], Session]) -> None:
+        self._factory = factory
+        self._stack: ExitStack | None = None
+        self._session: Session | None = None
+
+    @property
+    def opened(self) -> bool:
+        return self._session is not None
+
+    def session(self) -> Session:
+        if self._session is None:
+            stack = ExitStack()
+            try:
+                session = stack.enter_context(self._factory())
+                stack.enter_context(session.begin())
+            except BaseException:
+                stack.close()
+                raise
+            self._stack, self._session = stack, session
+        return self._session
+
+    def finish(self, exc: BaseException | None) -> None:
+        # 예외가 없으면 commit, 있으면 rollback. 어느 쪽이든 Session 을 닫는다. 열지 않았으면 아무것도 하지 않는다
+        stack, self._stack, self._session = self._stack, None, None
+        if stack is None:
+            return
+        if exc is None:
+            stack.__exit__(None, None, None)
+        else:
+            stack.__exit__(type(exc), exc, exc.__traceback__)
+
+
+DB_ERRORS = (SQLAlchemyError, psycopg.Error)    # (R-27) 요청 Session 경계에서 고정 500 으로 바꾸는 DB 예외만
+_SQLSTATE_CHARS = frozenset("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def _safe_sqlstate(exc: BaseException) -> str | None:
+    # 드라이버 예외(psycopg) 또는 SQLAlchemy 래퍼(.orig)의 SQLSTATE — 5자리 영숫자일 때만 (다른 값은 로그에 넣지 않는다)
+    value = getattr(exc, "sqlstate", None)
+    if value is None:
+        value = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if isinstance(value, str) and len(value) == 5 and set(value) <= _SQLSTATE_CHARS:
+        return value
+    return None
+
+
+def _log_db_event(event: str, exc: BaseException) -> None:
+    # 로그는 고정 사건명·예외 클래스명·SQLSTATE 만 — str(exc)·repr·traceback·exc_info 를 남기지 않는다 (R-27)
+    logger.warning("%s exc_type=%s sqlstate=%s", event, type(exc).__name__, _safe_sqlstate(exc))
+
+
+def _rollback(holder: RequestDb, exc: BaseException) -> None:
+    try:
+        holder.finish(exc)                       # rollback + Session close
+    except Exception as cleanup:                 # noqa: BLE001 — rollback 실패는 기록만, 원래 처리 결과를 바꾸지 않는다
+        _log_db_event("request_db_rollback_failed", cleanup)
+
+
+def request_db(factory: Callable[[], Session] = Depends(auth_session_factory)) -> Iterator[RequestDb]:
+    # 일반 데이터 요청의 Session 1개·트랜잭션 1개 (V7_SPEC §29.4). 반드시 RequestDbDep(scope="function")로만 참조한다 —
+    # scope 가 다르면 FastAPI 의존성 캐시 키가 달라져 Session 이 2개가 된다. "function" 이면 응답을 보내기 전에 끝난다.
+    # 예외 처리 (R-27):
+    # - HTTPException(401·403·404·409 등)·검증 오류(422)·일반 파이썬 오류 → rollback 후 원래 예외를 그대로 올린다
+    # - DB 예외(SQLAlchemyError·psycopg.Error) → rollback 후 고정 500. 원래 예외는 연결하지 않는다(from None)
+    # - commit 중 DB 예외 → 고정 500 (성공 응답을 보내지 않는다). commit 중 다른 예외는 그대로 올린다
+    # 500 은 except 블록 밖에서 만든다 — 원래 DB 예외가 __context__ 로도 붙지 않게
+    holder = RequestDb(factory)
+    db_failed = False
+    try:
+        yield holder
+    except DB_ERRORS as exc:
+        _log_db_event("request_db_error", exc)
+        _rollback(holder, exc)
+        db_failed = True
+    except BaseException as exc:
+        _rollback(holder, exc)
+        raise
+    if not db_failed:
+        try:
+            holder.finish(None)                  # commit — 성공 응답보다 먼저
+        except DB_ERRORS as exc:                 # commit 실패면 성공 응답을 보내지 않는다
+            _log_db_event("request_db_commit_failed", exc)
+            db_failed = True
+    if db_failed:
+        raise HTTPException(500, SERVER_ERROR)
+
+
+RequestDbDep = Annotated[RequestDb, Depends(request_db, scope="function")]   # 요청 Session 은 이 별칭으로만 받는다
+
+
+def _load_current_user(request: Request, config: AuthConfig, rdb: RequestDb) -> CurrentUser | None:
     token = request.cookies.get(config.settings.cookie_name)
     if token is None:
+        return None                              # DB 를 열지 않는다
+    found = db.get_active_session(rdb.session(), token, now())   # 데이터 작업과 같은 Session·트랜잭션
+    if found is None:
         return None
-    with factory() as session, session.begin():
-        found = db.get_active_session(session, token, now())
-        if found is None:
-            return None
-        user_session, user = found
-        return CurrentUser(id=user.id, username=user.username, csrf_token=user_session.csrf_token)
+    user_session, user = found
+    return CurrentUser(id=user.id, username=user.username, csrf_token=user_session.csrf_token)
 
 
-def require_user(request: Request, config: AuthConfig = Depends(auth_config),
-                 factory: Callable[[], Session] = Depends(auth_session_factory)) -> CurrentUser:
-    # 유효한 세션이 없으면 401. DB 오류는 500·503 (Phase 3 에서 데이터 경로에 건다)
+def require_user(request: Request, rdb: RequestDbDep, config: AuthConfig = Depends(auth_config)) -> CurrentUser:
+    # 유효한 세션이 없으면 401. DB 오류는 500·503. 요청 Session(rdb)을 핸들러와 함께 쓴다 (데이터 경로 연결은 3-4·3-5)
     try:
-        user = _load_current_user(request, config, factory)
+        user = _load_current_user(request, config, rdb)
     except Exception as exc:                     # noqa: BLE001
         raise _auth_failure(exc, "auth_session_error") from None
     if user is None:

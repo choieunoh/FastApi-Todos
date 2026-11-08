@@ -78,10 +78,43 @@ def alembic_cfg(monkeypatch):
     return Config(str(APP_DIR / "alembic.ini"))
 
 
+def wait_until_single_backend(engine) -> None:
+    # (3-1B-2) fresh_schema 의 게이트 "앞"에서 읽기만 하며 기다린다 — 이 DB 의 연결 수(numbackends)가 점검 연결 1개로
+    # 돌아올 때까지 BACKEND_RELEASE_TIMEOUT 안에서만. 대기 종료는 R-19 통과가 아니다(바로 뒤 게이트가 다시 판정한다).
+    # 같은 역할의 다른 세션이 보이면 기다리지 않고 멈추고, 추가 백엔드의 정체는 추정하지 않는다. 쓰기는 하지 않는다.
+    if any(t.is_alive() for t in _UNFINISHED_WORKERS):
+        pytest.exit("끝나지 않은 작업 스레드가 있어 연결 수를 확인할 수 없습니다 — 이후 PostgreSQL 테스트를 진행하지 않습니다",
+                    returncode=3)
+    start = time.monotonic()
+    while True:
+        try:
+            with engine.connect() as conn:                                   # 풀의 점검 연결 1개 — 매번 새 트랜잭션
+                backends = conn.execute(text(db.TEST_SCHEMA_SQL["database_backends"])).scalar_one()
+                others = conn.execute(text(db.TEST_SCHEMA_SQL["other_sessions"])).scalar_one()
+                conn.rollback()                                              # 읽기만 — 스냅숏을 다음 반복으로 넘기지 않는다
+        except SQLAlchemyError as exc:
+            sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+            safe = sqlstate if isinstance(sqlstate, str) and len(sqlstate) == 5 and sqlstate.isalnum() else None
+            pytest.exit(f"테스트 DB 보호: 게이트 전 연결 수 확인 실패 ({type(exc).__name__}, sqlstate={safe})", returncode=2)
+        elapsed = time.monotonic() - start
+        if type(backends) is not int or type(others) is not int:
+            pytest.exit("테스트 DB 보호: 게이트 전 연결 수를 확인할 수 없음", returncode=2)
+        if others != 0:
+            pytest.exit(f"테스트 DB 보호: 같은 역할의 다른 세션 {others}개 (DB 연결 수 {backends}, {elapsed:.2f}초) "
+                        "— 기다리지 않고 멈춘다", returncode=2)
+        if backends == 1:
+            return
+        if elapsed >= BACKEND_RELEASE_TIMEOUT:
+            pytest.exit(f"테스트 DB 보호: DB 연결 수 {backends} 가 {BACKEND_RELEASE_TIMEOUT}초 안에 1로 돌아오지 않음 "
+                        f"(다른 세션 0, {elapsed:.2f}초) — 추가 백엔드의 정체는 확인하지 않음", returncode=2)
+        time.sleep(0.05)
+
+
 @pytest.fixture
 def fresh_schema(engine, alembic_cfg):
     # 빈 스키마에서 head 까지 올린다. 지우기 직전에 같은 연결·트랜잭션에서 서버와 스키마 내용(R-19)을
     # 다시 확인한다. 하나라도 어긋나거나 확인할 수 없으면 지우지 않고 세션 전체를 멈춘다
+    wait_until_single_backend(engine)                                        # (3-1B-2) 읽기 전용 사전 대기 — 판정은 아래 게이트
     try:
         with engine.begin() as conn:
             db.verify_test_server(conn)
@@ -220,6 +253,7 @@ def failure_row(kind: str, username_key: str | None, client_ip: str = "127.0.0.1
 
 
 def test_gate_accepts_state_left_by_migrations(fresh_schema):
+    wait_until_single_backend(fresh_schema)                                  # (3-1B-3) 업그레이드 직후 — 판정은 아래 게이트
     with fresh_schema.connect() as conn:
         assert db.verify_test_schema(conn) == "0002"
 
@@ -424,6 +458,7 @@ def test_logout_commit_is_seen_by_other_connection(fresh_schema):
                     assert db.get_active_session(orm(conn2), token, T) is None
     finally:
         other.dispose()                                                      # 다음 게이트 전에 연결을 닫는다
+        wait_for_backends_released(fresh_schema)                             # (3-1B-2) 닫은 연결이 서버에서 사라졌는지 확인
 
 
 # ---------- Phase 2-D: 로그인·가입 시도 제한 (db.begin_login_attempt 등) ----------
@@ -1009,6 +1044,785 @@ def test_http_session_expires_after_14_days_with_fixed_clock(http_app, monkeypat
     assert (old_status, new_status) == (401, 200)
 
 
+# ---------- (Phase 3-1B-1) 요청 Session(main.request_db)의 실제 연결 반환 ----------
+# http_app 의 엔진(fresh_schema 의 모듈 엔진, 기본 풀)을 그대로 쓴다. 요청은 하나씩 차례로 보내고, 요청 중에는
+# 이 테스트가 다른 연결을 붙잡지 않는다. 풀 이벤트는 관찰(체크아웃·반환 횟수)만 하고 풀 설정은 바꾸지 않는다.
+# 끝에서 wait_for_backends_released 로 다음 테스트의 R-19 게이트와 같은 조건(DB 연결 1개·다른 세션 0)을 확인한다.
+
+@contextmanager
+def pool_checkouts(engine):
+    # 블록 안에서 일어난 연결 체크아웃·반환 횟수 — 끝나면(실패해도) 리스너를 뗀다
+    counts = {"checkout": 0, "checkin": 0}
+
+    def on_checkout(dbapi_conn, record, proxy):
+        counts["checkout"] += 1
+
+    def on_checkin(dbapi_conn, record):
+        counts["checkin"] += 1
+
+    event.listen(engine, "checkout", on_checkout)
+    event.listen(engine, "checkin", on_checkin)
+    try:
+        yield counts
+    finally:
+        event.remove(engine, "checkout", on_checkout)
+        event.remove(engine, "checkin", on_checkin)
+
+
+def test_http_me_without_cookie_uses_no_connection(http_app):
+    # 쿠키 없는 /auth/me 는 401 이고 요청 Session 을 열지 않는다 — 연결을 꺼내지도 남기지도 않는다
+    c = http_client()
+    with pool_checkouts(http_app) as counts:
+        statuses = [call(c, "GET", "/auth/me").status_code for _ in range(5)]
+    assert statuses == [401] * 5
+    assert counts == {"checkout": 0, "checkin": 0}
+    assert http_app.pool.checkedout() == 0
+    wait_for_backends_released(http_app)                                     # 다음 R-19 게이트 조건 (연결 1·다른 세션 0)
+
+
+def test_http_me_with_session_returns_connection_each_request(http_app):
+    # 유효한 세션의 /auth/me 는 요청마다 Session 하나(연결 체크아웃 1회)를 쓰고, 끝나면 연결을 풀에 돌려준다
+    c = http_client()
+    created = call(c, "POST", "/auth/register", body=creds())
+    assert created.status_code == 201
+    token = created.cookies.get(COOKIE)
+    has_token = token is not None
+    assert has_token
+    assert http_app.pool.checkedout() == 0
+    with pool_checkouts(http_app) as counts:
+        responses = [call(c, "GET", "/auth/me", token=token) for _ in range(5)]
+    statuses = [r.status_code for r in responses]
+    same_user = all(r.json().get("username") == "alice" for r in responses)
+    assert statuses == [200] * 5 and same_user
+    assert counts == {"checkout": 5, "checkin": 5}                            # 요청당 Session·연결 1개, 모두 반환
+    assert http_app.pool.checkedout() == 0
+    assert db_state(http_app)["sessions"] == 1                               # 조회는 세션 행을 바꾸지 않는다
+    wait_for_backends_released(http_app)
+
+
+# ---------- (Phase 3-1B-2) 사용자 데이터 헬퍼의 소유권 격리 (실제 PostgreSQL) ----------
+# 모두 rolled_back(한 연결·한 트랜잭션, 끝나면 되돌림)이라 데이터를 남기지 않는다. 헬퍼는 같은 연결의 ORM Session 으로
+# 부르고, 쓰기 전에는 그 사용자로 lock_user 를 부른다(쓰기 헬퍼 규약). 원본이 그대로인지는 소유권 조건 없이 직접 읽어
+# 비교한다 — 확인용 읽기일 뿐 헬퍼 결과를 만들거나 바꾸는 데 쓰지 않는다. 사용자 A·B 는 테스트마다 새로 만든다.
+
+def todo_snapshot(conn, todo_id: int):
+    return conn.execute(select(db.Todo.__table__).where(db.Todo.id == todo_id)).one()
+
+
+def subtask_snapshot(conn, todo_id: int) -> list:
+    return conn.execute(select(db.Subtask.__table__).where(db.Subtask.todo_id == todo_id)
+                        .order_by(db.Subtask.id)).all()
+
+
+def template_snapshot(conn, template_id: int):
+    return conn.execute(select(db.TaskTemplate.__table__).where(db.TaskTemplate.id == template_id)).one()
+
+
+def missing_todo_id(conn) -> int:
+    return conn.execute(select(func.coalesce(func.max(db.Todo.id), 0) + 1000)).scalar_one()
+
+
+def missing_template_id(conn) -> int:
+    return conn.execute(select(func.coalesce(func.max(db.TaskTemplate.id), 0) + 1000)).scalar_one()
+
+
+def test_todo_helpers_isolate_users(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        assert db.lock_user(s, alice)
+        a1 = db.insert_todo(s, alice, {"title": "A 첫째", "priority": "높음"})
+        a2 = db.insert_todo(s, alice, {"title": "A 둘째"})
+        assert db.lock_user(s, bob)
+        b1 = db.insert_todo(s, bob, {"title": "B 첫째"})
+        assert len({a1, a2, b1}) == 3                                       # 서로 다른 행
+        before = todo_snapshot(conn, a1)
+
+        # A 는 자기 것만, B 는 자기 것만 본다
+        assert [t.id for t in db.active_todos(s, alice)] == [a1, a2]
+        assert [t.id for t in db.active_todos(s, bob)] == [b1]
+        assert db.get_owned_todo(s, alice, a1).title == "A 첫째"
+        assert db.get_owned_todo(s, bob, a1) is None
+        assert set(db.owned_todos_by_ids(s, bob, [a1, a2, b1])) == {b1}     # 섞인 id 에서도 자기 것만
+        assert set(db.owned_todos_by_ids(s, alice, [a1, a2, b1])) == {a1, a2}
+
+        # B 의 수정·삭제 시도는 실패하고 A 의 원본은 그대로다
+        assert db.lock_user(s, bob)
+        assert db.update_owned_todo(s, bob, a1, {"title": "B 가 바꿈", "completed": True}) is False
+        assert db.soft_delete_todos(s, bob, [a1, a2], T) == []
+        assert todo_snapshot(conn, a1) == before
+        assert todo_snapshot(conn, a2).deleted_at is None
+        assert [t.id for t in db.active_todos(s, alice)] == [a1, a2]
+
+        # A 자신의 수정은 된다 (대조)
+        assert db.lock_user(s, alice)
+        assert db.update_owned_todo(s, alice, a1, {"title": "A 가 바꿈"}) is True
+        assert db.get_owned_todo(s, alice, a1).title == "A 가 바꿈"
+        assert db.get_owned_todo(s, bob, b1).title == "B 첫째"              # B 의 행은 영향 없음
+        assert count(conn, db.Todo) == 3
+
+
+def test_subtask_helpers_require_parent_owner(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        assert db.lock_user(s, alice)
+        a_todo = db.insert_todo(s, alice, {"title": "A 상위"}, subtasks=[("하나", False), ("둘", True)])
+        assert db.add_subtask(s, alice, a_todo, "셋") == 3                  # sid = max + 1
+        assert db.lock_user(s, bob)
+        b_todo = db.insert_todo(s, bob, {"title": "B 상위"}, subtasks=[("하나", False)])
+        before = subtask_snapshot(conn, a_todo)
+        assert [(r.id, r.title, r.completed) for r in before] == [(1, "하나", False), (2, "둘", True), (3, "셋", False)]
+
+        # 조회: 상위 소유자만
+        assert [r.id for r in db.subtasks_of(s, alice, [a_todo])[a_todo]] == [1, 2, 3]
+        assert db.subtasks_of(s, bob, [a_todo]) == {}
+        assert set(db.subtasks_of(s, bob, [a_todo, b_todo])) == {b_todo}
+
+        # B 의 추가·수정·삭제 시도 (todo_id 와 sid 를 함께 지정) — 모두 실패, A 의 하위 할 일은 그대로
+        assert db.lock_user(s, bob)
+        assert db.add_subtask(s, bob, a_todo, "B 가 추가") is None
+        assert db.update_owned_subtask(s, bob, a_todo, 1, {"title": "B 가 바꿈", "completed": True}) is False
+        assert db.delete_owned_subtask(s, bob, a_todo, 2) is False
+        assert db.update_owned_subtask(s, bob, b_todo, 2, {"completed": True}) is False   # 자기 상위에 없는 sid
+        assert subtask_snapshot(conn, a_todo) == before
+
+        # 다른 상위의 같은 sid 는 다른 행이다 — B 가 자기 sid 1 을 바꿔도 A 의 sid 1 은 그대로
+        assert db.update_owned_subtask(s, bob, b_todo, 1, {"title": "B 의 하나"}) is True
+        assert subtask_snapshot(conn, a_todo) == before
+
+        # A 자신은 된다 (대조)
+        assert db.lock_user(s, alice)
+        assert db.update_owned_subtask(s, alice, a_todo, 1, {"completed": True}) is True
+        assert db.delete_owned_subtask(s, alice, a_todo, 3) is True
+        assert [(r.id, r.completed) for r in subtask_snapshot(conn, a_todo)] == [(1, True), (2, True)]
+
+
+def test_template_helpers_isolate_users_and_allow_same_name(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        assert db.lock_user(s, alice)
+        a_tpl = db.insert_template(s, alice, {"name": "주간 보고", "title": "보고서", "tags": ["업무"]})
+        assert db.lock_user(s, bob)
+        b_tpl = db.insert_template(s, bob, {"name": "주간 보고", "title": "B 보고서"})   # 다른 사용자는 같은 이름 허용
+        assert a_tpl != b_tpl
+        before = template_snapshot(conn, a_tpl)
+
+        assert [t.id for t in db.owned_templates(s, alice)] == [a_tpl]
+        assert [t.id for t in db.owned_templates(s, bob)] == [b_tpl]
+        assert db.get_owned_template(s, bob, a_tpl) is None
+        assert db.get_owned_template(s, alice, a_tpl).title == "보고서"
+
+        # 이름 중복 검사는 사용자 안에서만
+        assert db.template_name_taken(s, alice, "주간 보고") is True
+        assert db.template_name_taken(s, alice, "주간 보고", exclude_id=a_tpl) is False   # 자기 자신은 제외
+        assert db.template_name_taken(s, bob, "주간 보고", exclude_id=b_tpl) is False      # A 의 같은 이름은 B 와 무관
+        assert db.template_name_taken(s, bob, "다른 이름") is False
+
+        # B 의 수정·삭제 시도 — 실패, A 의 템플릿은 그대로
+        assert db.lock_user(s, bob)
+        assert db.update_owned_template(s, bob, a_tpl, {"title": "B 가 바꿈"}) is False
+        assert db.delete_owned_template(s, bob, a_tpl) is False
+        assert template_snapshot(conn, a_tpl) == before
+        assert [t.id for t in db.owned_templates(s, alice)] == [a_tpl]
+
+        # 각자 자기 것은 바꾸고 지울 수 있다 (대조)
+        assert db.update_owned_template(s, bob, b_tpl, {"title": "B 가 바꿈"}) is True
+        assert db.delete_owned_template(s, bob, b_tpl) is True
+        assert db.owned_templates(s, bob) == []
+        assert template_snapshot(conn, a_tpl) == before
+        assert count(conn, db.TaskTemplate) == 1
+
+
+def test_positions_are_independent_per_user(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        assert db.lock_user(s, alice)
+        assert db.next_todo_position(s, alice) == 1
+        a_ids = [db.insert_todo(s, alice, {"title": f"A{i}"}) for i in range(3)]
+        assert db.lock_user(s, bob)
+        assert db.next_todo_position(s, bob) == 1                          # A 의 행과 무관하게 1부터
+        b_first = db.insert_todo(s, bob, {"title": "B0"})
+        assert db.lock_user(s, alice)
+        a_ids.append(db.insert_todo(s, alice, {"title": "A3"}))            # A 가 더 추가해도
+        assert db.lock_user(s, bob)
+        assert db.next_todo_position(s, bob) == 2                          # B 의 다음 번호는 그대로
+
+        a_rows = db.active_todos(s, alice)
+        assert [t.id for t in a_rows] == a_ids and [t.position for t in a_rows] == [1, 2, 3, 4]   # position·id 순
+        assert [(t.id, t.position) for t in db.active_todos(s, bob)] == [(b_first, 1)]
+
+        # 템플릿 position 도 사용자마다 1부터
+        assert db.lock_user(s, alice)
+        a_tpls = [db.insert_template(s, alice, {"name": f"A{i}", "title": "t"}) for i in range(2)]
+        assert db.lock_user(s, bob)
+        b_tpl = db.insert_template(s, bob, {"name": "B0", "title": "t"})
+        assert [(t.id, t.position) for t in db.owned_templates(s, alice)] == [(a_tpls[0], 1), (a_tpls[1], 2)]
+        assert [(t.id, t.position) for t in db.owned_templates(s, bob)] == [(b_tpl, 1)]
+
+
+def test_other_users_ids_look_the_same_as_missing_ids(fresh_schema):
+    # B 입장에서 "A 의 id" 와 "없는 id" 의 결과가 같다 — 존재 여부를 드러내지 않는다(404 를 같게 만들 근거)
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        assert db.lock_user(s, alice)
+        a_todo = db.insert_todo(s, alice, {"title": "A"}, subtasks=[("하나", False)])
+        a_tpl = db.insert_template(s, alice, {"name": "A", "title": "t"})
+        gone_todo, gone_tpl = missing_todo_id(conn), missing_template_id(conn)
+        assert db.lock_user(s, bob)
+
+        def outcomes(todo_id: int, template_id: int) -> tuple:
+            return (
+                db.get_owned_todo(s, bob, todo_id),
+                db.owned_todos_by_ids(s, bob, [todo_id]),
+                db.subtasks_of(s, bob, [todo_id]),
+                db.update_owned_todo(s, bob, todo_id, {"title": "x"}),
+                db.soft_delete_todos(s, bob, [todo_id], T),
+                db.add_subtask(s, bob, todo_id, "x"),
+                db.update_owned_subtask(s, bob, todo_id, 1, {"title": "x"}),
+                db.delete_owned_subtask(s, bob, todo_id, 1),
+                db.get_owned_template(s, bob, template_id),
+                db.update_owned_template(s, bob, template_id, {"title": "x"}),
+                db.delete_owned_template(s, bob, template_id),
+            )
+
+        expected = (None, {}, {}, False, [], None, False, False, None, False, False)
+        assert outcomes(a_todo, a_tpl) == expected
+        assert outcomes(gone_todo, gone_tpl) == expected
+        assert count(conn, db.Todo) == 1 and count(conn, db.Subtask) == 1 and count(conn, db.TaskTemplate) == 1
+
+
+# ---------- (Phase 3-1B-3) soft delete·복구·정리·position (실제 PostgreSQL) ----------
+# 모두 rolled_back(한 연결·한 트랜잭션, 끝나면 되돌림) — 커밋·추가 연결·실제 시간 대기 없음. 시각은 헬퍼에 넘기는 now
+# 와 soft delete 시각(T 기준 고정값)으로만 정한다. 쓰기 헬퍼 앞에서는 그 사용자로 lock_user 를 부른다.
+# 같은 deleted_at 의 100건 경계 순서, bulk·반복 생성 때의 정리 시점은 정하지 않았으므로 여기서 확정하지 않는다.
+
+WINDOW = timedelta(seconds=30)
+MICRO = timedelta(microseconds=1)
+
+
+def deleted_at_of(conn, todo_id: int):
+    return conn.execute(select(db.Todo.deleted_at).where(db.Todo.id == todo_id)).scalar_one_or_none()
+
+
+def todo_exists(conn, todo_id: int) -> bool:
+    return conn.execute(select(func.count()).select_from(db.Todo).where(db.Todo.id == todo_id)).scalar_one() == 1
+
+
+def test_restore_window_boundary_in_database(fresh_schema):
+    # 같은 시각 T 에 지운 항목 3개를 각각 다른 now 로 복구해 본다: 30초 − 1µs 성공, 정확히 30초·초과는 실패
+    with rolled_back(fresh_schema) as conn:
+        alice = make_user(conn, "alice")
+        s = orm(conn)
+        assert db.lock_user(s, alice)
+        ids = [db.insert_todo(s, alice, {"title": f"A{i}"}) for i in range(3)]
+        assert db.soft_delete_todos(s, alice, ids, T) == ids
+        just_in, exact, late = ids
+
+        assert db.restore_todos(s, alice, [just_in], T + WINDOW - MICRO) == [just_in]
+        assert deleted_at_of(conn, just_in) is None
+        assert db.restore_todos(s, alice, [exact], T + WINDOW) is None                  # 같으면 만료 (> 비교)
+        assert db.restore_todos(s, alice, [late], T + WINDOW + timedelta(seconds=1)) is None
+        assert deleted_at_of(conn, exact) == T and deleted_at_of(conn, late) == T       # 실패한 복구는 바꾸지 않는다
+        assert [t.id for t in db.active_todos(s, alice)] == [just_in]                    # 만료 행은 정리 전에도 안 보인다
+
+        assert db.purge_expired_deleted_todos(s, alice, T + WINDOW) == 2                 # <= now − 30초 만 완전 삭제
+        assert not todo_exists(conn, exact) and not todo_exists(conn, late)
+        assert todo_exists(conn, just_in)
+
+
+def test_restore_is_all_or_nothing_in_database(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        now = T + timedelta(seconds=1)
+        assert db.lock_user(s, alice)
+        a1, a2, a_old = (db.insert_todo(s, alice, {"title": f"A{i}"}) for i in range(3))
+        assert db.soft_delete_todos(s, alice, [a1, a2], T) == [a1, a2]
+        assert db.soft_delete_todos(s, alice, [a_old], T - timedelta(seconds=60)) == [a_old]   # now 기준 만료
+        assert db.lock_user(s, bob)
+        b1 = db.insert_todo(s, bob, {"title": "B"})
+        assert db.soft_delete_todos(s, bob, [b1], T) == [b1]
+        missing = conn.execute(select(func.max(db.Todo.id))).scalar_one() + 1000
+        before = {i: todo_snapshot(conn, i) for i in (a1, a2, a_old, b1)}
+
+        assert db.lock_user(s, alice)
+        for mixed in ([a1, a2, b1], [a1, missing], [a1, a_old], [b1]):                 # 하나라도 부적합하면
+            assert db.restore_todos(s, alice, mixed, now) is None
+            assert {i: todo_snapshot(conn, i) for i in before} == before                 # 아무것도 바뀌지 않는다
+
+        assert db.restore_todos(s, alice, [a2, a1], now) == [a2, a1]                     # 유효한 자기 항목만 → 요청 순서
+        assert deleted_at_of(conn, a1) is None and deleted_at_of(conn, a2) is None
+        assert db.restore_todos(s, alice, [a1], now) is None                             # 두 번째 복구는 실패
+        assert todo_snapshot(conn, b1) == before[b1] and todo_snapshot(conn, a_old) == before[a_old]
+
+
+def test_pending_limit_keeps_newest_100(fresh_schema):
+    # A 의 대기 행 101건을 서로 다른 시각에 하나씩 만들면 가장 오래된 1건만 완전 삭제(하위 할 일 포함), B 는 무관
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        assert db.lock_user(s, bob)
+        b1 = db.insert_todo(s, bob, {"title": "B"}, subtasks=[("b 하위", False)])
+        assert db.soft_delete_todos(s, bob, [b1], T - timedelta(seconds=1))           # A 보다 오래된 B 의 대기 행
+        b_before, b_sub_before = todo_snapshot(conn, b1), subtask_snapshot(conn, b1)
+
+        assert db.lock_user(s, alice)
+        ids = [db.insert_todo(s, alice, {"title": f"A{i}"}, subtasks=[(f"하위{i}", False)]) for i in range(101)]
+        for i, todo_id in enumerate(ids):
+            assert db.soft_delete_todos(s, alice, [todo_id], T + i * MICRO) == [todo_id]
+
+        oldest, kept = ids[0], ids[1:]
+        assert not todo_exists(conn, oldest) and subtask_snapshot(conn, oldest) == []  # CASCADE 로 하위도 사라짐
+        pending = conn.execute(select(db.Todo.id).where(db.Todo.user_id == alice, db.Todo.deleted_at.is_not(None))
+                               .order_by(db.Todo.id)).scalars().all()
+        assert pending == kept and len(pending) == 100
+        assert conn.execute(select(func.count()).select_from(db.Subtask)
+                            .where(db.Subtask.todo_id.in_(kept))).scalar_one() == 100
+        assert todo_snapshot(conn, b1) == b_before and subtask_snapshot(conn, b1) == b_sub_before
+
+
+def test_purge_expired_only_touches_own_expired_rows(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        assert db.lock_user(s, alice)
+        expired, fresh, active = (db.insert_todo(s, alice, {"title": f"A{i}"}) for i in range(3))
+        assert db.soft_delete_todos(s, alice, [expired], T - WINDOW - timedelta(seconds=1)) == [expired]
+        assert db.soft_delete_todos(s, alice, [fresh], T - timedelta(seconds=10)) == [fresh]
+        assert db.lock_user(s, bob)
+        b_expired = db.insert_todo(s, bob, {"title": "B"})
+        assert db.soft_delete_todos(s, bob, [b_expired], T - WINDOW - timedelta(seconds=1)) == [b_expired]
+        before = {i: todo_snapshot(conn, i) for i in (fresh, active, b_expired)}
+
+        assert db.lock_user(s, alice)
+        assert db.purge_expired_deleted_todos(s, alice, T) == 1
+        assert not todo_exists(conn, expired)
+        assert {i: todo_snapshot(conn, i) for i in before} == before                     # A 미만료·활성, B 만료 행 그대로
+
+
+def test_soft_deleted_rows_hidden_from_all_read_helpers(fresh_schema):
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        assert db.lock_user(s, bob)
+        b1 = db.insert_todo(s, bob, {"title": "B"})
+        b_before = todo_snapshot(conn, b1)
+        assert db.lock_user(s, alice)
+        gone = db.insert_todo(s, alice, {"title": "지울 것"}, subtasks=[("하위", False)])
+        kept = db.insert_todo(s, alice, {"title": "남길 것"})
+        assert db.soft_delete_todos(s, alice, [gone], T) == [gone]
+        gone_before, sub_before = todo_snapshot(conn, gone), subtask_snapshot(conn, gone)
+
+        # 조회 — 대기 행은 없는 것과 같다
+        assert [t.id for t in db.active_todos(s, alice)] == [kept]
+        assert db.get_owned_todo(s, alice, gone) is None
+        assert set(db.owned_todos_by_ids(s, alice, [gone, kept])) == {kept}
+        assert db.subtasks_of(s, alice, [gone]) == {}
+        # 쓰기 — 모두 거부, 행은 그대로 (이미 지운 행을 다시 지워도 deleted_at 이 바뀌지 않는다)
+        assert db.update_owned_todo(s, alice, gone, {"title": "x"}) is False
+        assert db.soft_delete_todos(s, alice, [gone], T + timedelta(seconds=1)) == []
+        assert db.add_subtask(s, alice, gone, "x") is None
+        assert db.update_owned_subtask(s, alice, gone, 1, {"completed": True}) is False
+        assert db.delete_owned_subtask(s, alice, gone, 1) is False
+        assert todo_snapshot(conn, gone) == gone_before and subtask_snapshot(conn, gone) == sub_before
+        assert todo_snapshot(conn, b1) == b_before
+
+
+def test_position_after_delete_restore_and_purge(fresh_schema):
+    # §27.3: 삭제해도 position 유지, 대기 중에는 그 번호를 다시 쓰지 않음, 복구하면 원래 자리, 완전 삭제 뒤 재사용 허용
+    with rolled_back(fresh_schema) as conn:
+        alice = make_user(conn, "alice")
+        s = orm(conn)
+        assert db.lock_user(s, alice)
+        p1, p2, p3 = (db.insert_todo(s, alice, {"title": f"P{i}"}) for i in range(1, 4))
+        assert db.soft_delete_todos(s, alice, [p3], T) == [p3]
+        assert todo_snapshot(conn, p3).position == 3                                   # 삭제해도 position 유지
+        assert db.next_todo_position(s, alice) == 4                                    # 대기 행 번호는 다시 쓰지 않는다
+        p4 = db.insert_todo(s, alice, {"title": "P4"})
+        assert db.restore_todos(s, alice, [p3], T + timedelta(seconds=1)) == [p3]
+        rows = db.active_todos(s, alice)
+        assert [t.id for t in rows] == [p1, p2, p3, p4] and [t.position for t in rows] == [1, 2, 3, 4]
+
+        assert db.soft_delete_todos(s, alice, [p4], T + timedelta(seconds=2)) == [p4]
+        assert db.next_todo_position(s, alice) == 5                                    # 대기 중에는 4 를 피한다
+        assert db.purge_expired_deleted_todos(s, alice, T + timedelta(seconds=2) + WINDOW) == 1
+        assert db.next_todo_position(s, alice) == 4                                    # 완전 삭제 뒤 재사용 허용
+        p5 = db.insert_todo(s, alice, {"title": "P5"})
+        rows = db.active_todos(s, alice)
+        assert [t.id for t in rows] == [p1, p2, p3, p5] and [t.position for t in rows] == [1, 2, 3, 4]
+        assert p5 > p4                                                                 # id 는 시퀀스라 재사용하지 않는다
+
+
+# ---------- (Phase 3-1B-3 우선순위 2) 사용자 행 잠금 (실제 PostgreSQL) ----------
+# 스레드 없음. Session·Connection 은 만든 쪽에서만 쓴다. 잠금 대기 상한은 테스트 연결의 SET LOCAL lock_timeout 으로만
+# 둔다(앱의 L1/L2 정책·서버 설정과 무관). 두 번째 연결은 NullPool 이고 finally 에서 dispose 한 뒤 연결 반환을 확인한다.
+# 사용자 생성처럼 다른 연결에서 보여야 하는 준비 데이터만 commit 한다 — 다음 fresh_schema 가 정리한다.
+
+LOCK_WAIT_TEST = "1s"                             # 테스트 연결 전용 잠금 대기 상한 (lock_timeout)
+
+
+def sqlstate_of(exc: BaseException) -> str | None:
+    value = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    return value if isinstance(value, str) and len(value) == 5 and value.isalnum() else None
+
+
+def committed_users(engine, *names: str) -> list[int]:
+    with engine.begin() as conn:                                             # 다른 연결에서 보이도록 commit
+        return [make_user(conn, name) for name in names]
+
+
+def test_lock_record_does_not_survive_transaction_end_in_database(fresh_schema):
+    # Session 트랜잭션(여기서는 SAVEPOINT)이 끝나면 그 잠금 기록으로는 새 트랜잭션에서 쓸 수 없다.
+    # SAVEPOINT 해제는 최상위 트랜잭션 종료·행 잠금 해제가 아니다 — 여기서 보는 것은 헬퍼의 트랜잭션 동일성 규약이다
+    with rolled_back(fresh_schema) as conn:
+        alice = make_user(conn, "alice")
+        s = Session(bind=conn, join_transaction_mode="create_savepoint")
+        try:
+            def write_attempts() -> None:
+                for call in (lambda: db.insert_todo(s, alice, {"title": "x"}),
+                             lambda: db.update_owned_todo(s, alice, first, {"title": "x"}),
+                             lambda: db.soft_delete_todos(s, alice, [first], T),
+                             lambda: db.insert_template(s, alice, {"name": "n", "title": "t"})):
+                    with pytest.raises(RuntimeError):
+                        call()
+
+            s.begin()
+            tx1 = s.get_transaction()
+            assert db.lock_user(s, alice)
+            first = db.insert_todo(s, alice, {"title": "첫째"})
+            s.commit()                                                       # 트랜잭션 1 끝 (commit)
+
+            s.begin()
+            assert s.get_transaction() is not tx1                            # 새 트랜잭션 객체
+            before = count(conn, db.Todo)
+            write_attempts()                                                 # 이전 기록으로는 안 된다
+            assert count(conn, db.Todo) == before
+            s.rollback()                                                     # 트랜잭션 2 끝 (rollback)
+
+            s.begin()
+            write_attempts()                                                 # rollback 뒤에도 마찬가지
+            assert count(conn, db.Todo) == before
+            assert db.lock_user(s, alice)                                    # 대조: 다시 잠그면 쓸 수 있다
+            second = db.insert_todo(s, alice, {"title": "둘째"})
+            assert count(conn, db.Todo) == before + 1 and second != first
+            s.rollback()
+        finally:
+            s.close()
+
+
+def end_session(trans, session) -> None:
+    # 연결 트랜잭션을 먼저 되돌리고(실패한 트랜잭션에서 보낼 수 있는 것은 ROLLBACK 뿐) 그다음 Session 을 닫는다.
+    # 되돌리다 오류가 나도 Session 은 닫는다
+    try:
+        if trans.is_active:
+            trans.rollback()
+    finally:
+        session.close()
+
+
+def test_lock_wait_timeout_rolls_back_and_releases(fresh_schema):
+    # A 가 alice 를 잠근 동안 B 의 lock_user(alice) 는 테스트 상한(1초) 뒤 55P03 으로 실패하고, 아무것도 쓰지 않으며,
+    # 잠금 권한도 얻지 못한다. 되돌린 뒤 B 연결은 다시 쓸 수 있고, A 연결이 잡았던 잠금은 A 를 되돌리면 모두 풀린다.
+    # (DB 전체의 잠금·연결은 여기서 보지 않는다 — 그것은 R-19 게이트·wait_for_backends_released 의 몫이다)
+    (alice,) = committed_users(fresh_schema, "alice")
+    other = nullpool_engine()
+    try:
+        with fresh_schema.connect() as conn_a, other.connect() as conn_b:
+            db.verify_test_server(conn_b)
+            conn_b.rollback()
+            trans_a = conn_a.begin()
+            s_a = orm(conn_a)
+            try:
+                assert db.lock_user(s_a, alice)
+                a_pid = conn_a.execute(text("SELECT pg_backend_pid()")).scalar_one()
+
+                trans_b = conn_b.begin()
+                s_b = orm(conn_b)
+                try:
+                    conn_b.execute(text(f"SET LOCAL lock_timeout = '{LOCK_WAIT_TEST}'"))
+                    with pytest.raises(SQLAlchemyError) as e:
+                        db.lock_user(s_b, alice)
+                    state = sqlstate_of(e.value)                             # SQLSTATE 만 꺼낸다
+                    del e
+                    granted = db._LOCKED_USER_KEY in s_b.info                # 실패한 잠금은 권한을 남기지 않는다
+                    # 잠금 기록이 없으면 insert_todo 는 첫 줄(_require_user_lock)에서 SQL 없이 거부한다 —
+                    # 실패한 트랜잭션에 SQL 을 보내지 않는다
+                    with pytest.raises(RuntimeError):
+                        db.insert_todo(s_b, alice, {"title": "x"})
+                finally:
+                    end_session(trans_b, s_b)                                # ROLLBACK → Session 닫기
+                assert state == "55P03" and not granted
+
+                assert conn_b.execute(text("SELECT 1")).scalar_one() == 1    # 되돌린 뒤 연결은 다시 쓸 수 있다
+                assert conn_b.execute(select(func.count()).select_from(db.Todo)
+                                      .where(db.Todo.user_id == alice)).scalar_one() == 0   # 쓰기 없음
+                conn_b.rollback()
+            finally:
+                end_session(trans_a, s_a)                                    # A 잠금 해제
+            a_locks = conn_b.execute(text("SELECT count(*) FROM pg_locks WHERE pid = :pid"),
+                                     {"pid": a_pid}).scalar_one()           # 이 테스트가 만든 A 연결만 본다
+            conn_b.rollback()
+            assert a_locks == 0
+    finally:
+        other.dispose()
+        wait_for_backends_released(fresh_schema)
+
+
+def test_lock_user_is_independent_per_user(fresh_schema):
+    # A 의 트랜잭션이 alice 를 잠근 채 열려 있는 동안, B 의 bob 잠금·쓰기가 테스트 상한(1초) 안에 끝난다 —
+    # 같은 잠금을 기다렸다면 55P03 으로 실패했을 것이다. 핵심은 B 의 성공과 사용자별 격리다
+    alice, bob = committed_users(fresh_schema, "alice", "bob")
+    with fresh_schema.begin() as conn:                                       # alice 의 할 일 1건 (B 에서 보여야 한다)
+        s = orm(conn)
+        try:
+            assert db.lock_user(s, alice)
+            a_todo = db.insert_todo(s, alice, {"title": "A"})
+        finally:
+            s.close()
+    other = nullpool_engine()
+    try:
+        with fresh_schema.connect() as conn_a, other.connect() as conn_b:
+            db.verify_test_server(conn_b)
+            conn_b.rollback()
+            trans_a = conn_a.begin()
+            s_a = orm(conn_a)
+            try:
+                assert db.lock_user(s_a, alice)                              # A 가 alice 잠금을 얻었다
+
+                trans_b = conn_b.begin()
+                s_b = orm(conn_b)
+                try:
+                    conn_b.execute(text(f"SET LOCAL lock_timeout = '{LOCK_WAIT_TEST}'"))
+                    b_locked = db.lock_user(s_b, bob)
+                    b_todo = db.insert_todo(s_b, bob, {"title": "B"})
+                    rows = [(t.id, t.position) for t in db.active_todos(s_b, bob)]
+                    hidden = db.get_owned_todo(s_b, bob, a_todo) is None     # 격리
+                    visible_to_b = set(db.owned_todos_by_ids(s_b, bob, [a_todo, b_todo]))
+                    a_open_during_b = trans_a.is_active and conn_a.in_transaction()   # B 가 끝날 때 A 는 아직 열림
+                finally:
+                    end_session(trans_b, s_b)                                # bob 의 쓰기는 남기지 않는다
+                assert b_locked and rows == [(b_todo, 1)]
+                assert hidden and visible_to_b == {b_todo}
+                assert a_open_during_b
+
+                assert db.insert_todo(s_a, alice, {"title": "A2"}) != a_todo # A 의 잠금 기록도 그대로 유효
+            finally:
+                end_session(trans_a, s_a)
+    finally:
+        other.dispose()
+        wait_for_backends_released(fresh_schema)
+
+
+A_WORKER_LOCK_WAIT = "15s"                        # 작업 스레드 연결 전용 lock_timeout — 메인이 풀지 못해도 스레드가 끝난다
+A_OBSERVE_TIMEOUT = 5.0                           # 초 — 작업 스레드가 실제 잠금 대기에 들어간 것을 확인하는 상한
+
+
+def observe_lock_wait(conn, pid: int, timeout: float) -> bool:
+    # pid 로 범위를 한정해 읽기만 한다: pg_stat_activity 의 wait_event_type = 'Lock' 이고 pg_locks 에 미획득 잠금이 있는가.
+    # 메인 트랜잭션 안에서 반복하므로 매번 통계 스냅숏을 비운다(같은 트랜잭션에서는 pg_stat_activity 가 고정된다)
+    deadline = time.monotonic() + timeout
+    while True:
+        conn.execute(text("SELECT pg_stat_clear_snapshot()"))
+        waiting = conn.execute(text("SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = :pid"),
+                               {"pid": pid}).scalar_one_or_none()
+        ungranted = conn.execute(text("SELECT count(*) FROM pg_locks WHERE pid = :pid AND NOT granted"),
+                                 {"pid": pid}).scalar_one()
+        if waiting is True and ungranted > 0:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)                                                     # 다음 관찰까지의 간격 (추정이 아니다)
+
+
+def test_lock_user_serializes_same_user_writes(fresh_schema):
+    # 메인(A)이 alice 를 잠근 채 할 일을 넣는 동안, 작업 스레드(B)의 lock_user(alice) 는 실제로 기다린다(관찰).
+    # A 가 commit 해 잠금을 풀면 B 가 진행해 다음 번호를 받는다 → alice 의 position 은 [1, 2], 중복 없음.
+    # 연결·Session 은 만든 스레드만 쓴다. 정리 순서: A 해제 → 스레드 join → 끝났을 때만 dispose → 연결 반환 확인.
+    # 스레드가 끝나지 않으면 dispose 하지 않고 _UNFINISHED_WORKERS 에 넣는다(다음 연결 확인이 pytest.exit(3) 로 멈춘다)
+    (alice,) = committed_users(fresh_schema, "alice")
+    other = nullpool_engine()
+    handoff: dict[str, object] = {}                                          # 작업 스레드 → 메인: pid·결과 (값만)
+    pid_ready = threading.Event()
+
+    def worker() -> None:
+        try:
+            with other.connect() as conn_b:                                  # 이 스레드가 만들고 이 스레드만 쓴다
+                db.verify_test_server(conn_b)
+                conn_b.rollback()
+                trans_b = conn_b.begin()
+                s_b = orm(conn_b)
+                try:
+                    conn_b.execute(text(f"SET LOCAL lock_timeout = '{A_WORKER_LOCK_WAIT}'"))
+                    handoff["pid"] = conn_b.execute(text("SELECT pg_backend_pid()")).scalar_one()
+                    pid_ready.set()
+                    handoff["locked"] = db.lock_user(s_b, alice)             # A 가 풀 때까지 기다린다
+                    handoff["todo"] = db.insert_todo(s_b, alice, {"title": "B"})
+                    trans_b.commit()
+                finally:
+                    end_session(trans_b, s_b)
+        except BaseException as exc:                                         # noqa: BLE001 — 종류·SQLSTATE 만 넘긴다
+            handoff["error"] = (type(exc).__name__, sqlstate_of(exc))
+        finally:
+            pid_ready.set()                                                  # pid 전에 실패해도 메인이 기다리지 않게
+
+    thread = threading.Thread(target=worker, daemon=False)
+    observed = False
+    a_todo = None
+    try:
+        with fresh_schema.connect() as conn_a:                               # 메인 스레드가 소유
+            trans_a = conn_a.begin()
+            s_a = orm(conn_a)
+            try:
+                assert db.lock_user(s_a, alice)
+                a_todo = db.insert_todo(s_a, alice, {"title": "A"})
+                thread.start()
+                pid_ready.wait(CONNECT_TIMEOUT + A_OBSERVE_TIMEOUT)
+                b_pid = handoff.get("pid")
+                if isinstance(b_pid, int):                                   # pid 를 받은 것만으로 대기라고 보지 않는다
+                    observed = observe_lock_wait(conn_a, b_pid, A_OBSERVE_TIMEOUT)
+                trans_a.commit()                                             # 정상: A 의 할 일을 남기고 잠금 해제
+            finally:
+                end_session(trans_a, s_a)                                    # 실패 경로: rollback 으로 잠금 해제
+    finally:
+        if thread.ident is not None:
+            thread.join(JOIN_TIMEOUT)                                        # A 를 푼 뒤에 기다린다
+        if thread.is_alive():
+            _UNFINISHED_WORKERS.append(thread)                               # dispose·연결 닫기를 하지 않는다
+            pytest.fail(f"작업 스레드가 {JOIN_TIMEOUT}초 안에 끝나지 않음")
+        other.dispose()                                                      # 스레드가 끝난 뒤에만
+        wait_for_backends_released(fresh_schema)
+
+    assert observed, "작업 스레드의 잠금 대기를 관찰하지 못함"
+    assert "error" not in handoff, handoff.get("error")                      # (예외 종류, SQLSTATE) 만
+    assert handoff.get("locked") is True and isinstance(handoff.get("todo"), int)
+    with fresh_schema.connect() as conn:
+        rows = conn.execute(select(db.Todo.id, db.Todo.position).where(db.Todo.user_id == alice)
+                            .order_by(db.Todo.position)).all()
+        conn.rollback()
+    assert [r.position for r in rows] == [1, 2]                              # 직렬화 — 같은 max 를 읽지 않았다
+    assert [r.id for r in rows] == [a_todo, handoff["todo"]]
+
+
+# ---------- (Phase 3-1B-3 우선순위 3) R-27 실제 DB 오류 · R-16 lower 대 casefold 관찰 ----------
+
+R27_MARKERS = ("DETAIL", "Key (", "already exists", "pk_sessions", "Traceback")   # 응답·로그에 나오면 안 되는 표식
+
+
+def test_request_db_real_unique_violation_is_hidden(fresh_schema, caplog, monkeypatch):
+    # 테스트 전용 앱의 경로가 실제 main.request_db(RequestDbDep) 경계 안에서 같은 합성 token_hash 의 세션 행을 두 번 넣는다
+    # → 실제 PostgreSQL 23505. 고정 500, 응답·로그 비노출, 요청 트랜잭션 전체 롤백, 다음 요청 정상을 본다.
+    # 합성 값만 쓴다(실제 토큰·비밀번호·기존 세션 없음). commit 하지 않는다. hide_parameters 가 DETAIL 까지 숨긴다고 보지 않는다
+    from fastapi import FastAPI
+
+    monkeypatch.setattr(logging.getLogger("todo.auth"), "disabled", False)   # Alembic fileConfig 가 끈 로거를 켠다
+    caplog.set_level(logging.DEBUG)
+    token = auth.new_session_token()                                         # 합성 — 어디에도 쓰지 않는 값
+    token_hash = auth.hash_token(token)
+    synthetic = (token, token_hash.hex(), token_hash.hex().upper())
+
+    app = FastAPI()
+    app.dependency_overrides[main.auth_session_factory] = lambda: sessionmaker(bind=fresh_schema, expire_on_commit=False)
+
+    @app.post("/r27/duplicate-session")
+    def duplicate_session(rdb: main.RequestDbDep) -> dict:
+        s = rdb.session()
+        uid = s.execute(insert(db.User).values(username="r27user", password_hash="x", created_at=T)
+                        .returning(db.User.id)).scalar_one()
+        for _ in range(2):                                                   # 두 번째에서 pk_sessions 위반
+            s.execute(insert(db.UserSession).values(
+                token_hash=token_hash, user_id=uid, csrf_token=auth.new_csrf_token(),
+                created_at=T, expires_at=T + timedelta(days=14)))
+        return {"ok": True}
+
+    @app.get("/r27/ping")
+    def ping(rdb: main.RequestDbDep) -> dict:
+        return {"one": rdb.session().execute(text("SELECT 1")).scalar_one()}
+
+    client = TestClient(app, raise_server_exceptions=False)   # 예상 밖 예외도 테스트 쪽으로 다시 던지지 않는다
+    res = client.post("/r27/duplicate-session")
+
+    # 값은 bool 로만 만든 뒤 단언한다 — 실패 메시지에 합성 토큰·해시·DETAIL 이 실리지 않게
+    is_json = res.headers.get("content-type", "").startswith("application/json")
+    fixed_500 = res.status_code == 500 and is_json and res.json() == {"detail": main.SERVER_ERROR}
+    surface = res.text + "\n" + "\n".join(f"{k}: {v}" for k, v in res.headers.items())
+    leaked_in_response = any(x in surface for x in synthetic + R27_MARKERS)
+    log_text = caplog.text
+    leaked_in_logs = any(x in log_text for x in synthetic + R27_MARKERS)
+    no_exc_info = all(r.exc_info is None and r.exc_text is None for r in caplog.records)
+    app_args_safe = all(isinstance(a, (str, type(None)))
+                        for r in caplog.records if r.name == "todo.auth" for a in (r.args or ()))
+    event_logged = "request_db_error exc_type=IntegrityError sqlstate=23505" in log_text
+    del res, surface, log_text
+    assert fixed_500
+    assert not leaked_in_response
+    assert not leaked_in_logs and no_exc_info and app_args_safe
+    assert event_logged
+
+    with fresh_schema.connect() as conn:                                     # 실패한 요청은 전부 되돌려졌다
+        rolled_back_all = count(conn, db.User) == 0 and session_count(conn) == 0
+        conn.rollback()
+    assert rolled_back_all
+
+    ping = client.get("/r27/ping")                                           # 오류 뒤 정상 읽기 요청
+    assert ping.status_code == 200 and ping.json() == {"one": 1}
+    assert fresh_schema.pool.checkedout() == 0                               # Session·연결 반환
+    wait_for_backends_released(fresh_schema)
+
+
+R16_PAIRS = [                                                               # (사례 id, a, b) — 같은 사용자 템플릿 이름
+    ("ascii", "Weekly", "WEEKLY"),
+    ("sharp-s", "straße", "STRASSE"),
+    ("capital-sharp-s", "ß", "ẞ"),
+    ("dotted-I", "İ", "i̇"),
+    ("dotless-i", "I", "ı"),
+    ("fullwidth", "Ａ", "ａ"),
+    ("kelvin", "K", "k"),
+    ("greek-sigma", "Σ", "ς"),
+]
+
+
+def insert_rejected(conn, statement) -> bool:
+    # SAVEPOINT 안에서 실행하고 항상 되돌린다 — UNIQUE 위반이면 True. 바깥 트랜잭션은 계속 쓸 수 있다
+    nested = conn.begin_nested()
+    try:
+        conn.execute(statement)
+    except IntegrityError:
+        nested.rollback()
+        return True
+    nested.rollback()
+    return False
+
+
+@pytest.mark.parametrize("case, a, b", R16_PAIRS, ids=[p[0] for p in R16_PAIRS])
+def test_template_name_lower_vs_casefold_observation(fresh_schema, case, a, b):
+    # 단언: DB 안의 일관성(lower 비교 = 고유 인덱스 거부 = 헬퍼 결과), 사용자별 독립, ASCII 기준 사례.
+    # 관찰만(출력): 파이썬 casefold 와 DB lower 의 차이, DB 로캘. 비교 정책은 정하지 않는다(로캘에 따라 다를 수 있다)
+    with rolled_back(fresh_schema) as conn:
+        alice, bob = make_user(conn, "alice"), make_user(conn, "bob")
+        s = orm(conn)
+        python_eq = a.casefold() == b.casefold()
+        db_lower_eq = conn.execute(text("SELECT lower(:a) = lower(:b)"), {"a": a, "b": b}).scalar_one()
+        assert db.lock_user(s, alice)
+        db.insert_template(s, alice, {"name": a, "title": "t"})
+        helper_taken = db.template_name_taken(s, alice, b)
+        index_rejects = insert_rejected(conn, insert(db.TaskTemplate).values(
+            user_id=alice, position=99, name=b, title="t"))
+        other_user_rejected = insert_rejected(conn, insert(db.TaskTemplate).values(
+            user_id=bob, position=1, name=b, title="t"))
+        ctype, collate = conn.execute(text(
+            "SELECT datctype, datcollate FROM pg_database WHERE datname = current_database()")).one()
+        print(f"R-16 observation case={case} python_casefold_eq={python_eq} db_lower_eq={db_lower_eq} "
+              f"differs={python_eq != db_lower_eq} datctype={ctype} datcollate={collate}")
+        assert db_lower_eq == index_rejects == helper_taken                 # DB 안의 세 기준이 같다
+        assert not other_user_rejected                                       # 다른 사용자는 같은 이름 허용
+        if case == "ascii":
+            assert python_eq and db_lower_eq                                 # 기존 계약 (대소문자 무시)
+
+
 # ---------- Phase 2-F: 다중 프로세스·다중 워커 (실제 uvicorn + todo_test) ----------
 # A: 독립 uvicorn 프로세스 2개(각 --workers 1, 포트 다름) — 요청을 보낼 프로세스를 정할 수 있어 결과가 결정적이다.
 # B: 실제 uvicorn --workers 2 — 요청 분산은 OS 가 정하므로 접근 로그의 PID 로 "관찰"한다. 분산을 확인하지 못하면
@@ -1298,7 +2112,11 @@ def stop_server(server: Server) -> list[str]:
     if table is not None:
         own, _ = _children(server, table)
         tracked.update({pid: info.created for pid, info in own.items()})   # 로그에 아직 안 나온 워커 포함
-    if server.proc.poll() is None:
+    # (3-1B) Windows 다중 워커 서버에는 콘솔 신호를 보내지 않는다 — 감독이 워커 PID(그룹 대표가 아님)에
+    # CTRL_BREAK 를 다시 보내면 같은 콘솔의 pytest 까지 끝날 수 있다(exit 0xC000013A). 이 경우 정상 종료 단계를
+    # 건너뛰고 아래의 기존 경로(핸들 기반 감독 종료 → 식별을 확인한 워커만 PID 별 종료 → PID·포트 확인)만 쓴다
+    console_signal_ok = not (os.name == "nt" and server.workers > 1)
+    if console_signal_ok and server.proc.poll() is None:
         try:
             if os.name == "nt":
                 server.proc.send_signal(signal.CTRL_BREAK_EVENT)

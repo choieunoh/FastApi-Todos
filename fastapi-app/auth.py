@@ -391,7 +391,9 @@ class LimitDecision:
 def limit_decision(rules: Iterable[LimitRule], now: datetime) -> LimitDecision:
     # 규칙마다 창 안(created_at > now − window, 같으면 창 밖) 기록이 limit 개 이상이면 차단한다.
     # 한도 미만이 되려면 오래된 (개수 − limit + 1)개가 창을 벗어나야 한다 = 최신 limit 번째 기록.
-    # Retry-After = 그 기록 + window − now (올림, 최소 1초). 여러 규칙에 걸리면 가장 긴 값
+    # Retry-After = 그 기록 + window − now (올림, 최소 1초). 여러 규칙에 걸리면 가장 긴 값.
+    # 규칙마다 대기 시간은 그 규칙의 window 를 넘지 않는다 — 다른 프로세스의 기록이 now 보다 약간 늦게 찍히면
+    # (now 를 정한 뒤 잠금을 기다린 경우) 계산값이 window 를 1초 넘을 수 있다 (2026-11-08 결정)
     _require_aware(now)
     wait = 0
     for rule in rules:
@@ -403,7 +405,8 @@ def limit_decision(rules: Iterable[LimitRule], now: datetime) -> LimitDecision:
         inside = sorted((t for t in rule.newest if t > start), reverse=True)
         if len(inside) >= rule.limit:
             release = inside[rule.limit - 1] + rule.window
-            wait = max(wait, max(1, math.ceil((release - now).total_seconds())))
+            rule_wait = max(1, math.ceil((release - now).total_seconds()))
+            wait = max(wait, min(rule_wait, math.ceil(rule.window.total_seconds())))
     return LimitDecision(allowed=wait == 0, retry_after=wait)
 
 
