@@ -113,7 +113,7 @@ FastApi_Todos/
 
 ### 6. UI
 - **버전 표시**: `Version 6.0.0` (6.0.0 개발을 시작하면서 미리 바꿨다. v5 당시 `Version 5.0.0`, v4 당시 `Version 4.0.0`). (7.0.0) Phase 4에서 `Version 7.0.0`으로 바꾸고 B22를 함께 갱신한다.
-- (7.0.0) **로그인 화면·헤더**: 로그인하지 않으면 로그인·가입 화면만 보인다 — 이 동작은 Phase 3(데이터 API 인증·앱 게이트)부터 시행한다. Phase 2-G에서는 `V7_SPEC.md` §30의 과도기 예외를 적용해, 로그인하지 않아도 로그인·가입 패널과 함께 기존 v6 앱 영역이 계속 보인다. 헤더에 사용자명과 [로그아웃]을 둔다 (`V7_SPEC.md` §30).
+- (7.0.0) **로그인 화면·헤더**: 로그인하지 않으면 로그인·가입 화면만 보인다 — 이 동작은 Phase 3-3(화면 로그인 게이트)부터 시행하고, 데이터 API 인증은 3-4(템플릿)·3-5(할 일)에서 적용한다(`V7_PLAN.md` §P3). Phase 2-G에서는 `V7_SPEC.md` §30의 과도기 예외를 적용해, 로그인하지 않아도 로그인·가입 패널과 함께 기존 v6 앱 영역이 계속 보인다. 헤더에 사용자명과 [로그아웃]을 둔다 (`V7_SPEC.md` §30).
 - **태그 입력**: 추가 폼과 수정 폼에 쉼표로 구분하는 텍스트 입력을 둔다 (예: `학교, 과제`).
 - **태그 표시**: 각 항목에 태그를 칩(chip)으로 보여준다.
 - **태그 필터**:
@@ -161,7 +161,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 프론트는 모든 PUT 본문을 `toPayload(todo, overrides)`로 만든다. 클라이언트 필드 목록 `TODO_FIELDS`는 한 곳에만 정의하고, 새 클라이언트 필드는 여기에 추가한다.
 - 서버가 관리하는 필드(`created_at`, `completed_at`, `subtasks`, `next_spawned`)는 POST/PUT 본문에 있어도 무시하고 기존 값을 유지한다.
 - 새 id는 "현재 목록 + 삭제 취소 버퍼"의 최대 id + 1이다 (복구 시 id 충돌 방지).
-  - (7.0.0) 할 일·템플릿 id는 PostgreSQL 전역 시퀀스로 매기고 재사용하지 않는다. 이전 직후 시퀀스를 최대 id에 맞춘다. 기본 목록 순서는 `position` 열이다(권장안, `V7_SPEC.md` §27.3·§27.5).
+  - (7.0.0) 할 일·템플릿 id는 PostgreSQL 전역 시퀀스로 매기고 재사용하지 않는다. 이전 직후 시퀀스를 최대 id에 맞춘다. 기본 목록 순서는 `position` 열이다(D-6 승인 2026-11-08, `V7_SPEC.md` §27.3·§27.5).
 - (7.0.0) 모든 사용자 데이터 조회·변경은 현재 사용자 조건(`user_id`)을 거치는 `db.py` 헬퍼로만 한다. 엔드포인트에서 소유자 조건 없는 조회를 쓰지 않는다.
 - `/todos/bulk`, `/todos/restore`, `/todos/export` 같은 고정 경로는 `/todos/{todo_id}` 라우트보다 먼저 선언한다.
 - 완료 전이(false → true / true → false)는 서버 함수 하나(`apply_completion`)에서 처리하고 PUT·bulk가 함께 쓴다.
@@ -184,7 +184,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 ### 12. 삭제 실행 취소 (2단계)
 - DELETE한 항목은 서버 메모리 버퍼에 30초 동안(최대 100건, 일괄 작업 한도와 같다) 보관한다. 넘치면 오래된 것부터 버린다. 재시작하면 사라진다.
 - `POST /todos/restore` `{ids:[int](1~100개)}` → 원래 id·`created_at`·내용 그대로 복구, 200. 버퍼에 없는 id가 있으면 404이고 아무것도 복구하지 않는다.
-- (7.0.0, 권장안 D-7) 버퍼는 사용자별이고 PostgreSQL soft delete(`deleted_at`)로 둔다. 30초·사용자당 100건·원자적 복구는 같고, 재시작·다중 워커에서도 30초 안이면 복구된다. 다른 사용자의 지운 id는 404 (`V7_SPEC.md` §27.4).
+- (7.0.0, D-7 승인 2026-11-08) 버퍼는 사용자별이고 PostgreSQL soft delete(`deleted_at`)로 둔다. 30초·사용자당 100건·원자적 복구는 같고, 재시작·다중 워커에서도 30초 안이면 복구된다. 다른 사용자의 지운 id는 404 (`V7_SPEC.md` §27.4).
 - UI: 삭제 확인(`confirm`)은 **유지**한다. 삭제 성공 후 토스트 "N개 삭제됨 [실행 취소]"를 5초 동안 보여준다. 새 삭제가 일어나면 토스트를 교체한다.
 
 ### 13. 일괄 작업 (3단계)
@@ -399,7 +399,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - v5: `favorite-toggle`, `favorite-filter`, `undo-toast`, `undo-button`, `bulk-select`, `bulk-bar`, `bulk-select-all`, `bulk-complete`, `bulk-uncomplete`, `bulk-delete`, `subtask-toggle`, `subtask-list`, `subtask-item`, `subtask-add`, `subtask-progress`, `recurrence-badge`, `template-panel`, `template-select`, `template-load`, `template-edit`, `template-delete`, `template-name`, `template-save`, `template-edit-form`, `export-csv`, `export-json`, `view-toggle`, `calendar`, `calendar-day`, `calendar-chip`
   - v6: `view-stats`, `dash-total`, `dash-completed`, `dash-active`, `dash-overdue`, `dash-rate`, `dash-trend`, `dash-trend-summary`, `dash-trend-table`, `dash-excluded`, `dash-priority`, `dash-compliance`, `dash-basis`, `kanban`, `kanban-column`(`data-status="active"|"completed"`), `kanban-count`, `kanban-card`(`data-id`), `kanban-move`, `kanban-status`, `notification-bell`, `notification-badge`, `notification-panel`, `notification-item`(`data-category`, `data-todo-id`), `notification-read-all`, `notification-live` `theme-select`, `status-message`. 목록 항목(`todo-item`)에는 `data-id`가 있다. 칸반 카드 안의 태그·배지·진행률·D-day·즐겨찾기는 목록과 같은 testid(`todo-tag`, `recurrence-badge`, `subtask-progress`, `dday`, `favorite-toggle`)를 쓴다.
   - v7: `auth-panel`, `login-form`, `auth-mode-toggle`, `auth-username`, `auth-password`, `auth-submit`, `auth-error`, `current-user`, `logout`
-- (7.0.0) **Python DB**: SQLAlchemy 2.x 스타일(`DeclarativeBase`, `Mapped[]`, `select()`)을 쓴다. 요청마다 세션 1개·트랜잭션 1개이고(예외: 로그인 경로는 선기록 Tx1 → 트랜잭션 밖 Argon2 → 성공 Tx2 또는 보상 Tx로 나눈다 — Argon2 동안 DB 연결·잠금을 잡지 않기 위해, 2026-11-06 승인, `V7_SPEC.md` §29.5), 사용자 데이터 조회는 `db.py`의 소유자 조건 헬퍼로만 한다. 스키마 변경은 Alembic 리비전으로만 한다(앱 시작 시 `create_all` 금지).
+- (7.0.0) **Python DB**: SQLAlchemy 2.x 스타일(`DeclarativeBase`, `Mapped[]`, `select()`)을 쓴다. 요청마다 세션 1개·트랜잭션 1개이고 — 데이터 경로는 인증 조회와 데이터 작업이 같은 Session을 쓰고 commit은 성공 응답 전에 끝나며, commit이 실패하면 성공 응답을 보내지 않는다(`V7_SPEC.md` §29.4, Phase 3-1 구현·검증 예정) — (예외: 로그인 경로는 선기록 Tx1 → 트랜잭션 밖 Argon2 → 성공 Tx2 또는 보상 Tx로 나눈다 — Argon2 동안 DB 연결·잠금을 잡지 않기 위해, 2026-11-06 승인, `V7_SPEC.md` §29.5), 사용자 데이터 조회는 `db.py`의 소유자 조건 헬퍼로만 한다. 스키마 변경은 Alembic 리비전으로만 한다(앱 시작 시 `create_all` 금지).
 - **커밋**: Conventional Commits 형식이다 (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
   - 기능 커밋 예: `feat: add favorites for Version 5.0.0`
 
@@ -478,6 +478,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - [x] 2-G1. 로그인·가입 UI(접힌 진입 버튼 `#auth-open`, 폼 펼침·포커스, 로그인·가입 전환, `auth-error`·429 "약 N분", 메모리 CSRF, `/auth/` 외 401 무효화, 늦은 `/auth/me` 응답 무시, 로그아웃) — **구현·검증 완료(2026-11-06)**. 과도기 예외(`V7_SPEC.md` §30): 비로그인에도 v6 앱·목록 유지, 강제 로그인 게이트·데이터 API 인증·사용자별 격리는 Phase 3(미완료). 칸반 드래그 회귀를 막으려고 접힘 상태 세로 높이를 상쇄했다(A+B 보정: 폼 → 템플릿 8px, 템플릿 → 통계 8px, [칸반] 버튼 717.9/752.7px 유지, 종·진입 버튼 `outline-offset` 0) — 이 배치를 바꾸면 칸반 드래그 3개와 화면 실측을 다시 한다. 검증: 칸반 집중 3 passed, `tests/test_ui_auth.py` **31 passed**, `tests/test_ui.py` **125 passed**, DB 없는 전체 회귀 **996 passed·1 skipped·3 deselected**(31·125는 996에 포함, skipped는 PostgreSQL 모듈). **PostgreSQL 실DB 테스트 55개는 2-G1에서 실행하지 않았다**(마지막 실DB 검증은 2-F). 수치·위험은 `V7_PLAN.md` §P2 2-G1 블록, R-32·R-33.
   - [x] T-A 잔여: 가입의 HTTP 수준 공백 정규화·`$argon2id$` 접두 검사, 고정 시계로 14일 만료 HTTP 검사 — **검증 완료(2026-11-06), 테스트만 추가(운영 코드 변경 없음)**. DB 없는 `tests/test_auth_routes.py` R1~R5(사례 9개, 단독 96 passed), `todo_test` PostgreSQL HTTP P1·P2(정규화 저장·`$argon2id$`·409·공백 로그인, T+14일−1µs 200·정확히 14일 401·로그인 때 만료 정리). DB 없는 전체 회귀 **1005 passed·1 skipped·3 deselected**, PostgreSQL 단독 **57 passed**, PostgreSQL 포함 전체 회귀 **1062 passed·0 failed·0 skipped·3 deselected**(deselected 3은 운영 IP 통합 테스트, 의도적 제외). PostgreSQL 실행 전후 읽기 전용 R-19 점검 통과, 종료 후 `todo_test` 0002·사용자 데이터 0행. 수치·범위는 `V7_PLAN.md` §P2 "T-A 잔여 검증 완료" 블록. R-12(Docker·프록시 실환경 클라이언트 IP)는 2026-11-06 Phase 6으로 이관 — 미검증, 운영 공개 전 필수(`V7_PLAN.md` §P7·§P11). 원격 push는 보류.
 - [ ] 3. 15개 데이터 경로 인증 필수, 익명 401·타 사용자 404 매트릭스, bulk·restore 격리, 템플릿 이름 사용자별, soft delete·position, 동시 요청.
+  - 하위 단계 3-0~3-6(2026-11-08 채택, B 방식 — 경로 묶음마다 인증·CSRF·DB 격리 함께, `V7_PLAN.md` §P3): 3-0 결정·문서, 3-1 요청 Session 구조·DB 헬퍼, 3-2 UI 테스트 기반, 3-3 UI 로그인 게이트, 3-4 템플릿 4개, 3-5 할 일 11개, 3-6 JSON 런타임 제거·계약 정리. 각 단계의 구현·검증은 별도 승인이며, 데이터 경로 15개 전체 격리 검증 전에는 운영에 공개하지 않는다(`V7_PLAN.md` §P7). D-6·D-7 승인(2026-11-08).
 - [ ] 4. v6 기능 전체를 DB·인증 위에서 통과(기존 테스트는 픽스처만 교체, 변경 목록은 `V7_PLAN.md` §P8.3), 사용자별 알림 키, 두 사용자 UI 격리, `Version 7.0.0`.
 - [ ] 5. `migrate_json.py` import·verify·export-v6·diff, 백업 사본 리허설 2회, 원본 해시 불변, `pg_dump` 복원 검증, 내용 미출력.
 - [ ] 6. 전체 pytest, 이미지 빌드·격리 Compose 실행, **R-12 실환경 클라이언트 IP 검증(Phase 2에서 이관, `V7_PLAN.md` §P11)**, OWASP 재점검, README·릴리스 노트, compose·Jenkins 변경안. 운영 공개는 HTTPS 게이트(`V7_PLAN.md` §P7 — R-12 통과 포함)와 별도 승인 후이며, R-12 검증 전에는 운영에 공개하지 않는다.

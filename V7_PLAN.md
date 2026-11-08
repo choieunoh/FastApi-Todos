@@ -24,11 +24,14 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
   - 함께 승인된 정책(의미 변경 포함, `V7_SPEC.md` §29.5 변경 기록): 선기록 방식(Tx1 커밋 → 트랜잭션 밖 Argon2 → 성공 Tx2), 성공·보상 시 **자기 선기록 id만** 삭제, "실패 횟수" → "성공으로 확인되지 않은 시도 수", 429 미기록, k번째 기록 기준 `Retry-After`, `username_key` HMAC(`AUTH_FAILURE_KEY` 신설), IPv6 /64, Argon2 슬롯 2개·5초, 새 응답 코드 503(C-7), `lock_timeout` 2초, 로그인 경로의 요청당 트랜잭션 1개 원칙 예외(CLAUDE.md).
 - D-6·D-7·D-13 등 아래 표의 다른 권장안 상태는 바꾸지 않았다.
 
-### 권장안 — Phase 1 시작 전 승인 필요
+### 승인됨 (2026-11-08, Phase 3 착수 전)
+- **D-6 채택**: `V7_SPEC.md` §27.3 권장안 그대로 — 할 일·템플릿 `position` 열, 기본 정렬 `ORDER BY position, id`, 새 항목·반복 다음 일정은 그 사용자의 `max(position) + 1`(soft delete 대기 행 포함, 사용자 행 잠금 안에서 계산·INSERT), 삭제 시 position 유지·복구 시 원래 값, 완전 삭제된 번호의 재사용 허용, 템플릿은 끝에 추가·즉시 완전 삭제. 호환성 변경 C-8 승인. 스키마는 Alembic `0001`에 이미 있다(새 리비전 없음).
+- **D-7 채택**: `V7_SPEC.md` §27.4 권장안 그대로 — `deleted_at` soft delete, 30초·사용자당 100건(넘치면 오래된 것부터 완전 삭제), 원자적 복구(하나라도 불가하면 404·변경 없음), 사용자 행 잠금으로 직렬화, 그 사용자의 쓰기 요청(삭제·복구·생성, V7_SPEC.md §27.4)마다 지난 대기 행 정리, 대기 중인 할 일의 PUT·DELETE·하위 할 일 API는 404, 다른 사용자의 지운 id는 404. `next_id()`·`RECENTLY_DELETED`는 Phase 3에서 제거. 호환성 변경 C-4 승인. 스키마는 `0001`에 이미 있다(새 리비전 없음).
+- 이 승인은 새 데이터 정책을 추가하지 않는다. 데이터 쓰기의 잠금 대기 상한·초과 응답은 미결정이다(§P3 "잠금 대기"). 다른 D 항목(D-13~D-17)의 상태는 바꾸지 않았다.
+
+### 권장안 — 승인 필요
 | ID | 내용 | 권장 |
 |---|---|---|
-| D-6 | 목록 순서 보존 | `position` 열 (할 일·템플릿), 삭제 시 유지·복구 시 원래 값, 반복 다음 일정은 끝 (`V7_SPEC.md` §27.3) |
-| D-7 | 삭제 실행 취소 저장 | PostgreSQL soft delete (`deleted_at`, 30초·사용자당 100건) (§27.4 비교표) |
 | D-12 | 시도 제한 수치·저장 | DB `auth_failures` + username advisory lock. (username,IP) 5회 / username 50회 / IP 20회 per 15분, 가입 IP 10회/시간. **Phase 2에서 구현** (§29.5) — **2026-11-06 채택** (위 "승인됨 (2026-11-06)") |
 | D-13 | 가입 공개 제어 | `REGISTRATION_ENABLED` 환경변수 — 운영 기본 `false`, 개발·테스트 `true` |
 | D-14 | 저장소의 개인정보 값 | 아래 §P9 선택지 중 결정. 결정 전에는 아무것도 바꾸지 않는다 |
@@ -231,9 +234,31 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 2. 저장 계층 교체: `load_todos/save_todos/read_list/write_list`를 `db.py` 헬퍼로 바꾼다.
    - `active_todos(db, uid)`, `get_owned_todo(db, uid, id)`, `insert_todo`(position), `soft_delete`, `restore`, `purge_expired`, 템플릿 헬퍼.
    - 쓰기 요청은 `lock_user(db, uid)`(`SELECT ... FOR UPDATE`)로 시작.
-3. 엔드포인트 15개에 `require_user` 적용. `next_id()`·`RECENTLY_DELETED` 제거(D-7 승인 시).
+3. 엔드포인트 15개에 `require_user`, 그중 쓰기 11개(POST·PUT·DELETE)에는 `require_csrf` 적용(3-4·3-5). `next_id()`·`RECENTLY_DELETED` 제거(D-7 승인 2026-11-08, 3-5).
 4. 순수 로직(`apply_completion`, `next_occurrence`, `add_months`, `compute_stats`, `todos_to_csv`)은 그대로 두고 입력만 DB에서 만든 `TodoItem` 목록으로 바꾼다.
 5. 앱 시작 시 `todo.json` 생성 코드 제거. `TODO_FILE`·`TEMPLATE_FILE`은 런타임에서 쓰지 않는다(이전 도구만 쓴다).
+6. 화면 로그인 게이트(`index.html`, `V7_SPEC.md` §30 최종 동작)는 3-3에서 적용한다.
+
+### Phase 3 하위 단계 (2026-11-08 채택 — B 방식: 경로 묶음마다 인증·CSRF·DB 격리를 함께 적용)
+각 단계의 구현과 그 검증 실행은 **각각 별도 사용자 승인** 뒤에 한다. 각 단계는 앞 단계의 회귀를 통과한 뒤 시작한다(PostgreSQL 테스트는 실행마다 승인·읽기 전용 R-19 사전·사후 점검, §P8.6).
+
+| 단계 | 목표 | 변경 범위 | 검증 | 다음 단계 진입 조건 |
+|---|---|---|---|---|
+| 3-0 | 결정·문서 | `V7_PLAN.md`·`V7_SPEC.md`·`CLAUDE.md` | 문서 diff 검토 | 사용자 승인 |
+| 3-1 | 요청 Session 구조·DB 헬퍼 기반 | `main.py`(요청 Session 의존성, `require_user`가 같은 Session 사용 — 영향 경로는 `/auth/me`), `db.py`(`lock_user`, 할 일·템플릿 소유자 조건 헬퍼), 새 테스트. **데이터 경로 15개는 바꾸지 않는다** | DB 없음: 헬퍼 SQL의 `user_id`·`deleted_at` 조건, 의존성 구조·Session 공유. PostgreSQL: 헬퍼 격리·soft delete·position·잠금 대조, 응답 전 commit(`V7_SPEC.md` §29.4 확인 항목). 기존 인증 테스트 유지. PostgreSQL 초기화 방식(§P8.6)과 잠금 대기 정책(아래)을 이 단계에서 따로 결정 | DB 없는 회귀 + PostgreSQL 포함 회귀 통과 |
+| 3-2 | UI 테스트 기반 준비 | `conftest.py`(UI 서버에 테스트 DB, 페이지에 실제 로그인 세션). **앱 동작 변경 없음** | UI 테스트 전체가 로그인 상태로 통과. 로그인 상태에서는 접힌 로그인 패널이 없어지므로 칸반 드래그 3개와 화면 배치를 다시 확인(R-32) | UI 회귀(PostgreSQL) 통과 |
+| 3-3 | UI 로그인 게이트 | `index.html`(시작 `/auth/me` 401 → 로그인·가입 화면만, 할 일·템플릿 요청 없음), `test_ui_auth.py` 과도기 계약 교체 | UI 회귀 | UI 회귀 통과 |
+| 3-4 | 템플릿 4개 인증·CSRF·DB 격리 | `main.py` 템플릿 경로, `test_api.py` 템플릿 테스트 픽스처 | 템플릿 401·403 매트릭스, B→A 404, 사용자별 409, R-16 | 전체 회귀 통과 |
+| 3-5 | 할 일 11개 인증·CSRF·DB 격리 | `main.py` 할 일 경로(soft delete·position, `next_id()`·`RECENTLY_DELETED` 제거), `test_api.py` 나머지 픽스처 | 아래 T-B 나머지 전부 | 전체 회귀 통과 |
+| 3-6 | JSON 런타임 제거·계약 정리 | 시작 시 `todo.json` 생성 제거, JSON 저장 코드 삭제, `test_db_schema.py` 계약 마무리, 문서 | 전체 회귀, 라우트 목록 테스트 | Phase 3 완료 판정(사용자 승인) |
+
+- 할 일 11개는 같은 저장소(`todo.json`·복구 버퍼, 하위 할 일 포함)를 공유하므로 3-5에서 함께 바꾼다(일부만 바꾸면 읽기·쓰기 저장소가 갈라진다). 템플릿 4개는 서버에서 할 일과 저장소를 공유하지 않아 먼저 바꿀 수 있다.
+- **3-4 완료 후에도 할 일 11개는 미전환이다**(인증 없음·JSON·모든 호출자가 같은 데이터). 3-3~3-5 사이에는 화면만 로그인을 요구하고 할 일 API는 열려 있다. 개발 단계 전용 상태다.
+- **데이터 경로 15개 전체가 인증·사용자별로 격리·검증되기 전(3-5 완료와 Phase 3 완료 판정 전)에는 운영에 배포·공개하지 않는다**(§P7). R-12(Phase 6, 미검증·열림)의 운영 공개 차단 조건(§P7·§P11)은 그와 별개로 그대로 유지된다.
+- 기존 테스트 픽스처 이전(§P8.2)은 필요한 범위만 해당 하위 단계에서 한다(3-2 UI, 3-4 템플릿 API, 3-5 할 일 API). 의미가 바뀌는 테스트는 §P8.3 목록대로만 바꾼다.
+- 하위 단계 표는 계획이다. 각 단계는 실제 구현·검증 전에는 완료로 표시하지 않는다.
+
+잠금 대기 (미결정, 3-1에서 별도 결정): 데이터 쓰기의 `lock_user`(`FOR UPDATE`) 잠금 대기 상한과 초과 시 응답은 정하지 않았다. 검토 후보는 L1(상한 없음, PostgreSQL 기본 — 같은 사용자의 긴 트랜잭션이 그 사용자의 다른 쓰기를 붙잡을 수 있음)과 L2(트랜잭션 안에서만 `lock_timeout`, 초과 시 기존 500 — "혼잡"이 서버 오류로 보임)이며 어느 쪽도 채택하지 않았다. 503은 인증 경로 전용(`V7_SPEC.md` §28.2, C-7)이므로 데이터 경로에 새로 도입하지 않는다.
 
 테스트·완료 기준 (T-B)
 - [ ] 15개 경로 × 익명 401 매트릭스
@@ -253,7 +278,7 @@ D-1 의존성 추가, D-2 파일 구성, D-3 CLAUDE.md 수정, D-4 username·비
 
 ## P4. Phase 4 — 기존 v6 기능과 DB·인증 연동
 작업
-1. 기존 테스트 이전 (§P8): `client` 로그인 픽스처, `seed`를 DB 쓰기로, UI `page`에 로그인 쿠키.
+1. 기존 테스트 이전 (§P8): `client` 로그인 픽스처, `seed`를 DB 쓰기로, UI `page`에 로그인 쿠키. (2026-11-08 결정) 필요한 범위는 Phase 3 하위 단계에서 먼저 한다 — UI 픽스처 3-2, 템플릿 API 3-4, 할 일 API 3-5(§P3). Phase 4에서는 남은 이전과 v6 기능 전체 확인을 마무리한다.
 2. 반복·하위 할 일·템플릿·내보내기·통계·칸반·알림이 DB와 인증 위에서 동작 확인.
 3. 알림 읽음 키 `todo.v7.notifications.read.<userId>`.
 4. 화면 버전 `Version 7.0.0`, B22·`/` 테스트 갱신.
@@ -358,6 +383,7 @@ python migrate_json.py diff      <v6 JSON 폴더 A> <v6 JSON 폴더 B 또는 --o
 - [ ] DB 비밀번호가 저장소에 없음 (Jenkins Credentials 또는 서버의 권한 600 `.env`)
 - [ ] PostgreSQL 포트 외부 미공개 (`ports` 없음)
 - [ ] 시도 제한이 실제 클라이언트 IP로 동작 (R-12, 2026-11-06 Phase 2에서 이관 — 검증 절차는 §P11). 확인할 것: 서로 다른 실제 출발지 IP가 Docker·프록시 경로에서 의도치 않게 같은 IP로 집계되지 않는다(같은 공인 IP를 공유하는 클라이언트는 구분되지 않을 수 있다는 한계는 인정한다), 신뢰하지 않는 출처의 `X-Forwarded-For`로 클라이언트가 IP 제한을 우회할 수 없다, 신뢰한 프록시가 전달한 주소만 명시적 신뢰 설정(`--forwarded-allow-ips`)에 따라 반영된다, 실제 IP 기준으로 시도 제한이 분리되어 동작한다. 통과 전에는 운영에 공개하지 않는다.
+- [ ] Phase 3의 데이터 경로 15개 전체에서 인증·사용자별 데이터 격리가 검증됨 (2026-11-08 추가, §P3 하위 단계). 미검증이거나 일부 경로만 전환된 상태(예: 3-4 뒤 할 일 11개 미전환)에서는 운영에 공개하지 않는다.
 
 ## P8. 기존 테스트 유지·변경 계획
 ### 8.1 기준
@@ -365,9 +391,11 @@ python migrate_json.py diff      <v6 JSON 폴더 A> <v6 JSON 폴더 B 또는 --o
 - 목표: 기존 332개는 의미를 바꾸지 않고 **픽스처만 교체**해 통과. 새 테스트는 추가로 센다.
 
 ### 8.2 픽스처 교체
+(2026-11-08) 교체 시점: UI 픽스처는 Phase 3-2, 템플릿 API는 3-4, 할 일 API는 3-5(§P3 하위 단계). DB 초기화 방식은 §P8.6에 따라 3-1에서 별도 승인으로 정한다.
+
 | 대상 | v6 | v7 |
 |---|---|---|
-| `test_api.py` `isolated_file` | `TODO_FILE`·`TEMPLATE_FILE`·`RECENTLY_DELETED` monkeypatch | `db` 픽스처(test DB TRUNCATE) + 로그인한 사용자 |
+| `test_api.py` `isolated_file` | `TODO_FILE`·`TEMPLATE_FILE`·`RECENTLY_DELETED` monkeypatch | `db` 픽스처(초기화 방식은 3-1에서 결정, §P8.6) + 로그인한 사용자 |
 | `client = TestClient(app)` (모듈 전역) | 익명 | 로그인 쿠키 + `X-CSRF-Token` 기본 헤더를 가진 픽스처. 테스트 본문의 `client.post(...)` 형태는 유지 |
 | `load_todos()/save_todos()/write_text` 직접 호출 (약 16곳) | 파일 | `seed_todos(user, [dict])`, `read_todos(user)` 헬퍼 (v6 모델로 검증 후 DB 삽입) |
 | `monkeypatch(main, "now")` (6곳) | 동작 | 그대로 동작 (시각을 파이썬에서 넣음) |
@@ -380,19 +408,29 @@ python migrate_json.py diff      <v6 JSON 폴더 A> <v6 JSON 폴더 B 또는 --o
 | 테스트 | 변경 |
 |---|---|
 | A19·v1~v4 데이터 호환 테스트 (파일에 예전 형식을 쓰고 GET) | 런타임은 JSON을 읽지 않으므로 **이전 테스트**로 옮김: 같은 입력 → `migrate_json import` → GET 결과 동일 |
-| `test_v6_routes_are_v5_plus_stats_only` | `V7_ROUTES` = v6 경로 + `/auth/*` 4개 |
+| `test_routes_are_v6_plus_auth_only` (`tests/test_api.py`, 이전 이름 `test_v6_routes_are_v5_plus_stats_only`) | 경로 집합은 이미 v6 경로 + `/auth/*` 4개(2-E). Phase 3에서 데이터 경로 15개의 인증 의존성(쓰기 11개는 CSRF 포함) 확인을 추가 |
 | B22, `/` 응답 버전 테스트 | `Version 7.0.0` |
 | 알림 테스트 중 `todo.v6.notifications.read` 사용 1곳 | 사용자별 키 |
 | `RECENTLY_DELETED` 직접 참조·30초 경과 테스트 | soft delete 기준(시계 고정)으로 같은 결과 확인 |
 | A21 (최대 id + 1) | 단일 사용자·빈 DB에서 그대로 통과. 다중 사용자 시퀀스 동작은 새 테스트로 명시 |
 | `test_integration.py` | 로그인 흐름으로 다시 작성. **실행은 명시적 승인 후** (대상 서버에 테스트 계정·데이터가 생긴다) |
+| `tests/test_db_schema.py` `test_importing_main_creates_no_engine_or_connection_and_v6_stays_json` | "import만으로 엔진·연결·Alembic·DB 쓰기 없음"은 유지. "v6 경로는 JSON·DB 미사용" 단정은 3-4(템플릿)·3-5(할 일)에서 해당 부분만 교체하고, 3-6에서 JSON 관련 단정과 `todo.json` 생성 전제를 정리 (2026-11-08 추가) |
+| `tests/test_ui_auth.py` 과도기 정책(모듈 설명, 비로그인에도 앱·목록 유지 단정) | 3-3에서 "401 → 로그인·가입 화면만, 데이터 요청 없음"으로 교체 (2026-11-08 추가) |
+| `conftest.py` A22 실제 `todo.json`·`task_templates.json` 해시 보호 | **변경 없이 유지** — 이전 원본·롤백용 (`V7_SPEC.md` §33, 2026-11-08 확인) |
 
 ### 8.4 새 테스트 묶음
 - T-A 인증 (§P2), T-B 격리·soft delete·position (§P3), T-C 이전 (§P5), T-D Alembic (§P1), T-E UI 인증·다중 사용자 (§P2·§P4).
 - 보안 회귀: 응답·로그에 해시·토큰 없음, 사용자 입력 `textContent` 출력 유지, CSV 수식 방지 유지.
 
 ### 8.5 실행 시간
-DB 테스트로 늘어나는 시간은 테스트마다 TRUNCATE, UI 서버는 세션당 1개로 억제한다. Phase마다 소요 시간을 보고한다.
+DB 테스트로 늘어나는 시간과 억제 방법(초기화 방식·UI 서버 수명)은 3-1·3-2에서 실측한 뒤 §P8.6에 따라 정한다. Phase마다 소요 시간을 보고한다.
+
+### 8.6 PostgreSQL 테스트 초기화와 R-19 (2026-11-08, 미확정)
+- 우선 검토안: 기존 `fresh_schema` 방식(A, 테스트마다 R-19 게이트 → `DROP SCHEMA` → `alembic upgrade head`). **실제 채택은 3-1에서 실행 가능성과 R-19 충돌을 확인한 뒤 별도 승인으로 정한다.**
+- R-19 게이트의 조건(DB 전체 연결 수 1개 등)은 완화하지 않는다. UI 서버·TestClient 앱 엔진의 연결이 남아 있으면 스키마 삭제를 진행하지 않고, 연결 해제를 확인하지 못하면 테스트를 중단한다.
+- 테스트마다 TRUNCATE(B)와 사용자별 데이터 분리(C)는 **미승인 대안**이다. C는 할 일 id가 전역 기본키라 id를 직접 지정하는 기존 테스트(`seed` 등)와 충돌한다.
+- PostgreSQL 테스트는 실행마다 별도 승인과 읽기 전용 R-19 사전·사후 점검을 거친다(3-1 이후 UI·API 회귀 포함). 수동 DB 정리(DELETE·TRUNCATE·DROP)는 하지 않는다.
+- DB 없는 회귀만으로는 3-2 이후 UI 회귀, 3-4·3-5 이후 해당 API 회귀를 확인할 수 없다.
 
 ## P9. 개인정보 처리 (D-14)
 확인된 사실은 `V7_SPEC.md` §32.1. 선택지:
@@ -445,7 +483,7 @@ stages {
 | ID | 위험 | 대응 |
 |---|---|---|
 | R-1 | 이 VDI에서 Docker 사용 불가 → PG 테스트 불가 | 로컬 PostgreSQL 18.6(127.0.0.1:5433)으로 대체 (§P1). PostgreSQL 16(5432)은 보호 장치가 거부 |
-| R-2 | DB 테스트로 실행 시간 증가 | TRUNCATE, 세션 단위 서버, 소요 시간 보고 |
+| R-2 | DB 테스트로 실행 시간 증가 | 테스트 DB 초기화 방식·UI 서버 수명·연결 해제 절차는 §P8.6에 따라 Phase 3-1에서 별도 승인 후 확정한다. 기존 `fresh_schema` 방식(A)을 우선 검토하며, TRUNCATE(B)와 사용자별 분리(C)는 미승인 대안이다. R-19 사전·사후 점검과 연결 수 조건은 유지한다. 소요 시간 보고 |
 | R-3 | psycopg가 시간대 오프셋을 붙여 응답 형식 변경 | 연결 TimeZone UTC, 형식 회귀 테스트 |
 | R-4 | 운영 데이터 형식 미확인 (검증 실패·순서 불일치) | 사본 리허설, dry-run 리포트 |
 | R-5 | soft delete 조회 누락으로 지운 항목 노출 | 헬퍼 강제, 전 경로 테스트 |
