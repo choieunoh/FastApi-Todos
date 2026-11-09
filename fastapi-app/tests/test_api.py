@@ -212,7 +212,7 @@ def test_a22_real_todo_file_untouched():
 def test_index_served():
     res = client.get("/")
     assert res.status_code == 200
-    assert "Version 6.0.0" in res.text
+    assert "Version 7.0.0" in res.text
 
 
 # ---------- 5.0.0 1단계: 즐겨찾기 ----------
