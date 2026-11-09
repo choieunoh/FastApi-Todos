@@ -23,6 +23,18 @@ REAL_TODO_HASH = file_hash(REAL_TODO_FILE)             # 테스트 시작 전 �
 REAL_TEMPLATE_HASH = file_hash(REAL_TEMPLATE_FILE)     # 없으면 None — 테스트가 만들어서도 안 된다
 
 
+def pytest_configure(config):
+    # (7.0.0) TEST_DATABASE_URL 이 테스트 DB(이름이 _test 로 끝남)가 아니면 테스트 세션을 시작하지 않는다
+    raw = os.environ.get("TEST_DATABASE_URL")
+    if not raw:
+        return                                         # PostgreSQL 테스트는 건너뛴다 (test_db_postgres.py)
+    import db                                          # PostgreSQL 테스트를 돌릴 때만 불러온다
+    try:
+        db.check_test_database_url(raw, os.environ.get("DATABASE_URL"))
+    except db.DatabaseConfigError as e:
+        raise pytest.UsageError(f"테스트 DB 보호: {e}") from None
+
+
 @pytest.fixture(scope="session", autouse=True)
 def protect_real_todo_file():
     # 어떤 테스트도 실제 todo.json 을 바꾸면 안 된다 (A22)
@@ -59,7 +71,11 @@ def ui_template_file(ui_data_file) -> Path:
 def base_url(ui_data_file, ui_template_file):
     # UI 테스트용 서버 — 임시 TODO_FILE 로 uvicorn 을 띄운다 (pytest-playwright 의 base_url 을 덮어쓴다)
     port = free_port()
-    env = {**os.environ, "TODO_FILE": str(ui_data_file), "TEMPLATE_FILE": str(ui_template_file)}
+    # (7.0.0 Phase 2-E) 시작 가드가 APP_ENV 를 요구한다 — 테스트 서버는 test 로 명시(공개 대체 키, DB 연결 없음)
+    # (Phase 3-2) JSON 서버는 DB 에 붙지 않는다 — DB 접속 환경변수(DATABASE_URL·TEST_DATABASE_URL·PG*)는 넘기지 않는다
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("DATABASE_URL", "TEST_DATABASE_URL") and not k.upper().startswith("PG")}
+    env.update(TODO_FILE=str(ui_data_file), TEMPLATE_FILE=str(ui_template_file), APP_ENV="test")
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port)],
         cwd=APP_DIR, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

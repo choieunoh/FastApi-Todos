@@ -1,0 +1,15 @@
+Alembic 마이그레이션 (7.0.0)
+
+- 접속 주소: 환경변수 DATABASE_URL (alembic.ini 에는 두지 않는다). 비밀번호는 URL 이 아니라 pgpass.conf 에 둔다.
+- 실행 위치: fastapi-app/
+    alembic current                 # 현재 리비전 확인 (읽기 전용)
+    alembic upgrade head            # DB 에 적용
+    alembic upgrade head --sql      # DB 연결 없이 SQL 만 출력
+- 마이그레이션 왕복(upgrade → downgrade → upgrade)은 pytest(tests/test_db_postgres.py)로만 하고,
+  대상은 테스트 DB(todo_test_user@127.0.0.1:5433/todo_test) 하나다. 개발 DB 에서는 upgrade 만 한다.
+- downgrade 보호: 모든 리비전의 downgrade() 첫 줄은 db.guard_downgrade(...) 다 (tests/test_db_schema.py 가 확인).
+  테스트 DB 가 아니면(todo_dev 포함) 아래 확인값 2개가 실제 서버와 모두 맞아야 실행된다.
+    -x downgrade_confirm=<DB 이름>
+    환경변수 TODO_DOWNGRADE_CONFIRM=<DB 이름>@<서버 주소>:<포트>
+  확인값을 쓰기 전에 V7_PLAN.md §P1.2 의 승인 절차(백업 → 사용자 승인)를 먼저 거친다.
+- 리비전은 db.py 모델과 같아야 한다 (tests/test_db_schema.py 가 오프라인으로, tests/test_db_postgres.py 가 실제 DB 로 확인).

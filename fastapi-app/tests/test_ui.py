@@ -3,9 +3,34 @@ import re
 import pytest
 from playwright.sync_api import Page, expect
 
+from pg_harness import UiSession, ui_server_session   # (Phase 3-2) PostgreSQL 인증 UI 서버
+
 TODAY = "2026-10-12"                                # 브라우저 시계를 이 날짜 정오로 고정한다
 ITEM = "[data-testid=todo-item]"
 DONE_BOX = "input.todo-check"                                       # 상위 할 일의 완료 체크박스
+
+
+# ---------- (Phase 3-2) 모듈 하나에 PostgreSQL UI 서버 1개·로그인 1회 ----------
+# 할 일·템플릿은 3-2 동안 JSON(seed) 그대로이고, 로그인 쿠키만 테스트별 브라우저 컨텍스트에 넣는다.
+# base_url·browser_context_args 를 모듈 범위로 함께 덮어쓴다 — 세션 범위 browser_context_args 가 모듈 범위
+# base_url 을 요청하면 범위가 맞지 않는다. test_ui_auth.py 는 conftest 의 JSON 서버·모킹을 그대로 쓴다.
+
+@pytest.fixture(scope="module")
+def pg_ui(ui_data_file, ui_template_file, tmp_path_factory) -> UiSession:
+    # TEST_DATABASE_URL 이 없으면 실패한다(skip 아님). 시작·종료 보호 절차는 pg_harness.ui_server_session
+    with ui_server_session(tmp_path_factory.mktemp("pg_ui"), ui_data_file, ui_template_file) as session:
+        yield session
+
+
+@pytest.fixture(scope="module")
+def base_url(pg_ui: UiSession) -> str:
+    return pg_ui.base
+
+
+@pytest.fixture(scope="module")
+def browser_context_args(pg_ui: UiSession) -> dict:
+    # 앱의 날짜 기준이 Asia/Seoul 이므로 브라우저도 맞춘다(conftest 와 같음) + 로그인 쿠키
+    return {"base_url": pg_ui.base, "timezone_id": "Asia/Seoul", "storage_state": pg_ui.storage_state()}
 
 
 def todo(id: int, title: str, **fields) -> dict:
@@ -288,7 +313,7 @@ def test_b21_overdue_style(page: Page, seed):
 
 def test_b22_version(page: Page, seed):
     open_app(page)
-    expect(page.get_by_text("Version 6.0.0")).to_be_visible()
+    expect(page.get_by_text("Version 7.0.0")).to_be_visible()
 
 
 # ---------- 5.0.0 1단계: 즐겨찾기 ----------
@@ -1408,9 +1433,10 @@ KST_ZONE = tz(td(hours=9))
 
 
 @pytest.fixture
-def la_page(browser, base_url):
+def la_page(browser, base_url, pg_ui):
     # 브라우저 시간대가 한국이 아니어도 날짜는 Asia/Seoul 기준이어야 한다
-    context = browser.new_context(base_url=base_url, timezone_id="America/Los_Angeles")
+    context = browser.new_context(base_url=base_url, timezone_id="America/Los_Angeles",
+                                  storage_state=pg_ui.storage_state())          # (3-2) 로그인 쿠키
     yield context.new_page()
     context.close()
 
@@ -1822,9 +1848,9 @@ def test_kanban_changes_reflect_in_other_views(page: Page, seed):
 
 
 @pytest.fixture
-def mobile_page(browser, base_url):
+def mobile_page(browser, base_url, pg_ui):
     context = browser.new_context(base_url=base_url, timezone_id="Asia/Seoul", viewport={"width": 375, "height": 800},
-                                  has_touch=True, is_mobile=True)
+                                  has_touch=True, is_mobile=True, storage_state=pg_ui.storage_state())   # (3-2)
     page = context.new_page()
     page.clock.set_fixed_time(f"{TODAY}T12:00:00")
     yield page
@@ -2002,9 +2028,10 @@ def test_notify_due_date_change_is_new_alert(page: Page, seed):
 
 
 @pytest.fixture
-def clock_page(browser, base_url):
+def clock_page(browser, base_url, pg_ui):
     # 타이머까지 가짜 시계로 돌리는 페이지 (자정 넘김 테스트용)
-    context = browser.new_context(base_url=base_url, timezone_id="Asia/Seoul")
+    context = browser.new_context(base_url=base_url, timezone_id="Asia/Seoul",
+                                  storage_state=pg_ui.storage_state())          # (3-2) 로그인 쿠키
     yield context.new_page()
     context.close()
 
@@ -2403,6 +2430,8 @@ def test_keyboard_theme_and_focus_visible(page: Page, seed):
     expect(select).to_have_value("light")
     page.keyboard.press("ArrowDown")                                             # 라이트 → 다크
     expect(page.locator("html")).to_have_attribute("data-theme", "dark")
+    page.keyboard.press("Tab")                                                   # (3-2) 로그인 상태: 테마 → 로그아웃 → 종
+    expect(page.get_by_test_id("logout")).to_be_focused()
     page.keyboard.press("Tab")
     expect(bell(page)).to_be_focused()
     assert bell(page).evaluate("e => getComputedStyle(e).outlineStyle") == "solid"

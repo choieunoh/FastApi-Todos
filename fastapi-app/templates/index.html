@@ -307,6 +307,37 @@
           white-space: nowrap;
         }
         .notify-bar { display: flex; justify-content: flex-end; margin: -1rem 0 .8rem; }
+        /* (7.0.0 Phase 2-G) 로그인·가입 — 과도기에는 앱 영역과 함께 보인다(V7_SPEC §30). 색은 위 토큰만 쓴다 */
+        .auth-user { display: flex; align-items: center; gap: .4rem; font-size: .85rem; }
+        .auth-user span { overflow-wrap: anywhere; }
+        /* 접힌 상태: 알림 바 바로 아래 진입 버튼 한 줄. 칸반 등 아래 영역의 세로 위치가 2-G 이전과 같도록 높이를 상쇄한다:
+           알림 바 아래 여백(.8rem)을 버튼 위 여백으로 쓰지 않고(-.8rem 과 상쇄 → 간격 0, 겹침 없음),
+           접힌 진입점이 보일 때만 할 일 폼·템플릿 패널의 아래 여백(각 1rem)을 .5rem 으로 줄여 버튼 높이를 돌려준다
+           (폼과 템플릿 패널 사이가 붙지 않게 두 곳에 나눈다. 버튼 크기는 줄이지 않는다) */
+        .auth-panel { margin: -.8rem 0 0; }
+        .auth-open { display: block; margin-left: auto; padding: .2rem .7rem; font-size: .85rem; cursor: pointer; }
+        #auth-panel:not([hidden]):not(.open) + #todo-form { margin-bottom: .5rem; }
+        #auth-panel:not([hidden]):not(.open) ~ .template-panel { margin-bottom: .5rem; }
+        /* 접힌 상태에서는 종·진입 버튼·제목이 간격 없이 붙으므로 두 버튼의 윤곽선을 테두리에 붙여(굵기·색은 그대로)
+           이웃 컨트롤 위로 덜 나오게 한다. 로그인 상태(패널 hidden)와 펼친 폼에는 적용하지 않는다 */
+        #auth-panel:not(.open) .auth-open:focus-visible,
+        body:has(#auth-panel:not([hidden]):not(.open)) .notify-bell:focus-visible { outline-offset: 0; }
+        /* 펼친 상태: 테두리 상자 */
+        .auth-panel.open {
+          margin: 0 0 1rem;
+          padding: .6rem .8rem;
+          border: 1px solid var(--accent-border);
+          border-radius: 6px;
+        }
+        .auth-panel h2 { margin: 0 0 .4rem; font-size: 1rem; }
+        .auth-panel form { margin-bottom: 0; align-items: flex-end; }
+        .auth-panel label {
+          display: flex; flex-direction: column; gap: .2rem;
+          flex: 1 1 10rem; min-width: 0; font-size: .85rem;
+        }
+        /* 세로 label 안 — 위 input[type="text"] 규칙의 flex 크기가 높이로 적용되지 않게 끈다 */
+        .auth-panel input { flex: 0 0 auto; width: 100%; box-sizing: border-box; padding: .5rem; }
+        #auth-error { margin: .4rem 0 0; color: var(--danger); overflow-wrap: anywhere; }
         .notify-bell { display: inline-flex; align-items: center; gap: .3rem; padding: .3rem .7rem; cursor: pointer; }
         .notify-badge {
           min-width: 1.2rem;
@@ -476,8 +507,13 @@
           <option value="dark">다크</option>
         </select>
       </label>
+      <!-- (7.0.0 Phase 2-G) 로그인한 사용자 — 로그인 전에는 숨긴다 -->
+      <div class="auth-user">
+        <span id="current-user" data-testid="current-user" hidden></span>
+        <button type="button" id="logout" data-testid="logout" aria-label="로그아웃" hidden>로그아웃</button>
+      </div>
     </header>
-    <p class="version">Version 6.0.0</p>
+    <p class="version">Version 7.0.0</p>
     <!-- 마감일 알림 센터 — 앱 안에서만 보인다. 읽음 표시는 이 브라우저(localStorage)에만 저장한다 -->
     <div class="notify-bar">
       <button type="button" id="notification-bell" class="notify-bell" data-testid="notification-bell"
@@ -495,6 +531,31 @@
       <ul id="notification-list" class="notify-list" aria-labelledby="notification-title"></ul>
     </section>
     <p id="notification-live" class="visually-hidden" data-testid="notification-live" role="status" aria-live="polite"></p>
+    <!-- (7.0.0 Phase 2-G) 로그인·가입 — 과도기: 로그인하지 않아도 아래 앱 영역은 그대로 쓴다(V7_SPEC §30).
+         인증 정보·CSRF 토큰은 메모리에만 둔다. 데이터는 아직 사용자별로 나뉘지 않는다(Phase 3) -->
+    <section id="auth-panel" class="auth-panel" data-testid="auth-panel" aria-labelledby="auth-title">
+      <!-- 기본은 접혀 있다(칸반 등 아래 영역의 세로 위치를 거의 바꾸지 않게). 펼치면 아래 폼이 보인다 -->
+      <button type="button" id="auth-open" class="auth-open" aria-expanded="false" aria-controls="auth-form-area">
+        로그인 / 회원가입
+      </button>
+      <div id="auth-form-area" hidden>
+      <h2 id="auth-title">로그인</h2>
+      <form id="login-form" data-testid="login-form">
+        <label>아이디
+          <input type="text" id="auth-username" data-testid="auth-username" name="username"
+                 autocomplete="username" maxlength="1024" required>
+        </label>
+        <label>비밀번호
+          <input type="password" id="auth-password" data-testid="auth-password" name="password"
+                 autocomplete="current-password" maxlength="1024" required>
+        </label>
+        <button type="submit" id="auth-submit" data-testid="auth-submit">로그인</button>
+        <button type="button" id="auth-mode-toggle" data-testid="auth-mode-toggle"
+                aria-pressed="false">회원가입으로 전환</button>
+      </form>
+      </div>
+      <p id="auth-error" data-testid="auth-error" role="alert" hidden></p>
+    </section>
     <form id="todo-form">
       <input
         type="text"
@@ -714,12 +775,42 @@
         let editingSubtask = null;               // 제목을 고치는 하위 할 일 { todoId, id } — 한 번에 하나
         let editingId = null;                    // 수정 폼이 열린 항목 (한 번에 하나)
 
+        // (7.0.0 Phase 2-G) 인증 상태 — 메모리에만 둔다(localStorage·sessionStorage 에 저장하지 않는다)
+        let authUser = null;                     // { id, username } — 로그인하지 않았으면 null
+        let csrfToken = null;                    // 로그인·가입·/auth/me 응답 본문으로만 받는다
+        let authEpoch = 0;                       // 인증 상태가 바뀔 때마다 올린다 — 오래된 /auth/me 응답이 최신 상태를 덮지 않게
+        const AUTH_WITHOUT_CSRF = ["/auth/login", "/auth/register"];   // 세션 전 요청 — 이전 세션의 토큰을 보내지 않는다
+
+        // 오류 본문의 detail (문자열 또는 422 목록). 형식이 다르면 null
+        function errorDetail(text) {
+          try {
+            const detail = JSON.parse(text).detail;
+            return typeof detail === "string" || Array.isArray(detail) ? detail : null;
+          } catch {
+            return null;
+          }
+        }
+
         // 모든 요청을 한 곳에서 처리하고, 실패는 조용히 넘기지 않는다
+        // (7.0.0) GET·HEAD 가 아닌 요청에는 X-CSRF-Token 을 붙인다(로그인·가입 제외). 오류의 message 형식은 v6 그대로이고
+        // status·detail·retryAfter 를 덧붙인다. /auth/ 가 아닌 요청의 401 은 로그인이 풀린 것으로 본다(Phase 3 부터 실제로 생긴다)
         async function api(url, method = "GET", body) {
-          const res = await fetch(url, body
-            ? { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
-            : { method });
-          if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+          const headers = {};
+          if (body) headers["Content-Type"] = "application/json";
+          const verb = method.toUpperCase();
+          if (csrfToken && verb !== "GET" && verb !== "HEAD" && !AUTH_WITHOUT_CSRF.includes(url)) {
+            headers["X-CSRF-Token"] = csrfToken;
+          }
+          const res = await fetch(url, body ? { method, headers, body: JSON.stringify(body) } : { method, headers });
+          if (!res.ok) {
+            const text = await res.text();
+            const error = new Error(`${res.status} ${text}`);
+            error.status = res.status;
+            error.detail = errorDetail(text);
+            error.retryAfter = res.headers.get("Retry-After");
+            if (res.status === 401 && !url.startsWith("/auth/")) invalidateAuth("다시 로그인하세요.");
+            throw error;
+          }
           return res.status === 204 ? null : res.json();
         }
 
@@ -1905,8 +1996,144 @@
         };
         syncThemeSelect();
 
+        // ---------- (7.0.0 Phase 2-G) 로그인·가입·로그아웃 — 과도기: 앱 영역은 숨기지 않는다(V7_SPEC §30) ----------
+        const authPanelEl = $("auth-panel"), authFormEl = $("login-form"), authTitleEl = $("auth-title");
+        const authUsernameEl = $("auth-username"), authPasswordEl = $("auth-password");
+        const authSubmitEl = $("auth-submit"), authToggleEl = $("auth-mode-toggle"), authErrorEl = $("auth-error");
+        const currentUserEl = $("current-user"), logoutEl = $("logout");
+        const authOpenEl = $("auth-open"), authFormAreaEl = $("auth-form-area");
+        let authMode = "login";                  // "login" | "register" — 같은 폼에서 바꾼다
+        let authBusy = false;                    // 제출 중이면 다시 보내지 않는다
+
+        // 서버 문구 대신 쓰는 안전한 안내 (500·503·예상하지 못한 형식은 서버 원문을 보여주지 않는다)
+        const AUTH_MESSAGES = {
+          401: "아이디 또는 비밀번호가 올바르지 않습니다.",
+          403: "요청이 거부되었습니다.",
+          409: "이미 사용 중인 아이디입니다.",
+          500: "서버 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+          503: "요청이 많아 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+        };
+        const AUTH_FALLBACK = "요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.";
+
+        function authErrorText(error) {
+          if (error.status === 429) {
+            const seconds = Number(error.retryAfter);
+            return Number.isFinite(seconds) && seconds > 0
+              ? `시도 횟수를 초과했습니다. 약 ${Math.ceil(seconds / 60)}분 후 다시 시도해 주세요.`
+              : "시도 횟수를 초과했습니다. 잠시 후 다시 시도해 주세요.";
+          }
+          if (error.status === 422) {
+            const messages = Array.isArray(error.detail)
+              ? error.detail.map((d) => (d && typeof d.msg === "string" ? d.msg : "")).filter(Boolean) : [];
+            return messages.length ? `입력값을 확인해 주세요: ${messages.join("; ")}` : "입력값을 확인해 주세요.";
+          }
+          // 403 은 Origin 거부·가입 비활성처럼 서버의 고정 문구로 구분한다
+          if (error.status === 403 && typeof error.detail === "string") return error.detail;
+          return AUTH_MESSAGES[error.status] || AUTH_FALLBACK;
+        }
+
+        function showAuthError(text) {
+          authErrorEl.textContent = text;
+          authErrorEl.hidden = !text;
+        }
+
+        // 폼 영역 펼치기·접기 — hidden 이라 접힌 입력란·버튼은 Tab 순서에서도 빠진다
+        function setAuthOpen(open) {
+          authFormAreaEl.hidden = !open;
+          authOpenEl.setAttribute("aria-expanded", String(open));
+          authPanelEl.classList.toggle("open", open);
+        }
+
+        // 화면 표시만 바꾼다 — 사용자명은 textContent 로만 넣는다. 로그인하면 진입점·폼을 숨기고 다음을 위해 접어 둔다
+        function renderAuth() {
+          const signedIn = authUser !== null;
+          currentUserEl.textContent = signedIn ? authUser.username : "";
+          currentUserEl.hidden = !signedIn;
+          logoutEl.hidden = !signedIn;
+          authPanelEl.hidden = signedIn;
+          if (signedIn) setAuthOpen(false);
+        }
+
+        function setSignedIn(data) {
+          authEpoch += 1;
+          authUser = { id: data.id, username: String(data.username) };
+          csrfToken = String(data.csrf_token);
+          renderAuth();
+        }
+
+        function invalidateAuth(message) {
+          authEpoch += 1;
+          authUser = null;
+          csrfToken = null;
+          renderAuth();
+          setAuthOpen(true);                     // 다시 로그인할 수 있게 폼과 안내를 함께 보인다
+          showAuthError(message);
+        }
+
+        function setAuthMode(mode) {
+          authMode = mode;
+          const register = mode === "register";
+          authTitleEl.textContent = register ? "회원가입" : "로그인";
+          authSubmitEl.textContent = register ? "회원가입" : "로그인";
+          authToggleEl.textContent = register ? "로그인으로 전환" : "회원가입으로 전환";
+          authToggleEl.setAttribute("aria-pressed", String(register));
+          authPasswordEl.autocomplete = register ? "new-password" : "current-password";
+          showAuthError("");
+        }
+
+        // 시작 시 한 번 — 200 이면 로그인 상태, 401 은 로그인하지 않은 상태일 뿐이라 #error 에 쓰지 않는다.
+        // 응답이 오기 전에 로그인·가입·로그아웃·무효화가 있었으면(authEpoch 가 바뀌었으면) 그 응답은 버린다
+        async function checkAuth() {
+          const epoch = authEpoch;
+          try {
+            const me = await api("/auth/me");
+            if (epoch === authEpoch) setSignedIn(me);
+          } catch (error) {
+            if (epoch !== authEpoch) return;
+            if (error.status !== 401) showAuthError("로그인 상태를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.");
+          }
+        }
+
+        authToggleEl.onclick = () => setAuthMode(authMode === "login" ? "register" : "login");
+
+        authOpenEl.onclick = () => {
+          const open = authFormAreaEl.hidden;
+          setAuthOpen(open);
+          if (open) authUsernameEl.focus();      // 펼치면 아이디 입력란으로 — 그다음 Tab 은 비밀번호·제출
+        };
+
+        authFormEl.onsubmit = async (event) => {
+          event.preventDefault();
+          if (authBusy) return;
+          authBusy = true;
+          authSubmitEl.disabled = true;
+          showAuthError("");
+          try {
+            const data = await api(authMode === "register" ? "/auth/register" : "/auth/login", "POST",
+                                   { username: authUsernameEl.value, password: authPasswordEl.value });
+            setSignedIn(data);
+            authPasswordEl.value = "";
+            showAuthError("");
+            load();
+          } catch (error) {
+            showAuthError(authErrorText(error));
+          } finally {
+            authBusy = false;
+            authSubmitEl.disabled = false;
+          }
+        };
+
+        // 로그아웃 — CSRF 헤더는 api() 가 붙인다. 성공하면 화면 상태를 모두 비우려고 새로고침, 실패하면 #error 에 보이고 상태는 그대로
+        logoutEl.onclick = () => run("로그아웃", async () => {
+          await api("/auth/logout", "POST");
+          authEpoch += 1;
+          location.reload();
+        });
+
         load();
         run("템플릿 목록 불러오기", () => fetchTemplates());
+        renderAuth();
+        checkAuth();                             // 기존 불러오기와 따로 — 늦거나 실패해도 목록을 막지 않는다
      </script>
 </body>
 </html>

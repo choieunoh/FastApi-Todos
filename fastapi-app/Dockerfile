@@ -21,6 +21,9 @@ RUN pip install -r requirements.txt
 # 실행에 필요한 파일만 명시적으로 복사 (코드는 root 소유 → 앱이 수정 불가)
 COPY main.py .
 COPY templates/ ./templates/
+# (7.0.0) main.py 가 import 하는 DB·인증 모듈과 Alembic 마이그레이션 (alembic upgrade head 를 이미지 안에서 실행)
+COPY db.py auth.py alembic.ini ./
+COPY alembic/ ./alembic/
 
 # 데이터는 이미지에 넣지 않는다: docker-compose 가 /app/data 에 볼륨을 붙이고
 # TODO_FILE·TEMPLATE_FILE 로 그 안을 가리킨다. 새 볼륨은 이 폴더의 소유자(appuser)를 이어받는다.

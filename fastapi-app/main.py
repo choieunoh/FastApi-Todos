@@ -2,18 +2,31 @@ import calendar
 import csv
 import io
 import json
+import logging
 import os
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from contextlib import ExitStack, asynccontextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Annotated, Literal, get_args
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, Response
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import (
     AfterValidator, BaseModel, Field, StrictBool, StringConstraints, field_validator, model_validator,
 )
+import psycopg
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+import auth                                      # (7.0.0) 순수 인증 함수
+import db                                        # (7.0.0) DB 함수 — 엔진은 첫 요청 때 만든다(import 시 연결 없음)
 
 BASE_DIR = Path(__file__).resolve().parent       # main.py 가 있는 폴더
 TODO_FILE = Path(os.environ.get("TODO_FILE", BASE_DIR / "todo.json"))  # 테스트에서 바꿔 쓸 수 있다
@@ -23,7 +36,21 @@ INDEX_FILE = BASE_DIR / "templates" / "index.html"
 if not TODO_FILE.exists():                       # 없으면 빈 목록으로 만들어 둔다
     TODO_FILE.write_text("[]", encoding="utf-8")
 
-app = FastAPI(title="To-Do List API")
+logger = logging.getLogger("todo.auth")         # (7.0.0) 인증 경로 로그 — 예외 문자열·traceback·비밀값을 남기지 않는다
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # (7.0.0 Phase 2-E) 시작 가드 — 설정이 틀리면 AuthConfigError 로 시작을 거부한다(메시지에 값 없음)
+    app.state.auth = load_auth_config()
+    try:
+        yield
+    finally:
+        app.state.auth = None
+
+
+app = FastAPI(title="To-Do List API", lifespan=lifespan)
+app.state.auth = None                            # 시작 가드를 거치기 전에는 인증 경로가 500 (fail-closed)
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
@@ -574,3 +601,403 @@ def delete_template(template_id: int) -> None:
 @app.get("/", include_in_schema=False)           # 화면 서빙
 def read_root() -> FileResponse:
     return FileResponse(INDEX_FILE, media_type="text/html")
+
+
+# ────────────────────────── (7.0.0 Phase 2-E) 인증 경로 /auth/* ──────────────────────────
+# V7_SPEC §28.1·§29. 기존 v6 데이터 경로에는 아직 인증을 걸지 않는다(Phase 3).
+# - 트랜잭션은 라우트가 소유한다. db 함수는 commit 하지 않는다. 남겨야 할 결과(409·429)는 블록을 정상 종료(commit)한 뒤
+#   블록 밖에서 응답하고, 503·500 은 블록 안에서 예외로 빠져나가 rollback 한다.
+# - 로그인: Tx1(선기록) → 트랜잭션 밖 Argon2 → Tx2(자기 선기록 삭제·rehash·세션) 또는 보상 Tx (§29.5).
+# - 오류 응답·로그에 예외 문자열·DETAIL·traceback·비밀번호·토큰·해시를 넣지 않는다.
+
+LOGIN_FIELD_MAX = 1024                           # 로그인 본문 구조 상한 — 넘으면 422, 그 안의 규칙 위반은 401 (§28.1)
+LOGIN_FAILED = "아이디 또는 비밀번호가 올바르지 않습니다"
+AUTH_REQUIRED = "로그인이 필요합니다"
+CSRF_INVALID = "CSRF 토큰이 올바르지 않습니다"
+ORIGIN_INVALID = "요청 출처가 올바르지 않습니다"
+REGISTRATION_DISABLED = "회원가입이 비활성화되어 있습니다"
+USERNAME_TAKEN = "이미 사용 중인 아이디입니다"
+TOO_MANY_ATTEMPTS = "시도 횟수를 초과했습니다. 잠시 후 다시 시도해 주세요"
+SERVICE_BUSY = "요청이 많아 처리하지 못했습니다. 잠시 후 다시 시도해 주세요"
+SERVER_ERROR = "서버 오류가 발생했습니다"
+CSRF_HEADER = "x-csrf-token"
+
+
+@dataclass(frozen=True)
+class AuthConfig:                                # 시작 가드가 확인한 설정 (app.state.auth)
+    settings: auth.AuthSettings
+    failure_key: auth.FailureKey
+
+
+@dataclass(frozen=True)
+class CurrentUser:                               # 유효한 세션의 사용자 (세션 토큰·해시는 담지 않는다)
+    id: int
+    username: str
+    csrf_token: str
+
+
+class LoginIn(BaseModel):                        # 구조만 검사 — username 형식·비밀번호 길이 위반은 401 (§28.1)
+    username: str = Field(max_length=LOGIN_FIELD_MAX)
+    password: str = Field(max_length=LOGIN_FIELD_MAX)
+
+
+class RegisterIn(BaseModel):                     # 가입 규칙 위반은 422 (응답에 입력값을 넣지 않는다)
+    username: str
+    password: str
+
+    @field_validator("username")
+    @classmethod
+    def _username(cls, value: str) -> str:
+        return auth.normalize_username(value)
+
+    @field_validator("password")
+    @classmethod
+    def _password(cls, value: str) -> str:
+        return auth.check_password(value)
+
+
+class AuthOut(BaseModel):
+    id: int
+    username: str
+    csrf_token: str
+
+
+class _LoginStateError(RuntimeError):
+    """Tx2 에서 자기 선기록이 없음 — 내부 불일치. rollback 후 500 (세션 없음)."""
+
+
+def load_auth_config(environ: Mapping[str, str] | None = None) -> AuthConfig:
+    # 시작 가드: APP_ENV·COOKIE_SECURE·REGISTRATION_ENABLED, AUTH_FAILURE_KEY, 운영이면 DATABASE_URL 존재(연결하지 않음)
+    env = os.environ if environ is None else environ
+    settings = auth.load_settings(env)
+    failure_key = auth.load_failure_key(env)
+    if settings.app_env == "production" and not env.get("DATABASE_URL"):
+        raise auth.AuthConfigError("APP_ENV=production 에서는 DATABASE_URL 이 필요합니다")
+    if failure_key.development_fallback:
+        logger.warning("auth_failure_key_public_fallback app_env=%s", settings.app_env)
+    return AuthConfig(settings=settings, failure_key=failure_key)
+
+
+def auth_config(request: Request) -> AuthConfig:
+    # 시작 가드를 거친 설정. 없으면(가드 미실행) 인증을 처리하지 않는다
+    config = getattr(request.app.state, "auth", None)
+    if not isinstance(config, AuthConfig):
+        logger.warning("auth_not_configured")
+        raise HTTPException(500, SERVER_ERROR)
+    return config
+
+
+def auth_session_factory() -> Callable[[], Session]:
+    # 트랜잭션마다 새 Session — 테스트에서 dependency_overrides 로 바꾼다. 엔진은 처음 부를 때 만든다
+    return lambda: db.get_sessionmaker()()
+
+
+def _sqlstate(exc: BaseException) -> str | None:
+    return getattr(getattr(exc, "orig", None), "sqlstate", None)
+
+
+def _auth_failure(exc: Exception, event: str) -> HTTPException:
+    # 예상한 실패(HashBusy·55P03)는 503, 그 밖은 500. 로그에는 사건·예외 종류·SQLSTATE 만 (str(exc)·traceback 없음)
+    logger.warning("%s exc_type=%s sqlstate=%s", event, type(exc).__name__, _sqlstate(exc))
+    if isinstance(exc, auth.HashBusy) or db.is_lock_timeout(exc):
+        return HTTPException(503, SERVICE_BUSY)
+    return HTTPException(500, SERVER_ERROR)
+
+
+def _guarded(call: Callable[[], Response], event: str) -> Response:
+    # 인증 라우트 본문 — HTTPException 만 그대로 내보내고, 다른 예외는 여기서 끝낸다(서버 기본 traceback 로그 없음)
+    try:
+        return call()
+    except HTTPException:
+        raise
+    except Exception as exc:                     # noqa: BLE001 — 401·409 로 위장하지 않고 503·500 으로만 바꾼다
+        raise _auth_failure(exc, event) from None
+
+
+def _client_ip(request: Request) -> str:
+    # 신뢰된 ASGI client 주소만 쓴다 (X-Forwarded-* 를 읽지 않는다). IP 가 아니면 InvalidClientAddress → 500
+    return auth.normalize_client_ip(request.client.host if request.client else None)
+
+
+def require_same_origin(request: Request) -> None:
+    # 로그인·가입 CSRF 방지 — Origin(없으면 Referer)이 이 요청의 스킴·호스트·포트와 같아야 한다 (본문 검증보다 먼저)
+    expected = auth.request_origin(request.url.scheme, request.headers.get("host"))
+    if not auth.origin_allowed(request.headers.get("origin"), request.headers.get("referer"), expected):
+        raise HTTPException(403, ORIGIN_INVALID)
+
+
+class RequestDb:
+    """(Phase 3-1A) 요청 하나의 Session·트랜잭션 — 처음 session() 을 부를 때 연다(쿠키 없는 401 은 DB 를 열지 않는다).
+
+    commit·rollback 은 request_db 의존성만 한다. 헬퍼·핸들러·require_user 는 commit 하지 않는다.
+    Session 은 auth_session_factory 로 만든다(테스트의 dependency_overrides 지점을 그대로 쓴다).
+    """
+
+    def __init__(self, factory: Callable[[], Session]) -> None:
+        self._factory = factory
+        self._stack: ExitStack | None = None
+        self._session: Session | None = None
+
+    @property
+    def opened(self) -> bool:
+        return self._session is not None
+
+    def session(self) -> Session:
+        if self._session is None:
+            stack = ExitStack()
+            try:
+                session = stack.enter_context(self._factory())
+                stack.enter_context(session.begin())
+            except BaseException:
+                stack.close()
+                raise
+            self._stack, self._session = stack, session
+        return self._session
+
+    def finish(self, exc: BaseException | None) -> None:
+        # 예외가 없으면 commit, 있으면 rollback. 어느 쪽이든 Session 을 닫는다. 열지 않았으면 아무것도 하지 않는다
+        stack, self._stack, self._session = self._stack, None, None
+        if stack is None:
+            return
+        if exc is None:
+            stack.__exit__(None, None, None)
+        else:
+            stack.__exit__(type(exc), exc, exc.__traceback__)
+
+
+DB_ERRORS = (SQLAlchemyError, psycopg.Error)    # (R-27) 요청 Session 경계에서 고정 500 으로 바꾸는 DB 예외만
+_SQLSTATE_CHARS = frozenset("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def _safe_sqlstate(exc: BaseException) -> str | None:
+    # 드라이버 예외(psycopg) 또는 SQLAlchemy 래퍼(.orig)의 SQLSTATE — 5자리 영숫자일 때만 (다른 값은 로그에 넣지 않는다)
+    value = getattr(exc, "sqlstate", None)
+    if value is None:
+        value = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if isinstance(value, str) and len(value) == 5 and set(value) <= _SQLSTATE_CHARS:
+        return value
+    return None
+
+
+def _log_db_event(event: str, exc: BaseException) -> None:
+    # 로그는 고정 사건명·예외 클래스명·SQLSTATE 만 — str(exc)·repr·traceback·exc_info 를 남기지 않는다 (R-27)
+    logger.warning("%s exc_type=%s sqlstate=%s", event, type(exc).__name__, _safe_sqlstate(exc))
+
+
+def _rollback(holder: RequestDb, exc: BaseException) -> None:
+    try:
+        holder.finish(exc)                       # rollback + Session close
+    except Exception as cleanup:                 # noqa: BLE001 — rollback 실패는 기록만, 원래 처리 결과를 바꾸지 않는다
+        _log_db_event("request_db_rollback_failed", cleanup)
+
+
+def request_db(factory: Callable[[], Session] = Depends(auth_session_factory)) -> Iterator[RequestDb]:
+    # 일반 데이터 요청의 Session 1개·트랜잭션 1개 (V7_SPEC §29.4). 반드시 RequestDbDep(scope="function")로만 참조한다 —
+    # scope 가 다르면 FastAPI 의존성 캐시 키가 달라져 Session 이 2개가 된다. "function" 이면 응답을 보내기 전에 끝난다.
+    # 예외 처리 (R-27):
+    # - HTTPException(401·403·404·409 등)·검증 오류(422)·일반 파이썬 오류 → rollback 후 원래 예외를 그대로 올린다
+    # - DB 예외(SQLAlchemyError·psycopg.Error) → rollback 후 고정 500. 원래 예외는 연결하지 않는다(from None)
+    # - commit 중 DB 예외 → 고정 500 (성공 응답을 보내지 않는다). commit 중 다른 예외는 그대로 올린다
+    # 500 은 except 블록 밖에서 만든다 — 원래 DB 예외가 __context__ 로도 붙지 않게
+    holder = RequestDb(factory)
+    db_failed = False
+    try:
+        yield holder
+    except DB_ERRORS as exc:
+        _log_db_event("request_db_error", exc)
+        _rollback(holder, exc)
+        db_failed = True
+    except BaseException as exc:
+        _rollback(holder, exc)
+        raise
+    if not db_failed:
+        try:
+            holder.finish(None)                  # commit — 성공 응답보다 먼저
+        except DB_ERRORS as exc:                 # commit 실패면 성공 응답을 보내지 않는다
+            _log_db_event("request_db_commit_failed", exc)
+            db_failed = True
+    if db_failed:
+        raise HTTPException(500, SERVER_ERROR)
+
+
+RequestDbDep = Annotated[RequestDb, Depends(request_db, scope="function")]   # 요청 Session 은 이 별칭으로만 받는다
+
+
+def _load_current_user(request: Request, config: AuthConfig, rdb: RequestDb) -> CurrentUser | None:
+    token = request.cookies.get(config.settings.cookie_name)
+    if token is None:
+        return None                              # DB 를 열지 않는다
+    found = db.get_active_session(rdb.session(), token, now())   # 데이터 작업과 같은 Session·트랜잭션
+    if found is None:
+        return None
+    user_session, user = found
+    return CurrentUser(id=user.id, username=user.username, csrf_token=user_session.csrf_token)
+
+
+def require_user(request: Request, rdb: RequestDbDep, config: AuthConfig = Depends(auth_config)) -> CurrentUser:
+    # 유효한 세션이 없으면 401. DB 오류는 500·503. 요청 Session(rdb)을 핸들러와 함께 쓴다 (데이터 경로 연결은 3-4·3-5)
+    try:
+        user = _load_current_user(request, config, rdb)
+    except Exception as exc:                     # noqa: BLE001
+        raise _auth_failure(exc, "auth_session_error") from None
+    if user is None:
+        raise HTTPException(401, AUTH_REQUIRED)
+    return user
+
+
+def require_csrf(request: Request, user: CurrentUser = Depends(require_user)) -> CurrentUser:
+    # GET·HEAD 가 아닌 인증 요청은 X-CSRF-Token 이 세션 값과 같아야 한다 (Phase 3 에서 데이터 경로에 건다)
+    if request.method not in ("GET", "HEAD") and not auth.csrf_matches(user.csrf_token,
+                                                                       request.headers.get(CSRF_HEADER)):
+        raise HTTPException(403, CSRF_INVALID)
+    return user
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> Response:
+    # 인증 경로만 입력값(input)·ctx 를 빼고 위치·메시지·종류만 돌려준다(비밀번호 원문 노출 방지). v6 경로는 기본 처리 그대로
+    if request.url.path.startswith("/auth/"):
+        errors = [{"loc": list(e.get("loc", ())), "msg": e.get("msg", ""), "type": e.get("type", "")}
+                  for e in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
+    return await request_validation_exception_handler(request, exc)
+
+
+def _auth_response(status_code: int, user_id: int, username: str, csrf: str, token: str,
+                   config: AuthConfig) -> Response:
+    # commit 이 끝난 뒤에만 부른다 — 본문에 세션 토큰·해시를 넣지 않는다
+    response = JSONResponse(status_code=status_code,
+                            content=AuthOut(id=user_id, username=username, csrf_token=csrf).model_dump())
+    response.set_cookie(value=token, **auth.cookie_kwargs(config.settings))   # type: ignore[arg-type]
+    return response
+
+
+def _too_many(retry_after: int) -> HTTPException:
+    return HTTPException(429, TOO_MANY_ATTEMPTS, headers={"Retry-After": str(int(retry_after))})
+
+
+AUTH_RESPONSES: dict[int | str, dict[str, object]] = {
+    401: {"description": "로그인 실패·미로그인"}, 403: {"description": "Origin·CSRF 불일치, 가입 비활성"},
+    409: {"description": "username 중복"}, 429: {"description": "시도 제한 (Retry-After)"},
+    500: {"description": "서버 오류"}, 503: {"description": "해시 슬롯 혼잡·잠금 대기 초과"},
+}
+
+
+@app.post("/auth/register", status_code=201, response_model=AuthOut, responses=AUTH_RESPONSES,
+          dependencies=[Depends(require_same_origin)])
+def register(payload: RegisterIn, request: Request, config: AuthConfig = Depends(auth_config),
+             factory: Callable[[], Session] = Depends(auth_session_factory)) -> Response:
+    # Origin(403) → 본문(422) → 비활성(403) → IP → 시도 제한(429) → 중복(409)·가입(201). 201·409 만 시도로 센다
+    def run() -> Response:
+        if not config.settings.registration_enabled:
+            raise HTTPException(403, REGISTRATION_DISABLED)
+        client_ip = _client_ip(request)
+        moment = now()
+        outcome: tuple = ()
+        with factory() as session, session.begin():          # 가입 트랜잭션 1개 (해시 동안 연결 유지 — R-30)
+            attempt = db.begin_register_attempt(session, client_ip, moment)
+            if not attempt.decision.allowed:
+                outcome = ("blocked", attempt.decision.retry_after)          # 기록 없음
+            elif db.username_exists(session, payload.username):
+                outcome = ("taken",)                                         # 시도 기록은 commit 해서 센다
+            else:
+                password_hash = auth.hash_password_limited(payload.password)  # HashBusy → rollback(세지 않음) → 503
+                try:
+                    user_id = db.create_user(session, payload.username, password_hash, moment)
+                except db.UsernameTaken:
+                    outcome = ("taken",)                                     # 경쟁 — SAVEPOINT 로 바깥 트랜잭션 유지
+                else:
+                    db.purge_expired_sessions(session, moment)
+                    token, csrf = db.create_session(
+                        session, user_id, moment, replace_token=request.cookies.get(config.settings.cookie_name))
+                    outcome = ("created", user_id, token, csrf)
+        # 여기부터는 commit 이 끝난 뒤다
+        if outcome[0] == "blocked":
+            raise _too_many(outcome[1])
+        if outcome[0] == "taken":
+            raise HTTPException(409, USERNAME_TAKEN)
+        _, user_id, token, csrf = outcome
+        return _auth_response(201, user_id, payload.username, csrf, token, config)
+
+    return _guarded(run, "auth_register_error")
+
+
+@app.post("/auth/login", response_model=AuthOut, responses=AUTH_RESPONSES,
+          dependencies=[Depends(require_same_origin)])
+def login(payload: LoginIn, request: Request, config: AuthConfig = Depends(auth_config),
+          factory: Callable[[], Session] = Depends(auth_session_factory)) -> Response:
+    # Tx1(선기록) → 트랜잭션 밖 Argon2 → Tx2(성공) 또는 보상 Tx(HashBusy). 실패 유형과 관계없이 같은 401
+    def run() -> Response:
+        client_ip = _client_ip(request)
+        name = auth.login_name(payload.username, config.failure_key)
+        with factory() as session, session.begin():          # Tx1 — 끝나면 commit, Session·연결 반환
+            attempt = db.begin_login_attempt(session, name, client_ip, now())
+        if not attempt.decision.allowed:
+            raise _too_many(attempt.decision.retry_after)
+        try:
+            verified = auth.verify_login_password(attempt.password_hash, payload.password)   # DB 연결·잠금 없음
+        except auth.HashBusy:
+            _cancel_attempt(factory, name, attempt.attempt_id)
+            raise
+        if not verified or attempt.user_id is None or attempt.password_hash is None:
+            raise HTTPException(401, LOGIN_FAILED)                           # 선기록은 실패로 남는다
+        new_hash = _rehash(attempt.password_hash, payload.password)          # 트랜잭션 밖. 못 하면 None
+        moment = now()
+        with factory() as session, session.begin():          # Tx2 — 실패하면 rollback, 선기록은 남고 세션 없음
+            if not db.finish_login_success(session, name, attempt.attempt_id):
+                raise _LoginStateError()
+            if new_hash is not None:
+                db.update_password_hash_if_unchanged(session, attempt.user_id, attempt.password_hash, new_hash)
+            db.purge_expired_sessions(session, moment)
+            token, csrf = db.create_session(
+                session, attempt.user_id, moment, replace_token=request.cookies.get(config.settings.cookie_name))
+        return _auth_response(200, attempt.user_id, name.username or "", csrf, token, config)
+
+    return _guarded(run, "auth_login_error")
+
+
+def _cancel_attempt(factory: Callable[[], Session], name: auth.LoginName, attempt_id: int | None) -> None:
+    # 보상 Tx — 검증에 들어가지 못한 시도의 자기 선기록만 지운다. 실패해도 응답은 503 (선기록은 남는다)
+    if attempt_id is None:
+        return
+    try:
+        with factory() as session, session.begin():
+            db.cancel_login_attempt(session, name, attempt_id)
+    except Exception as exc:                     # noqa: BLE001
+        logger.warning("auth_compensation_failed exc_type=%s sqlstate=%s", type(exc).__name__, _sqlstate(exc))
+
+
+def _rehash(stored_hash: str, password: str) -> str | None:
+    # 해시 설정이 바뀐 경우만 새 해시 — 트랜잭션 밖, 슬롯 안. 슬롯 혼잡·규칙 불일치면 건너뛴다(로그인은 진행)
+    try:
+        if not auth.needs_rehash(stored_hash):
+            return None
+        return auth.hash_password_limited(password)
+    except (auth.HashBusy, ValueError) as exc:
+        logger.warning("auth_rehash_skipped exc_type=%s", type(exc).__name__)
+        return None
+
+
+@app.post("/auth/logout", status_code=204, responses=AUTH_RESPONSES)
+def logout(request: Request, config: AuthConfig = Depends(auth_config),
+           factory: Callable[[], Session] = Depends(auth_session_factory)) -> Response:
+    # 세션이 있으면 CSRF 헤더가 맞아야 지운다(아니면 403). 세션이 없거나 만료·형식 오류여도 204 + 쿠키 삭제
+    def run() -> Response:
+        token = request.cookies.get(config.settings.cookie_name)
+        if token is not None:
+            with factory() as session, session.begin():
+                found = db.get_active_session(session, token, now())
+                if found is not None:
+                    if not auth.csrf_matches(found[0].csrf_token, request.headers.get(CSRF_HEADER)):
+                        raise HTTPException(403, CSRF_INVALID)
+                    db.delete_session(session, token)
+        response = Response(status_code=204)
+        response.delete_cookie(**auth.cookie_delete_kwargs(config.settings))   # type: ignore[arg-type]
+        return response
+
+    return _guarded(run, "auth_logout_error")
+
+
+@app.get("/auth/me", response_model=AuthOut, responses=AUTH_RESPONSES)
+def me(user: CurrentUser = Depends(require_user)) -> AuthOut:
+    return AuthOut(id=user.id, username=user.username, csrf_token=user.csrf_token)

@@ -1,0 +1,493 @@
+# V7_SPEC.md — FastAPI To-Do List 7.0.0 "PostgreSQL Foundation & Authentication"
+
+이 문서는 Version 7.0.0의 개발 명세다. `CLAUDE.md`의 v4·v5·v6 명세(§1~§24)는 그대로 계약으로 남고, v7에서 바뀌는 규칙은 이 문서와 `CLAUDE.md` 해당 절에 `(7.0.0)`으로 표시한다. 절 번호는 `CLAUDE.md`에 이어 §25부터 쓴다.
+구현 순서·절차·위험은 `V7_PLAN.md`를 따른다. 이 문서에 없는 기능은 추가하지 않는다.
+
+- 기준 커밋: `176e48a` (main, v6.0.0 병합), 작업 브랜치 `feature/v7.0.0`
+- v6.0.0 테스트 기준: `332 passed, 3 deselected` (2026-11-05 로컬 실행 확인, integration 제외)
+
+## 범위 조정 기록 (2026-11-09)
+> **v7.0.0의 최종 범위를 줄였다(사용자 승인 2026-11-09).** 이전 제목은 "Multi-User & PostgreSQL"이었다.
+> - v7.0.0 = **PostgreSQL Foundation & Authentication**. 포함: Phase 1, Phase 2, Phase 3-0, Phase 3-1, Phase 3-2(`V7_PLAN.md` §P13).
+> - **v8.0.0 "Multi-User Data Migration"**으로 이관: Phase 3-3~3-6(UI 로그인 게이트, 데이터 경로 인증·CSRF·사용자별 격리, JSON 런타임 제거)과 기존 Phase 4~6의 미구현 작업(v6 기능의 DB 연동, JSON 이전, 운영 전환·배포 준비).
+> - v7.0.0에서 할 일·템플릿은 **JSON 파일 저장을 그대로 쓴다.** 데이터 API 15개는 인증·CSRF·사용자별 격리 없이 모든 호출자가 같은 데이터를 쓴다(§28.2, `V7_PLAN.md` R-34).
+> - v7.0.0은 **로컬 개발·시연 전용**이다. 운영 배포·공개, main 병합, push, Jenkins 배포를 하지 않는다(§29.6, `V7_PLAN.md` R-35).
+> - 승인된 결정 D-6·D-7·D-8·D-10·D-11은 결정 이력을 그대로 두고 적용 시점을 v8.0.0으로 한다(§26).
+> - 이 날짜 이전에 쓴 기록(완료 블록·수치·커밋·체크 표시)은 고치지 않았다. 그 기록 안의 "Phase 3(3-3 이후)·4·5·6에서 한다"는 당시 계획이며, 지금은 v8.0.0 작업을 뜻한다.
+> - 상태 표시: **구현·검증 완료**(v7.0.0), **구현됨·미연결**(코드·스키마는 있지만 앱 경로가 쓰지 않음), **미검증**, **v8.0.0 이관**(미구현). 한 절에 "v7.0.0 실제 동작"과 "v8.0.0 계약"을 나눠 쓴 곳은 앞의 것이 현재 계약이다.
+
+## 25. 목표와 범위
+(2026-11-09 범위 조정) 처음 목표 8개(2026-11-05)는 그대로 두고 v7.0.0 상태를 함께 적는다.
+
+| # | 목표 | v7.0.0 상태 (2026-11-09) |
+|---|---|---|
+| 1 | PostgreSQL 도입 (JSON 파일 저장 대체) | 인증 데이터(`users`·`sessions`·`auth_failures`)용으로 **구현·검증 완료**. 할 일·템플릿의 JSON 대체는 **v8.0.0 이관** — v7.0.0은 JSON 저장 유지 |
+| 2 | SQLAlchemy 2.x ORM, Alembic 스키마 관리 | **구현·검증 완료** (Alembic `0001`·`0002`) |
+| 3 | 회원가입·로그인·로그아웃 (username + 비밀번호) | **구현·검증 완료** (§28.1) |
+| 4 | Argon2id 해싱, HttpOnly 쿠키 기반 서버 세션, CSRF 방어, 로그인 시도 제한 | **구현·검증 완료** — 인증 경로에 한함(가입·로그인 Origin 검사, 로그아웃 CSRF 검사, `/auth/me` 세션 인증 — §29.3). 데이터 경로 CSRF는 v8.0.0 |
+| 5 | 사용자별 데이터 격리 (할 일·하위 할 일·템플릿·통계·내보내기·알림) | **v8.0.0 이관** (3-1의 소유자 조건 헬퍼는 구현됨·미연결) |
+| 6 | 기존 JSON 데이터를 지정한 사용자 1명에게 안전하게 이전 (순서·id·시각·관계 보존) | **v8.0.0 이관** (`migrate_json.py` 없음) |
+| 7 | v6.0.0 기능 전부 유지 (CRUD, 하위 할 일, 반복, 일괄, 태그·즐겨찾기·우선순위, 검색·필터·정렬, 템플릿, 캘린더, `/stats` 대시보드, 칸반, 알림 센터, 테마, 내보내기, KST 규칙) | JSON 저장 그대로 유지, 기존 v6 테스트로 회귀 확인 |
+| 8 | 인증·권한·이전·회귀 테스트 | 인증 테스트, PostgreSQL 테스트 하네스, 로그인 상태 UI 테스트 기반(3-2) **구현·검증 완료**. 권한(격리)·이전 테스트는 v8.0.0 |
+
+**운영 공개 금지 (2026-11-09)**: v7.0.0은 로컬 개발·시연 전용이며 운영에 배포·공개하지 않는다. 데이터 API 15개가 인증 없이 열려 있기 때문이다(§28.2, `V7_PLAN.md` R-34). 아래 HTTPS 조건은 v8.0.0 이후의 공개 판단 기준으로 남긴다.
+
+**운영 공개 조건 (필수)**: 운영 HTTPS가 확인되기 전에는 v7(로그인 기능)을 운영 환경에 공개하지 않는다. §29.6 참고.
+
+## 26. 승인된 결정 (2026-11-05)
+| ID | 결정 |
+|---|---|
+| D-1 | 런타임 의존성 추가: `sqlalchemy`, `psycopg[binary]`, `alembic`, `argon2-cffi` |
+| D-2 | 파일 구성: `main.py`(라우트) + `db.py`(엔진·ORM·세션) + `auth.py`(해시·세션·CSRF·시도 제한) + `migrate_json.py`(이전·역내보내기 CLI) + `alembic/`. `index.html`은 1개 유지 — (2026-11-09) `migrate_json.py`는 v8.0.0(아직 없음) |
+| D-3 | `CLAUDE.md` Out of Scope에서 "DB 도입, 사용자 인증" 삭제, v7 변경 부분만 수정 |
+| D-4 | 로그인 식별자는 username, 비밀번호 8~128자 |
+| D-5 | 세션 만료 14일 고정 (연장 없음) |
+| D-8 | 알림 읽음 localStorage 키를 사용자별로 분리 — 적용 v8.0.0 |
+| D-9 | 비밀번호 변경 기능은 7.0.0 범위 밖 |
+| D-10 | 기존 JSON 데이터는 명시적으로 지정한 사용자 1명에게 이전 — 적용 v8.0.0 |
+| D-11 | 데이터 API는 인증 필수, 익명 요청은 401 — 적용 v8.0.0 (v7.0.0 데이터 API는 인증 없음, §28.2) |
+
+권장안을 제시한 결정(D-6 position — 2026-11-08 채택, D-7 soft delete — 2026-11-08 채택, D-12 시도 제한 수치 — 2026-11-06 채택, D-13~D-17)은 `V7_PLAN.md` §P0에 있다. 아래 명세는 권장안 기준으로 쓰고, 아직 승인되지 않은 항목만 `(권장)`으로 표시한다.
+
+(2026-11-09) D-6·D-7·D-8·D-10·D-11은 승인 이력을 그대로 두고 적용 시점을 v8.0.0으로 한다. v7.0.0에 적용된 결정은 D-1, D-2(`migrate_json.py` 제외), D-3, D-4, D-5, D-9, D-12다. D-13~D-17의 상태는 바꾸지 않았다(`V7_PLAN.md` §P0).
+
+## 27. 데이터베이스 설계
+
+**v7.0.0 상태 (2026-11-09)**: 아래 표 8개(`alembic_version` 포함)는 모두 Alembic `0001`·`0002`로 만들어진다(**구현·검증 완료**, `todo_test`·`todo_dev` 적용). 앱이 실제로 쓰는 표는 `users`·`sessions`·`auth_failures`·`alembic_version`뿐이다. `todos`·`subtasks`·`task_templates`·`data_migrations`는 스키마만 있고 앱 경로에서 쓰지 않는다(**구현됨·미연결**) — v7.0.0의 할 일·템플릿은 JSON 파일(`TODO_FILE`·`TEMPLATE_FILE`)이다. §27.3~§27.5의 규칙은 v8.0.0에서 데이터 경로에 적용한다.
+
+### 27.1 원칙
+- PostgreSQL만 지원한다(테스트 포함, SQLite 대체 없음).
+- 열거값은 PG ENUM 대신 `VARCHAR + CHECK` (Alembic으로 값 변경이 쉽다).
+- 시각은 `TIMESTAMPTZ`로 UTC 저장. 연결마다 `TimeZone=UTC`를 고정해 응답 시각에 다른 오프셋이 붙지 않게 한다.
+- 시각 값은 DB `now()`가 아니라 파이썬 `main.now()`로 넣는다(테스트의 시계 고정 유지).
+- 검증 규칙(§2, §14, §16)은 계속 Pydantic이 맡는다. DB 제약은 이중 안전장치다.
+- 사용자 단위 쓰기는 트랜잭션 시작 시 `SELECT ... FROM users WHERE id = :uid FOR UPDATE`로 직렬화한다(다중 워커에서도 position·bulk·restore가 꼬이지 않게). (2026-11-09) **이 규칙은 v7.0.0 데이터 경로에 적용되지 않는다** — v7.0.0의 할 일·템플릿 쓰기는 JSON 파일이라 사용자 행 잠금이 없다(§28.2). `db.lock_user`로 구현·`todo_test`에서 검증했고(3-1, 구현됨·미연결), 데이터 경로에는 v8.0.0에서 적용한다.
+
+### 27.2 테이블
+```sql
+users (
+  id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  username      VARCHAR(30) NOT NULL UNIQUE,      -- 소문자로 정규화해 저장
+  password_hash TEXT NOT NULL,                    -- Argon2id PHC 문자열
+  created_at    TIMESTAMPTZ NOT NULL
+)
+
+sessions (
+  token_hash  BYTEA PRIMARY KEY,                  -- SHA-256(쿠키 토큰), 원문은 저장하지 않는다
+  user_id     BIGINT NOT NULL REFERENCES users ON DELETE CASCADE,
+  csrf_token  VARCHAR(64) NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL,
+  expires_at  TIMESTAMPTZ NOT NULL                -- created_at + 14일
+)  -- INDEX (user_id), INDEX (expires_at)
+
+auth_failures (                                    -- 로그인·가입 시도 제한 (§29.5), Alembic 0002 (Phase 2-A)
+  id           BIGINT GENERATED ALWAYS AS IDENTITY,                  -- pk_auth_failures
+  kind         VARCHAR(8) NOT NULL,
+  username_key VARCHAR(30) NULL,                  -- (2-D) 정규화한 username의 HMAC-SHA256 앞 22바이트, 패딩 없는 base64url 30자(§29.5). 평문 username은 저장하지 않는다. 가입 기록과 형식이 틀린 로그인 입력은 null
+  client_ip    VARCHAR(45) NOT NULL,              -- (2-D) 정규화한 IP: IPv4는 주소, IPv6는 /64 네트워크(예: 2001:db8:1:2::/64) (§29.5)
+  created_at   TIMESTAMPTZ NOT NULL,
+  CONSTRAINT ck_auth_failures_kind CHECK (kind IN ('login', 'register')),
+  CONSTRAINT ck_auth_failures_register_has_no_username CHECK (kind = 'login' OR username_key IS NULL)
+)  -- INDEX ix_auth_failures_kind_username_key_created_at (kind, username_key, created_at)
+   -- INDEX ix_auth_failures_kind_client_ip_created_at (kind, client_ip, created_at)
+   -- INDEX ix_auth_failures_created_at (created_at)  — 24시간 지난 기록 정리
+   -- users 와 외래키로 잇지 않는다 (없는 계정에 대한 시도도 기록)
+
+todos (
+  id           BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,  -- 이전 시 원래 id 유지
+  user_id      BIGINT NOT NULL REFERENCES users ON DELETE CASCADE,
+  position     BIGINT NOT NULL,                   -- (D-6 승인) 목록 순서
+  title        VARCHAR(100) NOT NULL,
+  description  VARCHAR(500) NOT NULL DEFAULT '',
+  completed    BOOLEAN NOT NULL DEFAULT false,
+  priority     VARCHAR(2) NOT NULL DEFAULT '보통' CHECK (priority IN ('높음','보통','낮음')),
+  due_date     DATE NULL,
+  tags         TEXT[] NOT NULL DEFAULT '{}',      -- 입력 순서 보존
+  favorite     BOOLEAN NOT NULL DEFAULT false,
+  recurrence   VARCHAR(7) NOT NULL DEFAULT 'none' CHECK (recurrence IN ('none','daily','weekly','monthly')),
+  next_spawned BOOLEAN NOT NULL DEFAULT false,
+  created_at   TIMESTAMPTZ NULL,                  -- v1~v3 데이터는 null 유지
+  completed_at TIMESTAMPTZ NULL,
+  deleted_at   TIMESTAMPTZ NULL,                  -- (D-7 승인) 실행 취소 대기 표시
+  CHECK (recurrence = 'none' OR due_date IS NOT NULL),
+  UNIQUE (user_id, position)
+)  -- (user_id, position) 조회·정렬은 UNIQUE 인덱스를 그대로 쓴다 (별도 부분 인덱스 없음)
+
+subtasks (
+  todo_id    BIGINT NOT NULL REFERENCES todos ON DELETE CASCADE,
+  id         INT NOT NULL,                        -- 그 할 일 안의 sid (§14)
+  title      VARCHAR(100) NOT NULL,
+  completed  BOOLEAN NOT NULL DEFAULT false,
+  PRIMARY KEY (todo_id, id)
+)  -- 순서는 id 순 (하위 할 일 순서 변경은 범위 밖)
+
+task_templates (
+  id          BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,  -- 이전 시 원래 id 유지
+  user_id     BIGINT NOT NULL REFERENCES users ON DELETE CASCADE,
+  position    BIGINT NOT NULL,                    -- 파일 순서 보존
+  name        VARCHAR(50) NOT NULL,
+  title       VARCHAR(100) NOT NULL,
+  description VARCHAR(500) NOT NULL DEFAULT '',
+  priority    VARCHAR(2) NOT NULL DEFAULT '보통' CHECK (...),
+  tags        TEXT[] NOT NULL DEFAULT '{}',
+  recurrence  VARCHAR(7) NOT NULL DEFAULT 'none' CHECK (...),
+  subtasks    TEXT[] NOT NULL DEFAULT '{}',       -- 하위 할 일 제목 목록 (§16)
+  UNIQUE (user_id, position)
+)  -- UNIQUE INDEX (user_id, lower(name)) — 이름 중복 409는 사용자 단위
+
+data_migrations (                                  -- JSON 이전 기록 (같은 원본 재이전 방지)
+  id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  source_sha256  CHAR(64) NOT NULL,               -- todo.json + task_templates.json 해시 조합
+  owner_user_id  BIGINT NOT NULL REFERENCES users,
+  todo_count     INT NOT NULL,
+  template_count INT NOT NULL,
+  migrated_at    TIMESTAMPTZ NOT NULL,
+  UNIQUE (source_sha256)
+)
+```
+
+### 27.3 목록 순서 — position (D-6, 2026-11-08 승인) — 적용 v8.0.0
+(2026-11-09) 3-1에서 `db.py` 헬퍼로 구현하고 `todo_test`에서 검증했다(구현됨·미연결). v7.0.0 데이터 경로는 v6 규칙(`todo.json` 배열 순서)을 그대로 쓴다.
+
+v6의 기본순은 `todo.json`의 배열 순서다. 새 항목·다음 반복 일정은 끝에 붙고, 복구한 항목은 지울 때의 자리로 돌아간다. id 순서와 같다는 보장이 없으므로(직접 편집·오래된 데이터) 순서를 별도 열로 저장한다.
+- 기본 정렬은 `ORDER BY position, id`이다. `GET /todos`, 내보내기(JSON·CSV), 화면의 '기본순'이 모두 이 순서다.
+- 새 할 일(POST, 템플릿으로 생성 포함): `position = 그 사용자의 max(position) + 1`.
+  - max에는 **soft delete 대기 행(`deleted_at IS NOT NULL`)도 포함**한다. 활성 행만 보면 지운 행의 번호를 받아 `UNIQUE (user_id, position)` 위반이 나고, 복구할 자리도 사라진다.
+  - max 계산과 INSERT는 **사용자 행 잠금**(§27.1 `FOR UPDATE`) 안에서 한 트랜잭션으로 한다. 잠금 없이 같은 사용자가 동시에 만들면 같은 max를 읽어 UNIQUE 위반이 난다.
+- 반복 다음 일정: 생성 시점에 같은 방식으로 끝에 붙는다. bulk complete에서 여러 개가 생기면 요청 `ids` 처리 순서대로 붙는다(v6과 같다).
+- 삭제: position을 바꾸지 않는다(다른 행도 다시 매기지 않는다).
+- 복구: 원래 position을 그대로 쓰므로 지울 때의 상대 순서로 돌아간다. 지운 뒤 새로 추가된 항목은 계속 뒤에 있다(v6 `insert(position)` 결과와 같은 상대 순서).
+- 30초가 지나 완전 삭제된 행의 position은 다른 행을 다시 매겨 채우지 않는다. 그 번호가 max였다면 다음 추가가 같은 번호를 다시 쓸 수 있고, **이 재사용은 허용한다**(그 행은 이미 없어 충돌하지 않고, 상대 순서도 v6과 같다). 대기 중인 행의 번호는 max에 포함되므로 재사용되지 않는다.
+- 검증(Phase 3 → v8.0.0, `V7_PLAN.md` §P3): 지운 대기 행이 max일 때 추가 → 새 번호가 그보다 크고 복구 후 순서 유지, 완전 삭제 뒤 번호 재사용, 같은 사용자 동시 생성(병렬 POST·반복 생성) → 충돌·중복 없음, 생성과 복구 병렬 → 일관.
+- 이전: `position = JSON 배열의 1부터 시작하는 인덱스`. 템플릿도 같다.
+- 템플릿: 새 템플릿은 끝에 붙고, 삭제는 즉시 완전 삭제(템플릿 실행 취소는 없다).
+
+### 27.4 삭제 실행 취소 — soft delete (D-7, 2026-11-08 승인) — 적용 v8.0.0
+(2026-11-09) 3-1에서 헬퍼(soft delete·100건 정리·30초 원자적 복구)로 구현하고 `todo_test`에서 검증했다(구현됨·미연결). v7.0.0 데이터 경로는 v6 메모리 버퍼(§12, 프로세스 안 30초)를 그대로 쓴다.
+
+| 기준 | 사용자별 메모리 버퍼 | PostgreSQL soft delete (`deleted_at`) |
+|---|---|---|
+| 30초 복구 | 가능 (v6과 같음) | 가능 (`deleted_at > now - 30s`) |
+| 동시 요청 | 프로세스 안 잠금 필요. DB 커밋과 버퍼 기록 사이에 실패하면 불일치 | 삭제·복구가 한 트랜잭션. 사용자 잠금으로 직렬화 |
+| 서버 재시작 | 버퍼가 사라져 복구 불가 | 30초 안이면 재시작 뒤에도 복구 가능 |
+| 다중 워커 | **동작하지 않음** (워커 A에서 지우고 워커 B에 복구 요청하면 404) | 동작함 |
+| 하위 할 일 | 객체째 메모리에 보관 후 다시 INSERT | 행이 그대로 남아 있어 복구 시 그대로 |
+| id 충돌 방지 | `next_id()`가 버퍼 id를 피해야 함 | 시퀀스는 재사용하지 않음, 행이 남아 있어 문제 없음 |
+| 위험 | 워커 1개 강제, 메모리 사용 | 모든 조회에 `deleted_at IS NULL` 누락 시 지운 항목 노출 |
+
+**채택: soft delete (D-7).** 누락 위험은 다음으로 막는다.
+- 할 일 조회는 `db.py`의 헬퍼(`active_todos(uid)`, `get_owned_todo(uid, id)`)만 쓰고 엔드포인트에서 `select(Todo)`를 직접 쓰지 않는다.
+- 테스트: 지운 직후 GET·stats·export·bulk·PUT·하위 할 일 API·알림 대상에 나타나지 않는지 전부 확인한다.
+
+규칙:
+- DELETE·bulk delete: `deleted_at = now()`. 응답과 상태 코드는 v6과 같다(204, `{updated:[], deleted:[...]}`).
+- 복구 가능 조건: 같은 사용자, `deleted_at IS NOT NULL`, `deleted_at > now() - 30초`.
+- `POST /todos/restore`: 요청 id가 하나라도 조건을 만족하지 않으면 404, 아무것도 바꾸지 않는다. 성공하면 `deleted_at = NULL`. 두 번째 복구는 404. 응답 순서는 요청 `ids` 순서(v6과 같다).
+- 사용자당 대기 행은 최대 100건(§12). 넘치면 `deleted_at`이 오래된 것부터 완전 삭제한다.
+- 정리: 그 사용자의 쓰기 요청(삭제·복구·생성)마다 30초가 지난 대기 행을 완전 삭제한다(백그라운드 스케줄러 없음, Out of Scope 유지). 지난 행은 정리 전에도 모든 조회에서 보이지 않는다.
+- 지운 할 일(대기 중)의 하위 할 일 API, PUT, 다른 DELETE는 404다.
+- v6과의 차이(C-4): "재시작하면 버퍼가 사라진다" → "재시작해도 30초 안이면 복구된다". 30초 제한은 그대로라 영구 휴지통(Out of Scope)은 아니다.
+
+### 27.5 id 규칙 (7.0.0) — 적용 v8.0.0
+(2026-11-09) v7.0.0 데이터 경로는 v6 규칙(최대 id + 1, 복구 대기 id 회피 — §9)을 그대로 쓴다.
+
+- 할 일·템플릿 id는 **전역 시퀀스**로 매긴다(v6 "최대 id + 1" 대체, C-2). 한 사용자 입장에서는 id가 건너뛸 수 있다.
+- 시퀀스는 재사용하지 않으므로 지운 id와 새 id는 항상 다르다(§9 복구 id 충돌 방지 규칙은 자동으로 만족).
+- 이전 직후 `setval`로 시퀀스를 이전 데이터의 최대 id에 맞춘다. 첫 POST id = 최대 id + 1(A21이 이전 직후 단일 사용자에서 성립).
+- 하위 할 일 sid는 v6과 같다(그 할 일 안에서 최대 sid + 1, 반복 복사 시 1부터).
+
+## 28. API
+
+### 28.1 신규 인증 API
+| 메서드 경로 | 요청 | 응답 |
+|---|---|---|
+| POST `/auth/register` | `{username, password}` | 201 `{id, username, csrf_token}` + 세션 쿠키 (가입 즉시 로그인). 중복 409, 검증 실패 422, 가입 비활성 403, 시도 초과 429, 해시 슬롯 혼잡 503 (2-D) |
+| POST `/auth/login` | `{username, password}` | 200 `{id, username, csrf_token}` + 세션 쿠키. 실패는 항상 같은 401 메시지, 시도 초과 429, 해시 슬롯 혼잡·잠금 대기 초과 503 (2-D) |
+| POST `/auth/logout` | (CSRF 헤더) | 204, 세션 행 삭제 + 쿠키 만료. 세션이 없어도 204 |
+| GET `/auth/me` | — | 200 `{id, username, csrf_token}`, 미로그인 401 |
+
+- 고정 경로 선언 순서 규칙(§9)을 지킨다.
+- username: 앞뒤 공백 제거 → ASCII `[A-Za-z0-9_.-]`와 3~30자 검사 → 소문자 변환 순서로 정규화한다(저장 값은 `[a-z0-9_.-]`). 소문자로 먼저 바꾸지 않는다(켈빈 기호 `K` 등 비ASCII 문자가 ASCII로 바뀌어 통과하는 것 방지). 중간 공백은 거부. 대소문자 무시 중복은 409.
+- password: 8~128자(문자 수), 공백 제거하지 않음, 유니코드 정규화하지 않음(입력 그대로 해시). 최대 길이는 해싱 DoS 방지용.
+- 응답에 `password_hash`·세션 토큰 원문을 넣지 않는다.
+- (Phase 2-D 정책, 2026-11-06) 로그인의 422는 **본문 구조 오류**(필드 누락, 문자열이 아님, 크기 상한 초과)만이다. username 형식 오류·비밀번호 길이 초과·없는 계정·틀린 비밀번호·깨진 해시는 모두 같은 401이고 시도로 기록한다(§29.5). 가입의 username·password 규칙 위반은 그대로 422다.
+- (Phase 2-D 정책) 인증 경로의 검사 순서: Origin(403) → 본문 구조(422) → (가입) 비활성(403) → 시도 제한(429) → 처리(401·409·201·200). DB 오류는 500, 잠금 대기 초과와 해시 슬롯 혼잡은 503이며 어느 경우에도 세션을 발급하지 않는다. 응답 연결은 Phase 2-E.
+- (Phase 2-E 구현, 2026-11-06 — 구현·검증 완료, 로컬 커밋 `bbe5227`) 실제 응답 계약:
+
+  | 경로 | 성공 | 실패 (검사 순서) |
+  |---|---|---|
+  | POST `/auth/register` | 201 `{id, username, csrf_token}` + 쿠키 | Origin 불일치 403 → 본문·규칙 위반 422 → 가입 비활성 403 → 시도 초과 429(`Retry-After` 정수 초) → 중복 409. 해시 슬롯 혼잡·잠금 대기 초과(SQLSTATE 55P03) 503, 그 밖의 DB 오류·IP가 아닌 클라이언트 500 |
+  | POST `/auth/login` | 200 `{id, username, csrf_token}` + 쿠키 | Origin 403 → 본문 구조 422(필드 누락·문자열 아님·필드당 1024자 초과·JSON 아님 — 깨진 JSON은 Origin 403보다 먼저 422, §28.2 예외) → 429 → 실패는 유형과 관계없이 **같은 401** → 503·500 |
+  | POST `/auth/logout` | 204 + 쿠키 삭제 (세션 없음·만료·형식 오류여도 204) | 유효한 세션이 있는데 `X-CSRF-Token`이 없거나 다름 403(세션 유지). DB 오류 500, 55P03 503 |
+  | GET `/auth/me` | 200 `{id, username, csrf_token}` | 세션 없음·만료 401. DB 오류 500, 55P03 503 |
+
+  - 가입은 트랜잭션 1개다. 시도 제한 판정·기록 → 중복 사전 조회 → 해시 → SAVEPOINT 안 사용자 INSERT → 만료 세션 정리 → 세션 생성 → commit. 409·429는 블록을 정상 종료(commit)한 **뒤** 응답하므로 409의 가입 시도 기록은 남는다(201·409만 센다). 동시 가입 경쟁의 UNIQUE 위반은 제약 이름이 `uq_users_username`일 때만 409이고, 다른 제약 위반은 rollback 후 500이다. 해시 슬롯 혼잡·55P03은 rollback 후 503(세지 않음).
+  - 로그인은 Tx1(`begin_login_attempt`, commit 후 Session·연결 반환) → **DB 연결·잠금 없이** Argon2 검증 → Tx2(`finish_login_success` → 필요하면 저장된 해시가 그대로일 때만 rehash UPDATE → 만료 세션 정리 → 세션 생성 → commit)다. 검증 중 해시 슬롯 혼잡은 보상 Tx(자기 선기록만 삭제) 후 503이고, 보상이 실패해도 503이다(선기록은 남는다). rehash용 새 해시는 Tx2 전에 트랜잭션 밖에서 계산하며 그때의 슬롯 혼잡은 rehash만 건너뛴다. `finish_login_success`가 False(자기 선기록 없음)이거나 rehash UPDATE·세션 생성 등 Tx2의 DB 오류면 Tx2를 rollback 하고 500(55P03은 503)이며 선기록은 실패로 남는다.
+  - 세션 쿠키와 성공 본문은 commit이 끝난 뒤에만 만든다. 로그인·가입 때 요청 쿠키의 세션만 교체한다(§29.2).
+  - 오류 정보: 인증 경로의 422는 `loc`·`msg`·`type`만 돌려주고 입력값(`input`)·`ctx`·비밀번호를 넣지 않는다. v6 경로의 422는 FastAPI 기본 형식 그대로다. 500·503은 고정 문구이고, 응답·로그에 예외 문자열·PostgreSQL DETAIL·traceback·비밀번호·토큰·해시를 넣지 않는다(로그는 사건·예외 종류·SQLSTATE만). 예상하지 못한 예외는 401·409로 바꾸지 않고 500이다.
+  - 시작 가드(lifespan): `auth.load_settings`·`auth.load_failure_key`, 운영이면 `DATABASE_URL` 존재(연결하지 않음). 틀리면 시작을 거부한다. 공개 대체 키는 `APP_ENV`가 development·test로 명시된 경우만이며 경고 로그에 값을 넣지 않는다. 시작 가드를 거치지 않은 앱에서 인증 경로는 500이다.
+  - 클라이언트 IP는 ASGI `request.client.host`만 `auth.normalize_client_ip`에 넘긴다. IP가 아니면 DB에 접근하지 않고 500이다. `X-Forwarded-For`·`X-Real-IP`·`Forwarded`는 읽지 않는다(uvicorn 프록시 헤더 설정은 `V7_PLAN.md` R-12, Phase 6).
+  - `require_user`·`require_csrf` 의존성은 `/auth/me`·`/auth/logout`에서 쓴다. v6 데이터 경로 적용은 Phase 3이다(템플릿 3-4, 할 일 3-5 — `V7_PLAN.md` §P3). (2026-11-09: v8.0.0으로 이관 — v7.0.0 데이터 경로에는 적용하지 않는다)
+  - 검증: DB 없는 인증 라우트 테스트 87개, `todo_test` PostgreSQL HTTP 테스트 12개(실제 UNIQUE·NOT NULL 위반의 응답·로그 비노출 포함), PostgreSQL 포함 전체 회귀 1015 passed·3 deselected(수치는 `V7_PLAN.md` §P2).
+
+### 28.2 기존 API (경로·메서드·성공 상태 코드 유지)
+
+**v7.0.0 실제 동작 (2026-11-09 — 현재 계약)**
+- 데이터 경로 15개(할 일 11개·템플릿 4개)는 v6.0.0과 같다. 저장은 JSON 파일(`TODO_FILE`·`TEMPLATE_FILE`)이고, 인증·CSRF 검사가 없으며, 로그인 여부와 관계없이 모든 호출자가 같은 데이터를 읽고 쓴다.
+- 상태 코드·응답 형식도 v6 그대로다(401·403을 내지 않고, 404는 없는 리소스뿐). 삭제 실행 취소는 v6 메모리 버퍼(§12, 프로세스 안 30초), 새 id는 최대 id + 1(§9), 기본 순서는 파일 배열 순서다.
+- 3-1의 요청 Session 의존성(`RequestDbDep`)과 소유자 조건 헬퍼는 이 경로들에 연결되어 있지 않다(구현됨·미연결, §29.4).
+- **보안 한계**: 서버에 접근할 수 있는 누구나 로그인 없이 모든 할 일·템플릿을 조회·생성·수정·삭제·복구·내보내기할 수 있다. 로그인은 데이터 접근 범위를 바꾸지 않으므로 사용자 데이터 보호 수단이 아니다. 그래서 v7.0.0은 운영에 공개하지 않는다(§25, §29.6, `V7_PLAN.md` R-34).
+
+**v8.0.0 계약 (2026-11-08 승인, v7.0.0 미적용)** — 아래 표와 공통 상태 코드는 v8.0.0(처음 계획의 Phase 3-4·3-5)에서 데이터 경로에 적용한다.
+
+v6의 사용자 데이터 경로 15개는 모두 **로그인 필수**이고 자기 데이터만 다룬다.
+
+| # | 경로 | v7 동작 |
+|---|---|---|
+| 1 | GET `/todos` | 자기 할 일, position 순, 지운 대기 행 제외 |
+| 2 | POST `/todos` | `user_id`는 세션에서 정한다. 본문의 `user_id` 등 모르는 필드는 무시 |
+| 3 | GET `/todos/export` | 자기 데이터만. 형식·파일명·CSV 규칙은 §17 그대로 |
+| 4 | GET `/stats` | 자기 데이터만 집계. 응답 형식은 §21 그대로 |
+| 5 | POST `/todos/restore` | 자기 대기 행만 (§27.4) |
+| 6 | POST `/todos/bulk` | 다른 사용자 id가 섞이면 "없는 id"와 같게 전체 404, 아무것도 바꾸지 않음 |
+| 7·8 | PUT·DELETE `/todos/{id}` | 소유자가 아니면 404 |
+| 9~11 | 하위 할 일 3개 | 상위 할 일 소유자가 아니면 404 |
+| 12~15 | `/task-templates` 4개 | 사용자별 목록. 이름 중복 409는 같은 사용자 안에서만 |
+
+공통 상태 코드 (v8.0.0 계약 — 이 가운데 인증 경로의 403(Origin·로그아웃 CSRF)·429·503은 v7.0.0에 이미 적용, §28.1):
+- 401: 세션 쿠키 없음·만료·로그아웃됨. 응답 본문 `{"detail": "로그인이 필요합니다"}`.
+- 403: GET이 아닌 요청에 CSRF 헤더 없음·불일치(`{"detail": "CSRF 토큰이 올바르지 않습니다"}`), 로그인·가입의 `Origin` 불일치.
+- 404: 없는 리소스 **또는 다른 사용자의 리소스** (존재 여부를 드러내지 않는다, 403을 쓰지 않는다).
+- 429: 로그인·가입 시도 제한 초과, `Retry-After` 헤더(초).
+- 503 (인증 경로만, Phase 2-D 정책): Argon2 해시 슬롯을 5초 안에 얻지 못했거나 시도 제한 잠금을 2초 안에 얻지 못함. 인증하지 않는다. 호환성 변경 C-7.
+- 검사 순서: 인증(401) → CSRF(403) → 본문 검증(422) → 소유권·존재(404) → 이름 중복(409).
+  - 예외 (프레임워크 동작, 2026-11-08 문서화): 본문이 JSON으로 해석되지 않는 요청(JSON `Content-Type`인데 형식이 깨짐)은 FastAPI가 의존성 실행 전 본문 파싱 단계에서 422(`json_invalid`)로 응답할 수 있다. 이 경우에만 익명·CSRF 불일치 요청도 401·403 대신 422를 받는다. 이 응답은 의존성·핸들러를 실행하지 않으므로 DB에 접근하지 않고 데이터를 읽거나 바꾸지 않는다. 인증 경로의 Origin 검사(403)와 깨진 JSON(422)의 순서도 같다. 해석되는 JSON의 필드 검증 오류는 의존성 뒤에 처리되므로 401 → 403 → 422 순서를 그대로 따른다. (설치된 FastAPI 0.142.2 소스 읽기로 확인한 동작이며 이 순서를 고정하는 테스트는 아직 없다.)
+
+### 28.3 인증 없이 열린 경로
+`GET /`(화면 — 로그인 화면 포함), `/auth/register`, `/auth/login`, `/auth/logout`, `/auth/me`(401 반환용), `/metrics`(Prometheus 내부 수집, 기존 그대로 — 외부 노출은 R-8), `/docs`·`/openapi.json`(기존 그대로).
+- (v7.0.0, 2026-11-09) 위 경로에 더해 **데이터 경로 15개도 인증 없이 열려 있다**(§28.2, `V7_PLAN.md` R-34). v8.0.0에서 이 목록은 위 경로만 남는다.
+
+### 28.4 호환성 변경 목록 (승인·인지 대상)
+| # | 변경 | 상태 |
+|---|---|---|
+| C-1 | 데이터 API 익명 요청 401 (v3/v4 클라이언트, `test_integration.py` 영향) | 승인됨 (D-11) — 적용 v8.0.0 (v7.0.0 미적용) |
+| C-2 | 새 id = 전역 시퀀스 (A21의 "최대 id + 1"은 이전 직후·단일 사용자에서만 성립) | §27.5 — 적용 v8.0.0 |
+| C-3 | 시간대 없는 예전 시각이 응답에서 UTC 표기를 얻음 (값의 의미는 같음) | 이전 시 UTC로 해석 (§20 규칙과 같다) — 이전은 v8.0.0 |
+| C-4 | 실행 취소 대기가 재시작 후에도 30초 안이면 유지 | 승인됨 (D-7, 2026-11-08) — 적용 v8.0.0 |
+| C-5 | 템플릿 이름 409 범위가 전체 → 사용자별 | 의도된 변경 — 적용 v8.0.0 |
+| C-6 | `/metrics`, `/docs` 공개 유지 | 기존 이슈, 범위 밖 |
+| C-7 | 인증 경로(`/auth/login`, `/auth/register`)의 새 상태 코드 503 (해시 슬롯 혼잡·잠금 대기 초과). 새 경로라 v3~v6 클라이언트 호환에는 영향 없음. D-11 절차에 따라 기재 | 승인됨 (2026-11-06, Phase 2-D 정책) — 적용됨 (v7.0.0) |
+| C-8 | 기본순 = position 순 (파일 순서 보존) | 승인됨 (D-6, 2026-11-08) — 적용 v8.0.0 |
+| C-9 | 동시 요청이 트랜잭션으로 원자 처리 (2026-11-08 번호 정리 — 이전에 C-7로 중복 표기) | 개선 — 적용 v8.0.0 |
+
+## 29. 인증·세션·보안
+
+### 29.1 비밀번호
+- `argon2-cffi`의 `PasswordHasher()` 기본값(Argon2id, RFC 9106 low-memory 프로필)을 쓴다.
+- 로그인 성공 시 `check_needs_rehash`면 새 해시로 갱신한다.
+- 없는 username으로 로그인해도 더미 해시를 검증해 응답 시간으로 계정 존재를 알 수 없게 한다.
+- 비밀번호·해시·세션 토큰은 로그에 남기지 않는다.
+
+### 29.2 세션 쿠키
+| 속성 | 개발·테스트 | 운영 (`COOKIE_SECURE=true`) |
+|---|---|---|
+| 이름 | `todo_session` | `__Host-todo_session` |
+| 값 | `secrets.token_urlsafe(32)` (DB에는 SHA-256만) | 같음 |
+| HttpOnly | 예 | 예 |
+| Secure | 아니오 | 예 |
+| SameSite | Lax | Lax |
+| Path / Domain | `/` / 없음 | `/` / 없음 |
+| Max-Age | 14일 | 14일 |
+
+- 만료: 생성 후 14일 고정(D-5), 요청으로 연장하지 않는다. 만료 행은 로그인·가입 때 정리한다.
+- 로그인·가입마다 새 토큰을 발급한다(세션 고정 방지). 이미 로그인한 상태에서 다시 로그인하면 **그 요청 쿠키의 세션 행만** 지우고 새 세션으로 교체한다(다른 기기의 세션은 유지).
+  - (Phase 2-C, 잠정) 요청 쿠키의 세션 사용자와 새로 로그인한 사용자가 달라도 같다: 제시된 세션 하나만 지우고, 두 사용자의 다른 세션은 그대로 둔다. 쿠키 값이 토큰 형식(43자 URL-safe, 32바이트, 정규 표기)이 아니면 아무것도 지우지 않는다.
+- 로그아웃은 서버 행을 지워 즉시 무효화한다.
+- 저장·조회 (Phase 2-C, `db.py`): DB에는 토큰의 SHA-256(`token_hash`)만 저장하고 원문은 저장하지 않는다. 조회는 `expires_at > 현재 시각`인 행만 유효로 본다(같으면 만료). 조회는 만료 행을 지우지 않고, 정리(`expires_at <= 현재 시각`)는 모든 사용자를 대상으로 한다. 세션 함수는 commit 하지 않으며 요청의 트랜잭션이 결과를 정한다. 사용자당 세션 수 상한은 없다(`V7_PLAN.md` R-26).
+
+### 29.3 CSRF
+- **v7.0.0 적용 범위 (2026-11-09 — 현재 계약)**: 가입·로그인은 `Origin`(없으면 `Referer`) 검사(아래 세 번째 항목), 로그아웃은 유효한 세션이 있을 때만 `X-CSRF-Token` 검사(§28.1), `/auth/me`는 세션 인증만 한다(GET이라 CSRF 없음). **데이터 경로 15개에는 CSRF 검사가 없다**(v8.0.0, `V7_PLAN.md` R-34). 아래 두 번째 항목의 "모든 인증 요청"은 v7.0.0에서 로그아웃 하나다.
+- 세션마다 `csrf_token`(`secrets.token_urlsafe(32)`)을 두고 `/auth/login`·`/auth/register`·`/auth/me` 응답으로 화면에 준다(쿠키에 넣지 않는다).
+- GET·HEAD가 아닌 모든 인증 요청은 `X-CSRF-Token` 헤더가 세션 값과 같아야 한다(`secrets.compare_digest`). 다르면 403.
+- `/auth/login`·`/auth/register`는 세션 전이므로 `Origin`(없으면 `Referer`)이 외부에서 본 요청 Origin과 같아야 한다. 다르면 403 (login CSRF 방지). 둘 다 없으면 허용(브라우저 아닌 클라이언트).
+  - 비교는 정규화한 **스킴·호스트·포트**가 모두 같은지로 한다(기본 포트 생략 동일, 문자열 접두사 비교 금지). `null`·경로가 붙은 Origin·사용자 정보·파싱 실패는 거부한다.
+  - 외부에서 본 요청 Origin(스킴과 호스트를 무엇으로 볼지, 프록시 헤더 신뢰 범위)은 Phase 2-E에서 정한다. 그전까지 `X-Forwarded-*`는 신뢰하지 않는다.
+  - (Phase 2-E 구현) 기대 Origin은 ASGI scope의 스킴(`request.url.scheme`)과 `Host` 헤더로 만들고, 앱은 `X-Forwarded-*`를 읽지 않는다. 허용 호스트 목록·공개 Origin 설정은 아직 없다(`V7_PLAN.md` R-23, Phase 6에서 결정).
+- SameSite=Lax와 JSON 본문 요구(`Content-Type: application/json`이 아니면 422)는 추가 방어선이다.
+- 내보내기 `<a download>`는 GET이라 CSRF 헤더가 필요 없다.
+
+### 29.4 인가
+**v7.0.0 실제 동작 (2026-11-09 — 현재 계약)**: `require_user`(세션 인증)는 `/auth/me`·`/auth/logout`에서, `require_csrf`는 `/auth/logout`에서만 쓴다. 데이터 경로 15개에는 인증·인가·소유자 조건이 없다(§28.2, `V7_PLAN.md` R-34). 요청 Session 구조(3-1)는 구현·검증 완료이고 데이터 경로에는 연결하지 않았다(구현됨·미연결). 아래 첫 세 항목과 "데이터 경로의 Session·트랜잭션" 규칙은 **v8.0.0 계약**이다.
+
+- `require_user` 의존성을 사용자 데이터 경로 15개 모두에 걸고, 쓰기 11개에는 `require_csrf`를 건다. 라우트 목록 테스트로 빠진 경로가 없는지 확인한다.
+- 모든 조회·변경은 `user_id = 현재 사용자` 조건을 거친다(헬퍼만 사용, §27.4).
+- 다른 사용자 리소스는 404.
+- (Phase 3 설계, 2026-11-08 채택 — 요청 Session 구조는 3-1에서 구현·검증 완료(2026-11-08), 데이터 경로 15개 연결은 3-4·3-5 → 2026-11-09 v8.0.0으로 이관) 데이터 경로의 Session·트랜잭션:
+  - 데이터 요청마다 Session 1개·트랜잭션 1개. 요청 Session 의존성 하나를 `require_user`·`require_csrf`·데이터 핸들러가 함께 쓴다(인증 조회와 데이터 작업이 같은 트랜잭션).
+  - commit은 성공 응답(200·201·204)을 보내기 **전에** 끝나야 하며, commit이 실패하면 성공 응답을 보내지 않는다.
+  - 쓰기 요청 순서: 인증(401) → CSRF(403) → 본문 검증(422) → `lock_user`(`SELECT … FOR UPDATE`) → (할 일의 삭제·복구·생성 요청에 한해, §27.4) 지난 대기 행 정리 → 소유권·존재(404) → 이름 중복(409) → 쓰기. 소유권 확인과 쓰기는 사용자 행 잠금을 잡은 뒤에 하고, UPDATE·DELETE 문에도 `user_id` 조건을 다시 넣는다.
+  - 로그인·가입·로그아웃은 §29.5·§28.1의 기존 트랜잭션 구성을 유지한다(예외 규칙 그대로).
+  - 오류 응답·로그에는 PostgreSQL DETAIL·바인드 값(`token_hash` 등)·예외 문자열·traceback을 넣지 않는다(R-27). commit 실패 경로도 같다.
+  - 잠금 대기 상한·초과 응답은 미결정이다(`V7_PLAN.md` §P3 "잠금 대기"). 데이터 경로에 503을 새로 도입하지 않는다.
+  - 구현(3-1A, 2026-11-08): `main.py`의 yield 의존성 `request_db`와 별칭 `RequestDbDep = Annotated[RequestDb, Depends(request_db, scope="function")]`. 요청 Session은 이 별칭으로만 받는다. Session은 처음 쓸 때 연다(쿠키 없는 `/auth/me`는 DB에 연결하지 않는다). 정상 종료면 commit, 예외면 rollback한다. DB 예외(`SQLAlchemyError`·`psycopg.Error`)와 commit 실패는 사건·예외 종류·SQLSTATE만 로그에 남기고 고정 문구 500으로 바꾼다. `require_user`가 `RequestDbDep`를 받고, `require_csrf`는 `require_user`를 거쳐 같은 Session을 쓴다. 데이터 경로 15개에는 아직 연결하지 않았다(3-4·3-5 → v8.0.0).
+  - 확인 결과(2026-11-08, 설치된 FastAPI 0.142.2 기준):
+    1. 의존성 캐시: 요청 Session을 `RequestDbDep` 한 별칭(같은 `scope`)으로만 선언해, 한 요청에서 Session이 1개임을 DB 없는 테스트로 확인했다.
+    2. `scope="function"`이면 응답 본문을 보내기 전에 commit이 끝나고(스트리밍 응답 포함), 대조군인 기본 scope("request")는 응답 뒤에 commit됨을 DB 없는 테스트로 확인했다. `requirements.txt` 하한(`fastapi>=0.142.0`)에서의 동작은 **확인하지 않았다**(설치 버전만).
+    3. `require_user`·`require_csrf`·핸들러가 같은 Session 객체를 받고 commit이 한 번임을 DB 없는 테스트로 확인했다.
+    4. commit 실패를 주입하면 성공 응답·본문이 나가지 않고 고정 문구 500이며, 응답·로그에 DETAIL·바인드 값·예외 문자열이 없음을 DB 없는 테스트와 실제 PostgreSQL UNIQUE 위반(SQLSTATE 23505)으로 확인했다(R-27의 이 경계에 한함 — R-27은 열림).
+    5. `/auth/me`를 새 구조로 바꾼 뒤 기존 DB 없는 인증 테스트와 PostgreSQL HTTP 테스트가 그대로 통과했다.
+    6. `db.get_db`는 바꾸지 않았고 앱·테스트 어디에서도 쓰지 않는다. 데이터 경로는 `RequestDbDep`만 쓴다(3-4·3-5에서 연결 → v8.0.0).
+
+### 29.5 로그인·가입 시도 제한 (Phase 2-D, D-12 채택 2026-11-06)
+메모리 카운터는 워커마다 따로라 다중 워커에서 제한이 워커 수만큼 느슨해지므로 **PostgreSQL `auth_failures` 테이블**에 기록한다.
+
+> **변경 기록 (2026-11-06, Phase 2-D 설계 검토 후 사용자 승인).** 처음 명세(권장안)와 달라진 점과 이유:
+> 1. "로그인 실패" 횟수 → **성공으로 확인되지 않은 로그인 시도** 수. Argon2 검증 동안 DB 연결·잠금을 잡지 않으려고 시도를 검증 전에 먼저 기록(선기록)하기 때문이다(한 트랜잭션에 Argon2를 넣으면 같은 username 요청이나 동시 검증 15개로 연결 풀이 고갈된다).
+> 2. "로그인 성공 시 그 username의 실패 기록을 지운다" → **그 요청의 선기록 하나만 지운다.** username 전체(또는 같은 username·IP)를 지우면 검증 중인 다른 요청의 선기록까지 지워져 그 시도가 실패해도 기록되지 않고, 피해자의 로그인이 공격자의 예산을 되돌려 준다.
+> 3. `username_key`는 평문 대신 HMAC 값을 쓴다(DB 유출 시 username 칸에 잘못 입력한 비밀번호 등이 드러나지 않게).
+> 4. `Retry-After`는 "가장 오래된 기록" 대신 한도 미만이 되는 데 필요한 k번째 기록 기준이다(차단 중에는 기록하지 않으므로 보통 같은 값).
+> 5. 503(해시 슬롯 혼잡·잠금 대기 초과), IP 정규화, 입력 오류 경계를 새로 정했다.
+> 6. (2026-11-08, Phase 3-1 PostgreSQL 실행에서 `Retry-After` 901 관찰 후 승인) 규칙별 `Retry-After`를 그 규칙의 창 길이로 제한한다(로그인 900초, 가입 3600초). 창 경계와 초 단위 올림이 겹치면 창보다 1초 긴 값이 나올 수 있었다. 429 여부 판정은 바뀌지 않는다.
+
+| 규칙 | 기준 | 결과 |
+|---|---|---|
+| 같은 (username, IP) 로그인 시도 (성공으로 확인되지 않은 것 = 실패 + 검증 중) | 15분 이동 창에 5회 이상 | 429 |
+| 같은 username 로그인 시도 (IP 무관, 분산 공격) | 15분 창에 50회 이상 | 429 |
+| 같은 IP 로그인 시도 | 15분 창에 20회 이상 | 429 |
+| 같은 IP 가입 시도 (201·409로 끝난 것) | 1시간 창에 10회 이상 | 429 |
+
+**판정과 기록**
+- 창은 `created_at > now − 창`이다(같으면 창 밖). 검사는 비밀번호 검증 **전에** 하고, 계정 존재 여부와 관계없이 같은 규칙이라 429로 계정 존재를 알 수 없다.
+- 차단(429)된 요청은 기록하지 않는다. 차단은 창이 지나면 풀린다(영구 잠금 없음).
+- `Retry-After` = 한도 미만으로 내려가는 데 창을 벗어나야 하는 마지막 기록(창 안 기록을 최신순으로 한도 번째)의 `created_at` + 창 − 지금. 초 단위 올림, 최소 1. 여러 규칙에 걸리면 가장 긴 값. 각 규칙의 값은 그 규칙의 창 길이를 넘지 않는다(로그인 900초, 가입 3600초 — 변경 기록 6).
+- 24시간이 지난 기록은 기록할 때 정리한다(한 번에 최대 1000개, `FOR UPDATE SKIP LOCKED`).
+
+**로그인 트랜잭션 (선기록 방식, 요청당 트랜잭션 1개 원칙의 예외)**
+1. Tx1: `SET LOCAL lock_timeout = '2s'` → READ COMMITTED 확인 → `pg_advisory_xact_lock(hashtextextended('login:' || username_key, 0))` → 세 규칙 검사 → 허용이면 선기록 INSERT → 사용자 해시 조회 → COMMIT. username 형식이 틀리면 잠금·사용자 조회 없이 IP 규칙만 적용하고 `username_key`는 null.
+2. Argon2 검증은 트랜잭션 밖에서 한다(DB 연결·잠금을 잡지 않는다). 계정이 없으면 더미 해시를 같은 방식으로 검증한다.
+3. 실패: 아무것도 하지 않는다 — 선기록이 실패 기록으로 남는다.
+4. 성공: Tx2에서 같은 잠금 → **자기 선기록 id 하나만** 삭제 → 세션 생성 → COMMIT. 이전 실패와 다른 요청의 선기록은 지우지 않는다(이전 실패는 창이 지나야 풀린다).
+5. 서버가 검증 중 멈추거나 Tx2가 실패하면 선기록은 실패로 남는다(fail-closed).
+- 보장: 같은 username의 두 규칙은 잠금으로 **정확히** 직렬화된다(전제: READ COMMITTED, 잠금이 `SET LOCAL` 다음 첫 문장, 해당 행을 바꾸는 경로는 모두 같은 잠금 아래). IP 규칙은 잠금이 없어 **근사**다(동시 Tx1 수만큼 넘칠 수 있다). 워커 간 시계 차이는 보장 범위 밖이다.
+
+**가입**: IP 1시간 창만(잠금 없음, 근사). 시도 기록은 중복 검사 앞에서 하고 201·409로 끝나면 커밋해 센다. 422·403(Origin·비활성)은 제한 검사 전에 끝나 세지 않고, 429는 기록하지 않으며, 503(해시 슬롯 혼잡)은 트랜잭션을 되돌려 세지 않는다.
+
+**username_key (HMAC)**
+- 값: `HMAC-SHA256(AUTH_FAILURE_KEY, "auth-failure:v1:" + 정규화한 username)`의 앞 22바이트를 패딩 없는 base64url 30자로. 잠금 키·검사·기록·삭제가 모두 이 값 하나를 쓴다. 평문 username은 `users` 조회에만 쓴다.
+- `AUTH_FAILURE_KEY`: base64url, 디코드해서 32바이트 이상. `APP_ENV=production`이거나 `APP_ENV`가 없으면 필수(없거나 틀리면 시작 거부, 연결은 2-E). `APP_ENV`가 `development`·`test`로 **명시**된 경우에만 코드의 공개 개발용 키로 대신할 수 있고, 그 공개 키는 운영에서 거부한다. 모든 워커가 같은 값을 써야 한다. 키를 바꾸면 username 기준 카운터가 초기화된다(기존 기록은 24시간 안에 정리). 값은 로그·예외·응답에 넣지 않는다.
+
+**클라이언트 IP**
+- 실제 주소는 2-E에서 신뢰된 ASGI `client` 값으로만 정한다. 기본은 소켓 주소이고, 리버스 프록시 뒤에서는 uvicorn `--proxy-headers --forwarded-allow-ips=<프록시 주소>`로만 프록시 헤더를 믿는다. 앱 코드는 요청 헤더·본문에서 IP를 읽지 않는다.
+- 정규화(`auth.normalize_client_ip`): IPv4는 주소 그대로, IPv4-mapped IPv6는 IPv4로, IPv6는 /64 네트워크로 묶고 zone ID는 버린다. IP가 아닌 값(없음, `testclient`, 형식 오류)은 `InvalidClientAddress`로 인증을 처리하지 않는다(2-E에서 500).
+- Docker 포트 공개 시 원래 IP가 보존되는지 확인한다(모두 같은 IP로 보이면 IP 규칙이 전역 제한이 된다 — R-12). 확인 시점은 Phase 6이며 격리 Docker 환경에서 한다(`V7_PLAN.md` §P11). 통과 전에는 운영에 공개하지 않는다(`V7_PLAN.md` §P7).
+
+**Argon2 동시 실행**: 프로세스당 `threading.BoundedSemaphore(2)`. 실제 검증·더미 검증·가입 해시 모두 슬롯 안에서만 Argon2를 실행한다(검증할 수 없는 입력은 슬롯 없이 바로 실패). 5초 안에 슬롯을 못 얻으면 `HashBusy` → 503, 인증·세션 발급 없음. 로그인은 보상 트랜잭션(같은 잠금 → 자기 선기록 id만 삭제)으로 검증에 들어가지 않은 시도를 지운다. 보상이 실패하면 선기록은 남는다.
+
+**책임 경계**: Phase 2-D = `auth.py` 순수 함수(판정·키·IP 정규화·슬롯)와 `db.py` DB 함수(잠금·검사·기록·삭제·정리, commit 하지 않음). Phase 2-E = 실제 IP 결정, 트랜잭션 구성, 429·500·503과 `Retry-After` 응답, 시작 가드.
+
+**검증 상태 (2026-11-06)**: Phase 2-D 함수는 구현·검증 완료, 로컬 커밋 `7e3b80e`. DB 없는 테스트와 `todo_test` PostgreSQL 테스트(단독 38 passed, 전체 회귀 915 passed·3 deselected)로 확인했다(수치·횟수는 `V7_PLAN.md` §P2). 이 절의 HTTP 동작(429·500·503 응답, `Retry-After` 헤더, 가입 409 집계, 시작 거부, 클라이언트 IP 결정)은 Phase 2-E에서 구현·검증했다(§28.1 "Phase 2-E 구현", 로컬 커밋 `bbe5227`). 이 절의 제한 정책 자체는 바꾸지 않았다.
+
+**다중 워커 검증 (Phase 2-F, 2026-11-06, 로컬 커밋 `53d7534`)**: 독립 uvicorn 프로세스 2개와 실제 `uvicorn --workers 2`에서 이 절의 제한이 PostgreSQL을 통해 프로세스·워커 사이에 공유됨을 확인했다 — 같은 username의 동시 실패는 처리한 프로세스가 달라도 정확히 한도만큼만 기록되고, IP 규칙과 세션·CSRF도 공유된다. 같은 `AUTH_FAILURE_KEY`를 쓰는 구성만, 프록시 헤더를 끈 상태(`--no-proxy-headers`)로 검증했다. 제한 정책과 코드는 바꾸지 않았다(수치·이력은 `V7_PLAN.md` §P2).
+- 시각은 `main.now()`를 써서 테스트에서 고정할 수 있다.
+
+### 29.6 운영 공개 조건 (HTTPS 게이트)
+- **(2026-11-09) v7.0.0은 아래 조건을 충족하더라도 운영에 배포·공개하지 않는다.** 데이터 API 15개가 인증 없이 열려 있다(§28.2, `V7_PLAN.md` R-34). main 병합·push·Jenkins 배포도 하지 않는다(`V7_PLAN.md` R-35). 아래 조건은 v8.0.0 이후의 공개 판단 기준이다.
+- 운영 HTTPS(TLS 종단)가 확인되기 전에는 v7을 운영 환경에 배포·공개하지 않는다. 그전까지 v7은 로컬·개발 환경과 `127.0.0.1`에만 바인딩한 격리 환경에서만 실행한다.
+- `APP_ENV=production`이면 `COOKIE_SECURE=true`가 아닐 때 앱이 시작을 거부한다(설정 실수로 평문 HTTP에 세션 쿠키가 나가는 것 방지).
+- `REGISTRATION_ENABLED`(기본 `false` in production, `true` in dev/test, D-13): 운영 공개 직후에는 가입을 막고 이전 소유자 계정만 쓴다. 가입 공개는 별도 승인.
+- (Phase 2-D) `AUTH_FAILURE_KEY`: 운영에서 없거나 형식이 틀리면 시작을 거부한다(§29.5). 비밀값이라 저장소·로그에 넣지 않는다.
+- (Phase 2-E) 위 시작 거부 조건(`APP_ENV`·`COOKIE_SECURE`·`REGISTRATION_ENABLED`·`AUTH_FAILURE_KEY`, 운영이면 `DATABASE_URL` 존재)은 앱 시작 단계(lifespan)에 연결했다(§28.1).
+- 운영 공개 전 확인 목록은 `V7_PLAN.md` §P7.
+
+## 30. UI 변경 (index.html 1개 유지)
+
+**v7.0.0 실제 화면 (2026-11-09 — 현재 계약)**
+- 아래 "Phase 2-G 과도기 예외"와 "Phase 2-G1 구현"이 v7.0.0의 최종 화면이다. 로그인하지 않아도 v6 앱 영역과 목록을 보여주고, 접힌 로그인·가입 패널을 두며, 로그인하면 사용자명과 [로그아웃]을 보여준다.
+- 로그인 여부와 관계없이 같은 공유 데이터(JSON)를 보여준다(§28.2, `V7_PLAN.md` R-34). 데이터 경로가 401을 내지 않으므로 `api()`의 `/auth/` 외 401 처리("다시 로그인하세요")는 v7.0.0에서 실제로 쓰이지 않는다.
+- 알림 읽음 키는 v6 `todo.v6.notifications.read` 그대로다(D-8 사용자별 키는 v8.0.0).
+- 화면 버전 표시는 `Version 7.0.0`이다(2026-11-09 변경, 이전 `Version 6.0.0`). 기존 `.version` 문단 하나에 공유 데이터·로컬 시연 전용 안내를 함께 쓴다 — 실제 문구: `Version 7.0.0 · 로컬 시연용 · 할 일·템플릿은 모든 사용자 공유`. 새 요소·스타일·포커스 대상은 없다. 이 안내는 사실을 알릴 뿐 데이터를 보호하지 않는다(로그인 게이트 없음, 데이터는 공유 JSON — `V7_PLAN.md` R-34).
+- 1280px·375px에서 이 문구의 실제 줄바꿈과 px 단위 배치는 실측하지 않았다. UI 회귀(칸반 드래그·375px 가로 스크롤 테스트 포함)는 통과했다(`V7_PLAN.md` §P13).
+
+**v8.0.0 계약** — 바로 아래 첫 항목(시작 시 401 → 로그인·가입 화면만), 데이터 경로 401 처리의 실제 동작, 사용자별 알림 키는 v8.0.0(처음 계획의 Phase 3-3·4)에서 적용한다.
+
+- 시작 시 `GET /auth/me`.
+  - 401 → 로그인·가입 화면만 보인다(앱 영역 숨김). 할 일 요청을 보내지 않는다. — **최종 동작이며 Phase 3-3(화면 로그인 게이트)부터 적용한다. 데이터 API 인증은 3-4(템플릿)·3-5(할 일)에서 적용한다(`V7_PLAN.md` §P3).** Phase 2-G에는 적용하지 않는다(아래 과도기 예외). (2026-11-09: v8.0.0으로 이관 — v7.0.0에는 적용하지 않는다)
+  - 200 → 기존 앱. `csrf_token`을 메모리 변수에만 둔다(localStorage에 저장하지 않는다).
+- 로그인·가입 화면: 같은 폼에서 [로그인]/[회원가입] 전환, username·password 입력, 오류는 `auth-error`(`role="alert"`), 429는 남은 시간 안내. 375px·다크 모드·키보드 조작·`aria-label` 기준(§24)을 따른다.
+- 헤더: 테마 select 옆에 현재 사용자명(`current-user`)과 [로그아웃](`logout`). 로그아웃 성공 후 `location.reload()`로 화면 상태(allTodos, 선택, 실행 취소 토스트, 알림)를 모두 비운다.
+- `api()` (7.0.0): GET이 아닌 요청에 `X-CSRF-Token`을 붙인다. 401을 받으면 로그인 화면으로 돌아가고 "다시 로그인하세요"를 보여준다. 403은 `#error`에 보여준다. 내보내기 링크는 계속 `api()` 예외다.
+- **Phase 2-G 과도기 예외 (2026-11-06 결정, 개발 단계의 임시 호환성 정책 — 운영 배포 승인이 아니다)** — (2026-11-09) v7.0.0의 최종 화면으로 확정했다. 운영 배포 승인이 아니라는 점은 그대로다: `V7_PLAN.md` §P2(2-G: "v6 화면 강제 로그인 게이트는 Phase 3까지 보류")에 맞춘다.
+  - 시작 시 `GET /auth/me`를 호출한다. 200이면 인증 상태(`current-user`·`logout`)를 표시한다. 401이면 로그인 패널(`auth-panel`)을 표시하되 **기존 v6 앱 영역은 숨기지 않고** 기존 목록 불러오기도 그대로 한다.
+  - 시작 시 `/auth/me`의 401은 로그인하지 않은 상태일 뿐이므로 `#error`에 일반 오류로 표시하지 않는다.
+  - 앱 영역 게이트(위 "401 → 로그인·가입 화면만")는 Phase 3-3에서, 데이터 API의 인증 강제는 3-4(템플릿)·3-5(할 일)에서 적용한다. 그전까지 해당 데이터 경로는 401을 내지 않으므로 `api()`의 401 처리는 그 경로가 전환된 뒤부터 실제로 동작한다.
+  - Phase 2-G 완료는 사용자별 데이터 격리 완료를 뜻하지 않는다(로그인해도 같은 v6 데이터를 본다). 운영 배포는 계속 보류한다(§29.6).
+  - **Phase 2-G1 구현 (2026-11-06)** — 위 최종 동작을 대체하지 않는 과도기 화면이다.
+    - 401이면 `auth-panel`은 **접힌 진입 버튼** 한 줄(`#auth-open` "로그인 / 회원가입", `aria-expanded`, `aria-controls="auth-form-area"`)로 보인다. 누르면 폼(`#auth-form-area`)을 펼치고 아이디 입력란으로 포커스를 옮긴다. 접힌 폼은 `hidden`이라 Tab 순서에서 빠진다(테마 → 🔔 → 진입 버튼 → 할 일 제목). 위치는 알림 바 아래·할 일 폼 위이고 알림 바 DOM은 바꾸지 않는다. `#auth-open`·`#auth-form-area`는 `id`만 있고 새 `data-testid`는 없다.
+    - 로그인·가입 성공 시 패널을 숨기고 `current-user`·`logout`을 보인다. 인증 상태와 `csrf_token`은 메모리에만 둔다. `X-CSRF-Token`은 GET·HEAD가 아닌 요청에 붙이되 `/auth/login`·`/auth/register`에는 붙이지 않는다.
+    - 오류는 `auth-error`에 상태별 문구(401·403·409·422·500·503)로 보이고, 429는 `Retry-After`를 분 단위로 올림한 "약 N분"으로 안내한다. 사용자명은 `textContent`로만 넣는다.
+    - `/auth/`가 아닌 경로의 401은 인증 상태를 지우고 폼을 펼쳐 "다시 로그인하세요."를 보인다(데이터 경로가 실제로 401을 내는 것은 Phase 3-4(템플릿)·3-5(할 일)부터). 인증 세대 값으로 늦게 도착한 `/auth/me` 응답이 그 뒤의 로그인·무효화를 덮어쓰지 않게 하고, 제출 중 중복 요청을 막는다.
+    - 화면 배치 제약: 접힌 진입점은 v6 칸반 드래그 테스트가 의존하는 세로 배치를 보존하도록 주변 여백으로 높이를 상쇄한다(진입 버튼 크기는 줄이지 않는다). 수치·검증 결과·남은 시각 위험은 `V7_PLAN.md` §P2 "2-G1" 블록과 §P12 R-32·R-33.
+- 알림 읽음 키 (D-8 — 적용 v8.0.0, v7.0.0은 v6 키 그대로): `todo.v7.notifications.read.<userId>`. v6 키 `todo.v6.notifications.read`는 읽지도 지우지도 않는다(무시). 정리 규칙(§23)은 그 사용자 키 안에서만 적용한다.
+- 테마 키 `todo.v6.theme`은 브라우저 공통으로 그대로 둔다.
+- 버전 표시: `Version 7.0.0` (Phase 4에서 변경, B22 갱신). (2026-11-09) v7.0.0 마감에서 `Version 7.0.0`으로 바꾸고 B22·`/` 테스트를 갱신했다(위 "v7.0.0 실제 화면", `V7_PLAN.md` §P13).
+- 새 `data-testid`: `auth-panel`, `login-form`, `auth-mode-toggle`, `auth-username`, `auth-password`, `auth-submit`, `auth-error`, `current-user`, `logout`.
+
+## 31. JSON → PostgreSQL 이전 — v8.0.0 이관 (v7.0.0 미구현, `migrate_json.py` 없음)
+(2026-11-09) 아래는 v8.0.0 계약으로 보존한다. v7.0.0에서는 JSON 데이터를 PostgreSQL로 옮기지 않는다.
+
+- 도구: `migrate_json.py` (서브커맨드 `import`, `verify`, `export-v6`, `diff`).
+- 원본은 백업 **사본**만 읽는다. 운영 볼륨이나 원본 파일에 쓰지 않는다. 시작·끝 sha256이 같아야 한다.
+- 검증: 모든 항목을 v6 모델(`TodoItem`, `TaskTemplate`)로 읽는다. v1~v6 기본값 채움, `due_date: ""` → null, 시간대 없는 시각 → UTC. 하나라도 실패하면 아무것도 넣지 않고 실패 id·이유를 보고한다.
+- 보존: id, 배열 순서(position), title~recurrence, `created_at`(null 포함), `completed_at`, `next_spawned`, subtasks(sid·제목·완료·순서), 템플릿 id·순서·필드.
+- 사전 거부 조건: 소유자 계정 없음, 대상 DB에 같은 id 존재, 같은 원본 해시가 `data_migrations`에 있음, 템플릿 이름 대소문자 무시 중복, 같은 파일 안 id 중복.
+- 한 트랜잭션으로 넣고 `setval`로 시퀀스를 맞춘다. `--dry-run`은 같은 검사·삽입을 한 뒤 롤백한다.
+- 로그·리포트에는 건수·id·필드 이름만 쓰고 제목·설명 등 내용은 출력하지 않는다(§32).
+- 역내보내기 `export-v6 --owner <u>`: DB의 그 사용자 활성 데이터를 v6 형식 `todo.json`·`task_templates.json`으로 만든다(position 순, id 유지, v6 필드만). v6 모델로 다시 읽혀야 한다.
+- `diff`: 두 v6 형식 JSON(또는 JSON과 DB 사용자 데이터)을 id 기준으로 비교해 추가·변경·삭제 id와 바뀐 필드 이름을 보고한다(자동 병합은 하지 않는다).
+- 절차·백업·롤백은 `V7_PLAN.md` §P5·§P6.
+
+## 32. 개인정보 보호
+### 32.1 확인된 사실 (2026-11-05, 읽기 전용 확인)
+- 저장소의 `fastapi-app/todo.json`(HEAD)과 원격에 push된 커밋 `98e98f4`에 **학번 형식 숫자와 한글 이름으로 보이는 값**이 할 일 제목·설명으로 들어 있다. 모든 원격 브랜치가 이 커밋을 포함한다.
+- 로컬 stash `stash@{0}`(`d66b8fb`, push되지 않음)에도 같은 값과 테스트용 항목이 더 있다.
+- 운영 볼륨의 실제 데이터는 확인하지 않았다. 제목·설명은 자유 입력이라 이름·연락처·일정 등 개인정보가 있을 수 있다고 가정한다.
+- v7은 username과 비밀번호 해시를 새로 저장한다(이메일 등 추가 개인정보는 받지 않는다).
+
+### 32.2 처리 원칙
+- 현재 파일과 Git 기록은 승인 없이 수정·삭제하지 않는다. 기록 재작성(`git filter-repo` 등)은 강제 푸시가 필요한 파괴적 작업이라 별도 명시적 승인 대상이다(D-14).
+- 운영 데이터 사본(백업 JSON, `pg_dump`, 개발 DB)은 운영 데이터와 같은 등급으로 다룬다.
+  - 저장소 밖 또는 `.gitignore`된 `backups/`에만 둔다. 디렉터리 권한 700, 파일 600.
+  - 서버 밖으로 옮길 때는 암호화(age 또는 gpg)한다. 채팅·이슈·PR·로그에 내용을 붙여넣지 않는다.
+  - 리허설이 끝나면 개발 DB와 사본을 지우고(보관 기간은 D-15) 삭제 사실을 기록한다.
+- 이전·검증 도구의 출력에는 내용(제목·설명·태그)을 넣지 않는다.
+- 테스트 데이터는 합성 값만 쓴다. 운영 데이터를 테스트 픽스처로 만들지 않는다.
+- `pg_dump`, 백업 파일은 커밋하지 않는다(`.gitignore`에 `backups/` 이미 있음, `*.dump` 추가는 Phase 1).
+- (2026-11-09) v7.0.0에서는 운영 데이터 사본·이전 리허설을 만들지 않았다. 사본·리허설 관련 원칙은 v8.0.0의 이전 작업에 적용한다.
+
+## 33. 테스트 원칙 (7.0.0)
+- (2026-11-09 정정) 이전 문구는 "테스트는 PostgreSQL 테스트 DB에서만 돈다"였다. 실제로는 **PostgreSQL을 쓰는 테스트만** PostgreSQL 테스트 DB에서 돈다 — `tests/test_db_postgres.py`와, 3-2부터 `tests/test_ui.py`. 나머지(v6 API, 인증 함수·라우트, 스키마 보호, `test_ui_auth.py` 등)는 DB 없이 돈다.
+- 실행 조건 (3-2 이후):
+  - **DB 없는 회귀**: `DATABASE_URL`·`TEST_DATABASE_URL`이 없는 환경에서 `tests/test_ui.py`·`tests/test_ui_auth.py`·`tests/test_db_postgres.py`를 빼고 실행한다. `test_ui.py`는 `TEST_DATABASE_URL`이 없으면 skip이 아니라 실패하므로 반드시 뺀다. `test_ui_auth.py`는 DB 없이 도는 브라우저 테스트(`/auth/*` 모킹)이고 3-2에서는 따로 실행했다.
+  - **PostgreSQL 하네스**: `TEST_DATABASE_URL`=아래 고정 대상, `DATABASE_URL` 없음, `tests/test_db_postgres.py`.
+  - **PostgreSQL UI**: 같은 조건으로 `tests/test_ui.py`. UI 서버는 `todo_test`를 인증 저장소로 쓰고 할 일·템플릿은 임시 JSON 파일이다. 시작과 종료에 R-19 게이트를 거친 스키마 초기화가 있다(`V7_PLAN.md` §P3 "3-2 결과").
+  - 두 PostgreSQL 실행은 실행마다 사용자 승인과 읽기 전용 R-19 사전·사후 점검을 거친다(`V7_PLAN.md` §P8.6).
+- PostgreSQL 테스트 DB: `TEST_DATABASE_URL`이 고정 대상 `todo_test_user@127.0.0.1:5433/todo_test`(로컬 PostgreSQL 18.x)가 아니면 테스트 세션을 시작하지 않는다(포트 생략·5432·다른 호스트·DB·계정·쿼리 매개변수 거부). 접속 후에는 실제 서버의 버전·주소·포트·DB·계정·비슈퍼유저를 확인하고, 그다음에만 스키마를 지운다(`db.verify_test_server`). 대상 변경은 사용자 승인 사항이다.
+- 실제 `todo.json`·`task_templates.json` 해시 보호(A22, `conftest.py`)는 유지한다.
+- `test_integration.py`는 외부 서버(`INTEGRATION_BASE_URL`, 기본 `163.239.77.78:5014`)에 POST·DELETE를 보내므로 **명시적 승인 없이 실행하지 않는다** (`pytest -m integration` 포함). 기본 실행 제외 설정은 유지한다.
+- 기존 332개 테스트는 의미를 바꾸지 않고 픽스처만 교체해 통과시키는 것이 원칙이다. 의미가 바뀌는 테스트는 `V7_PLAN.md` §P8 목록으로 관리한다. (2026-11-09) 픽스처 교체 원칙은 v8.0.0 데이터 전환에 적용한다. v7.0.0까지 바뀐 기존 테스트는 §P8.3 목록에 있다(3-2에서 `test_ui.py` Tab 순서 1건 추가).
+
+## 34. Out of Scope (7.0.0)
+- OAuth·소셜 로그인, 이메일 인증·비밀번호 재설정 메일, 2단계 인증
+- 비밀번호 변경(D-9), 계정 삭제 UI, 관리자 역할·권한, 데이터 공유·협업
+- 서버 측 알림 상태·다중 기기 읽음 동기화 (v6 그대로)
+- 비동기 ORM, 프론트엔드 프레임워크·빌드 도구, 외부 CDN
+- PostgreSQL 외 DB, 백그라운드 스케줄러(정리는 요청 시 처리)
+- v6 롤백 상태와 v7 데이터의 자동 병합 (diff 리포트까지만)
+
+### 34.1 v8.0.0으로 미룬 것 (2026-11-09 범위 조정)
+위 영구 범위 밖 목록과 다르다. 아래는 v7.0.0에서 구현하지 않고 v8.0.0 "Multi-User Data Migration"에서 할 일이다.
+- 데이터 경로 15개의 인증·CSRF·사용자별 격리(처음 계획의 3-4 템플릿·3-5 할 일), 사용자별 템플릿 이름 기준(R-16)·잠금 대기 정책
+- UI 로그인 게이트(3-3), JSON 런타임 제거(3-6)
+- v6 기능의 DB·인증 연동, 사용자별 알림 키(D-8), 두 사용자 UI 격리(Phase 4)
+- JSON → PostgreSQL 이전 도구·리허설(Phase 5, §31)
+- 운영 전환·백업·롤백, R-12 실환경 클라이언트 IP 검증, 이미지·Compose·Jenkins 변경, 운영 공개(Phase 6, `V7_PLAN.md` §P6·§P7·§P10·§P11)
