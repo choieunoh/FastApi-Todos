@@ -1,7 +1,11 @@
 # FastAPI To-Do List
 
-FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 데이터는 JSON 파일에 저장합니다.
-**6.0.0** 릴리스 후보입니다(화면 표시는 `Version 6.0.0`, 아직 배포 전). 변경 내용은 [RELEASE_NOTES.md](RELEASE_NOTES.md), 개발 명세는 [CLAUDE.md](CLAUDE.md)에 있습니다.
+FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 할 일과 작업 템플릿은 JSON 파일에 저장합니다.
+**7.0.0 "PostgreSQL Foundation & Authentication"** — 브랜치 `feature/v7.0.0`의 **로컬 개발·시연 전용** 마감 상태입니다(화면 표시 `Version 7.0.0 · 로컬 시연용 · 할 일·템플릿은 모든 사용자 공유`). 운영 배포·공개 대상이 아니며, main 병합·push·Jenkins 배포를 하지 않습니다. 변경 내용은 [RELEASE_NOTES.md](RELEASE_NOTES.md), 개발 명세는 [CLAUDE.md](CLAUDE.md)·[V7_SPEC.md](V7_SPEC.md), 단계·위험은 [V7_PLAN.md](V7_PLAN.md)에 있습니다.
+
+> **⚠ 보안 한계 (7.0.0)**: 회원가입·로그인·로그아웃이 있지만, **할 일·템플릿 API 15개는 인증·CSRF·사용자별 격리 없이** 모든 호출자가 같은 JSON 데이터를 씁니다. 서버에 접근할 수 있는 누구나 로그인 없이 모든 데이터를 조회·변경·삭제·내보내기할 수 있고, 로그인해도 보이는 데이터는 같습니다. 로그인은 데이터를 보호하지 않습니다. 사용자별 데이터 분리는 8.0.0 "Multi-User Data Migration"에서 합니다.
+
+(6.0.0 당시) 6.0.0은 릴리스 후보였습니다(화면 표시 `Version 6.0.0`, 배포 전). 그 내용은 아래 4.0.0~6.0.0 표와 릴리스 노트에 그대로 남아 있습니다.
 
 ## 기능 (4.0.0)
 - 할 일 추가·수정·삭제, 완료 체크
@@ -34,7 +38,28 @@ FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 데이터는 JSON 파�
 | 4 | 라이트/다크/시스템 테마(제목 옆 [테마], 기본 시스템, 이 브라우저 localStorage에 저장·다른 탭에도 반영), 375px에서 가로 스크롤 없음(목록 항목·칸반 열 세로 배치), 키보드 포커스 표시·색 외 상태 표시(⚠·취소선)·성공 메시지(`role="status"`), 모든 화면 텍스트 명도 대비 4.5:1 이상 자동 검사 | 완료 |
 | 5 | 전체 테스트(332 passed), 런타임 의존성만으로 실행 확인, 릴리스 노트. **Docker 빌드·컨테이너 검증은 미완료** — 아래 "6.0.0 배포 전 확인" | 진행 중 |
 
+## 7.0.0 진행 상황 (`feature/v7.0.0`, 로컬 개발·시연 전용)
+2026-11-09에 범위를 조정했습니다. 7.0.0은 PostgreSQL 기반과 계정 인증까지이고, 사용자별 데이터는 8.0.0으로 옮겼습니다.
+
+| 범위 | 내용 | 상태 |
+|---|---|---|
+| Phase 1 | PostgreSQL 기반(로컬 PostgreSQL 18.6), SQLAlchemy 2.x ORM, Alembic `0001` | 완료 |
+| Phase 2 | 회원가입·로그인·로그아웃(Argon2id, HttpOnly 쿠키 서버 세션, 14일 고정 만료), 로그인·가입 시도 제한(PostgreSQL 기록, 여러 워커 공유), 접힌 로그인·가입 패널과 헤더 사용자명·[로그아웃], 앱 시작 가드, Alembic `0002` | 완료 — 실제 Docker·프록시 환경의 클라이언트 IP 처리(R-12)는 미검증 |
+| 3-0 | Phase 3 설계 결정·문서 | 완료 |
+| 3-1 | 요청 단위 DB Session 구조, 사용자 데이터 DB 헬퍼(소유자 조건 조회·쓰기, soft delete 등) | 완료 — **데이터 경로에는 연결하지 않음** |
+| 3-2 | PostgreSQL 인증 UI 서버에서 실제 로그인 세션으로 도는 UI 테스트 기반(`tests/pg_harness.py`) | 완료(미커밋) |
+| 3-3~3-6, Phase 4~6 | UI 로그인 게이트, 데이터 API 15개 인증·CSRF·사용자별 격리, 할 일·템플릿의 PostgreSQL 전환, JSON → PostgreSQL 이전, 운영 전환·공개 준비 | **8.0.0 예정(미구현)** |
+
+- **PostgreSQL에 실제로 저장하는 것**: 계정(`users`)·로그인 세션(`sessions`)·시도 제한 기록(`auth_failures`)뿐입니다.
+- **스키마에만 있는 표**: `todos`·`subtasks`·`task_templates`·`data_migrations`는 8.0.0 이전·전환용으로 만들어 두었을 뿐, 지금 앱은 이 표를 읽거나 쓰지 않습니다. 할 일·템플릿은 위와 같이 JSON 파일입니다.
+- 알림 읽음 키·테마 키는 v6 그대로입니다(브라우저 localStorage).
+
 ## 실행
+
+> **7.0.0 주의**: 아래 "Docker"·"로컬" 명령과 [배포와 데이터 관리](#배포와-데이터-관리)는 **6.0.0(JSON) 기준**이며, 7.0.0 실행 방법이 아닙니다. 7.0.0은 운영에 배포하지 않습니다.
+> - 7.0.0 앱은 시작할 때 `APP_ENV`(`development`·`test`·`production`)와 시도 제한 비밀키 `AUTH_FAILURE_KEY`를 확인합니다(`V7_SPEC.md` §28.1). 코드를 읽어 보면 `APP_ENV`가 `development`·`test`로 명시되지 않고 `AUTH_FAILURE_KEY`도 없으면 시작을 거부하므로, 지금의 compose 설정이나 `uvicorn main:app --reload`만으로는 시작되지 않을 것으로 판단합니다. **코드 분석에 따른 판단이며 실행해서 확인하지는 않았습니다.**
+> - 인증 경로(`/auth/*`)는 `DATABASE_URL`의 PostgreSQL이 필요합니다. 할 일·템플릿 경로는 JSON 파일만 씁니다.
+> - 7.0.0 로컬 시연 실행 명령은 아직 이 저장소에서 확인하지 않아 여기에 적지 않습니다. 개발·테스트 DB 접속 형식은 [`.env.dev.example`](.env.dev.example)을 참고하세요(비밀번호는 넣지 않고 `pgpass.conf`에 둡니다).
 
 ### Docker
 ```bash
@@ -79,7 +104,20 @@ CSV 컬럼은 `id,title,description,completed,priority,due_date,tags,favorite,re
 
 서버를 띄운 뒤 http://localhost:8000/docs 에서 요청·응답 스키마를 볼 수 있습니다.
 
+### 인증 경로 (7.0.0)
+| 메서드 | 경로 | 동작 |
+|---|---|---|
+| POST | `/auth/register` | 회원가입 (201). `Origin` 검사, 이미 있는 이름이면 409 |
+| POST | `/auth/login` | 로그인 (200). `Origin` 검사, HttpOnly 세션 쿠키 발급(14일 고정) |
+| POST | `/auth/logout` | 로그아웃 (204). 유효한 세션이 있으면 `X-CSRF-Token` 검사 |
+| GET | `/auth/me` | 현재 로그인 사용자 (200, 세션이 없거나 만료되면 401) |
+
+- `Origin` 불일치·로그아웃 CSRF 오류는 403, 로그인·가입 시도가 많으면 429(`Retry-After`), 해시 처리 혼잡·잠금 대기 초과는 503입니다.
+- **위 API 표의 데이터 경로 15개는 6.0.0과 같이 인증·CSRF·사용자별 격리 없이 동작합니다.** 로그인 여부와 상관없이 모든 호출자가 같은 JSON 데이터를 씁니다. 인증·격리는 8.0.0 예정입니다.
+
 ## 배포와 데이터 관리
+> **이 절은 6.0.0(JSON) 운영 절차입니다.** 7.0.0은 운영에 배포하지 않습니다. 현재 compose·Jenkins 설정에는 7.0.0 앱이 요구하는 설정(`APP_ENV`, `AUTH_FAILURE_KEY`, PostgreSQL)이 없어서, 이 절차로 7.0.0 코드를 배포하면 앱이 시작되지 않을 것으로 판단합니다(코드 분석, 실행 미확인). 7.0.0용 compose·Jenkins 변경안은 8.0.0에서 다룹니다(`V7_PLAN.md` §P10).
+
 명령은 모두 **배포 서버(Linux)의 저장소 루트**에서 실행합니다.
 
 ### 구성
@@ -258,24 +296,57 @@ cd fastapi-app
 pip install -r requirements-dev.txt
 playwright install chromium        # UI 테스트용 브라우저 (처음 한 번)
 
-pytest                             # API + UI 테스트 (실제 todo.json은 건드리지 않음)
-pytest tests/test_api.py           # API만
-pytest tests/test_ui.py --headed   # UI를 브라우저 창으로 보면서 실행
-pytest -m integration              # 배포 서버 대상 통합 테스트
-                                   # 대상 주소: INTEGRATION_BASE_URL (기본 http://163.239.77.78:5014)
 ```
-- API 테스트는 FastAPI `TestClient`로, 테스트마다 임시 `todo.json`을 씁니다.
-- UI 테스트는 `tests/conftest.py`가 임시 데이터 파일로 uvicorn을 따로 띄우고 Playwright로 확인합니다.
+
+### 7.0.0 테스트 실행 조건
+7.0.0부터 테스트는 실행 조건이 다른 묶음으로 나뉩니다(`V7_SPEC.md` §33). **`pytest`만 실행하면 안 됩니다**: `tests/test_ui.py`는 `TEST_DATABASE_URL`이 없으면 skip이 아니라 실패하도록 되어 있습니다(코드 분석에 따른 판단, 그 상태로 실행해 확인하지는 않았습니다). 결과는 묶음마다 따로 보고하고 합산하지 않습니다.
+
+**1. DB 없는 회귀** — `DATABASE_URL`·`TEST_DATABASE_URL`을 비운 환경에서 PostgreSQL·브라우저 인증 테스트 3개 파일을 빼고 실행합니다.
+```bash
+python -m pytest -q --ignore=tests/test_ui.py --ignore=tests/test_ui_auth.py --ignore=tests/test_db_postgres.py
+```
+- 2026-11-09 마지막 실행(화면 버전 변경 후): **994 passed, 3 deselected**. deselected 3개는 기본 실행에서 빠지는 배포 서버 대상 integration 테스트입니다.
+
+**2. `tests/test_ui_auth.py`** — 로그인·가입 화면 Playwright 테스트. DB 없이 `/auth/*` 응답을 모킹해 따로 실행합니다.
+- 마지막 기록은 3-2 중간 단계의 **31 passed**입니다. 3-2 최종 변경과 화면 버전 변경 뒤에는 **다시 실행하지 않았습니다.**
+
+**3. PostgreSQL 테스트 (`tests/test_db_postgres.py`, `tests/test_ui.py`)** — 실행 전에 아래를 반드시 확인하세요.
+- **파괴적 초기화**: 테스트 DB의 `public` 스키마를 **지우고 다시 만듭니다.** 테스트 DB 외의 DB에 절대 쓰지 마세요.
+- **고정 대상**: `TEST_DATABASE_URL`은 로컬 PostgreSQL 18.x의 `todo_test_user@127.0.0.1:5433/todo_test`만 허용합니다. 포트 생략·5432·다른 호스트·DB·계정이면 테스트 세션을 시작하지 않습니다. `DATABASE_URL`은 비워 둡니다. 운영·개발 DB(`todo_dev`)와 PostgreSQL 16(5432)에는 연결하지 않습니다.
+- **삭제 전 게이트(R-19)**: 스키마를 지우기 전에 서버·알려진 객체·소유자·연결 수를 확인하고, 어긋나면 지우지 않고 멈춥니다. 게이트에도 남은 위험이 있습니다(아래, 릴리스 노트 "알려진 제한").
+- **별도 승인과 사전·사후 점검**: 이 저장소의 작업 규칙상 PostgreSQL 실행은 **실행마다 별도 승인**을 받고, 실행 전후에 읽기 전용 R-19 점검(서버·객체 수·소유자·다른 연결·사용자 데이터 0행)을 합니다(`V7_PLAN.md` §P8.6). 점검 스크립트는 저장소에 들어 있지 않습니다.
+- 비밀번호는 `pgpass.conf`에만 두고, URL·저장소·로그에 넣지 않습니다.
+
+위 조건을 확인한 뒤, `TEST_DATABASE_URL`을 고정 대상으로 두고 `DATABASE_URL`은 비운 환경에서 파일별로 따로 실행합니다.
+```bash
+python -m pytest -q tests/test_db_postgres.py   # PostgreSQL 하네스
+python -m pytest -q tests/test_ui.py            # PostgreSQL UI (인증 UI 서버 + 실제 로그인 세션, 할 일·템플릿은 임시 JSON)
+```
+- 2026-11-09 마지막 실행: PostgreSQL 하네스 **83 passed**(화면 버전 변경 전), PostgreSQL UI **125 passed**(화면 버전 변경 후). 두 실행 모두 사전·사후 R-19 점검을 통과했고, 종료 후 사용자 데이터 7개 표는 0행이었습니다.
+- UI 종료 때의 스키마 초기화(알려진 8개 표만 RESTRICT로 삭제)는 정상 경로를 코드 구조와 테스트 결과로 **간접 확인**했을 뿐입니다. RESTRICT 실패 경로, 표 재생성과 Alembic 업그레이드 사이의 공백, 출처 확인의 한계는 남아 있습니다(`V7_PLAN.md` R-19·R-36).
+
+### 그 밖의 주의
+- `pytest -m integration`은 외부 배포 서버(`INTEGRATION_BASE_URL`, 기본 http://163.239.77.78:5014)에 POST·DELETE를 보냅니다. **명시적 승인 없이 실행하지 않습니다.**
+- 화면·드래그 검증은 Chromium 헤드리스에서만 자동으로 했습니다. 다른 브라우저와 실제 화면의 줄바꿈·px 배치는 확인하지 않았습니다.
+- API 테스트는 FastAPI `TestClient`로, 테스트마다 임시 `todo.json`을 씁니다. 실제 `todo.json`·`task_templates.json`은 `tests/conftest.py`가 해시로 보호합니다.
+- UI 테스트는 임시 데이터 파일로 uvicorn을 따로 띄우고 Playwright로 확인합니다.
 - `tests/`와 `requirements-dev.txt`는 Docker 이미지에 들어가지 않습니다.
+
+(6.0.0 당시) 테스트 명령은 `pytest`(API + UI), `pytest tests/test_api.py`, `pytest tests/test_ui.py --headed`, `pytest -m integration`이었습니다. 7.0.0 코드에서는 위 실행 조건을 따릅니다.
 
 ## 구조
 ```
 fastapi-app/
-├── main.py               # API, 모델, 저장 로직
+├── main.py               # API, 모델, 저장 로직 (7.0.0: /auth/* 4개, 시작 가드)
+├── db.py                 # (7.0.0) PostgreSQL 엔진·ORM·세션, 테스트 DB 보호·삭제 전 게이트(R-19), 인증·사용자 데이터 헬퍼
+├── auth.py               # (7.0.0) 순수 인증 함수 (설정, Argon2id, 토큰·CSRF, Origin, 시도 제한 판정)
+├── alembic.ini, alembic/ # (7.0.0) 스키마 마이그레이션 (0001, 0002)
 ├── templates/index.html  # 화면 (HTML + CSS + JS 한 파일)
 ├── todo.json             # 로컬 실행용 데이터 (Docker는 볼륨 /app/data 사용)
 ├── requirements.txt      # 런타임 의존성
 ├── requirements-dev.txt  # 테스트 의존성
-└── tests/                # pytest (API, UI, 통합)
-scripts/load-data.sh      # 백업 → 데이터 볼륨 이전·복구
+└── tests/                # pytest (API, UI, 통합, DB 없는 인증·스키마, PostgreSQL)
+    └── pg_harness.py     # (7.0.0) PostgreSQL 테스트 공용 하네스
+scripts/load-data.sh      # 백업 → 데이터 볼륨 이전·복구 (6.0.0 운영)
 ```
+`migrate_json.py`(JSON → PostgreSQL 이전 도구)는 8.0.0 예정이며 아직 없습니다.
