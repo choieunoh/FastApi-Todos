@@ -458,21 +458,337 @@ def test_verify_test_server_runs_one_select_only():
         db.verify_test_server(FakeConnection(dataclasses.replace(GOOD, port=5432)))
 
 
+def _dotted(node: ast.AST) -> str:
+    # 호출 대상의 이름 (db.verify_test_server, pytest.exit, conn.execute 등)
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{_dotted(node.value)}.{node.attr}"
+    return ""
+
+
+def _steps(fn: ast.AST) -> list[tuple[int, int, str]]:
+    # 함수 안의 호출 이름과 문자열 상수를 소스 위치 순서로 — 실행 순서 비교용
+    found = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            found.append((node.lineno, node.col_offset, _dotted(node.func)))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            found.append((node.lineno, node.col_offset, node.value))
+    return sorted(found)
+
+
+def _first(steps: list[tuple[int, int, str]], match) -> tuple[int, int]:
+    hits = [(line, col) for line, col, label in steps if match(label)]
+    assert hits, "필요한 단계가 없음"
+    return hits[0]
+
+
+def _guarded_by_exit(try_node: ast.Try, *calls: str) -> None:
+    # try 본문에 calls 가 모두 있고, (db.DatabaseConfigError, SQLAlchemyError) 를 잡아 pytest.exit 로 멈춘다
+    inside = {_dotted(n.func) for stmt in try_node.body for n in ast.walk(stmt) if isinstance(n, ast.Call)}
+    assert set(calls) <= inside
+    (handler,) = [h for h in try_node.handlers if isinstance(h.type, ast.Tuple)]
+    assert {_dotted(e) for e in handler.type.elts} == {"db.DatabaseConfigError", "SQLAlchemyError"}
+    exits = [n for n in ast.walk(handler) if isinstance(n, ast.Call) and _dotted(n.func) == "pytest.exit"]
+    assert len(exits) == 1 and not try_node.orelse and not try_node.finalbody
+    # (3-2) 그 밖의 처리기는 reset_test_schema 의 ResetBlocked 하나만 허용 — 그것도 pytest.exit 로 멈춘다
+    others = [h for h in try_node.handlers if h is not handler]
+    assert len(others) <= 1 and all(_dotted(h.type) == "ResetBlocked" for h in others)
+    assert all([_dotted(n.func) for n in ast.walk(h) if isinstance(n, ast.Call)].count("pytest.exit") == 1
+               for h in others)
+
+
+def _fixture_scope(fn: ast.FunctionDef) -> str | None:
+    # @pytest.fixture 의 scope (없으면 None = function)
+    (deco,) = fn.decorator_list
+    if isinstance(deco, ast.Call):
+        assert _dotted(deco.func) == "pytest.fixture"
+        return {k.arg: k.value.value for k in deco.keywords}.get("scope")
+    assert _dotted(deco) == "pytest.fixture"
+    return None
+
+
 def test_fresh_schema_verifies_server_before_drop():
-    # test_db_postgres.py 의 DROP SCHEMA 는 fresh_schema 안에만 있고, 같은 연결의 서버 확인 뒤에 온다
-    source = (APP_DIR / "tests" / "test_db_postgres.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    functions = {n.name: ast.get_source_segment(source, n) for n in tree.body if isinstance(n, ast.FunctionDef)}
-    fresh = functions["fresh_schema"]
-    assert source.count("DROP SCHEMA") == fresh.count("DROP SCHEMA") == 1
-    order = [fresh.index("db.verify_test_server(conn)"), fresh.index("db.verify_test_schema(conn)"),
-             fresh.index("lock_timeout"), fresh.index("DROP SCHEMA")]     # 서버 → 스키마 내용(R-19) → 삭제
-    assert order == sorted(order)
-    assert "pytest.exit" in fresh and "SQLAlchemyError" in fresh       # 확인할 수 없어도 멈춘다
-    engine = functions["engine"]
-    order = [engine.index("check_test_database_url"), engine.index("verify_test_server"),
-             engine.index("verify_test_schema")]
-    assert order == sorted(order)
+    # (3-2) DROP SCHEMA 는 pg_harness.reset_test_schema 안에만 있고, 같은 연결의 서버 확인 뒤에 온다.
+    # test_db_postgres.py 의 fixture 는 이름·범위를 그대로 두고 하네스를 부르기만 한다 (AST 로 확인)
+    def parse(name: str):
+        source = (APP_DIR / "tests" / name).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        return source, tree, {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+    h_src, h_tree, harness = parse("pg_harness.py")
+    t_src, t_tree, tests = parse("test_db_postgres.py")
+
+    # A. 하네스: DROP SCHEMA 는 파일 전체에서 1번, reset_test_schema 안에만 있다
+    reset = harness["reset_test_schema"]
+    reset_src = ast.get_source_segment(h_src, reset)
+    assert h_src.count("DROP SCHEMA public CASCADE") == reset_src.count("DROP SCHEMA") == 1   # 함수 안 DROP 은 이것뿐
+    # (3-2 D안) 그 밖의 DROP SCHEMA 는 모듈 상수 DROP_EMPTY_SCHEMA_SQL(RESTRICT) 하나뿐이다
+    restrict = [n for n in h_tree.body if isinstance(n, ast.Assign) and "DROP SCHEMA" in ast.unparse(n.value)]
+    assert h_src.count("DROP SCHEMA") == 2 and len(restrict) == 1
+    assert _dotted(restrict[0].targets[0]) == "DROP_EMPTY_SCHEMA_SQL"
+    assert ast.literal_eval(restrict[0].value) == "DROP SCHEMA public RESTRICT"
+    owners = [fn.name for fn in ast.walk(h_tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+              for c in ast.walk(fn) if isinstance(c, ast.Constant) and isinstance(c.value, str) and "DROP SCHEMA" in c.value]
+    assert owners == ["reset_test_schema"]
+    # 실행 중 서버 검사가 첫 문장이고, 걸리면 pytest.exit 로 멈춘다
+    guard = reset.body[0]
+    assert isinstance(guard, ast.If) and _dotted(guard.test) == "_LIVE_SERVERS"
+    assert [_dotted(n.func) for n in ast.walk(guard) if isinstance(n, ast.Call)].count("pytest.exit") == 1
+    # 서버 → 스키마 내용(R-19) → lock_timeout → 삭제 → 생성 → upgrade 순서
+    steps = _steps(reset)
+    order = [(guard.lineno, guard.col_offset),
+             _first(steps, lambda s: s == "wait_until_single_backend"),
+             _first(steps, lambda s: s == "db.verify_test_server"),
+             _first(steps, lambda s: s == "db.verify_test_schema"),
+             _first(steps, lambda s: "lock_timeout" in s),
+             _first(steps, lambda s: "DROP SCHEMA" in s),
+             _first(steps, lambda s: "CREATE SCHEMA" in s),
+             _first(steps, lambda s: s == "command.upgrade")]
+    assert order == sorted(order) and len(set(order)) == len(order)
+    # 확인·삭제는 하나의 engine.begin() 트랜잭션 안이고, 확인할 수 없어도 멈춘다. upgrade 는 그 밖(삭제가 끝난 뒤)
+    (try_node,) = [n for n in reset.body if isinstance(n, ast.Try)]
+    (with_node,) = try_node.body
+    assert isinstance(with_node, ast.With) and _dotted(with_node.items[0].context_expr.func) == "engine.begin"
+    _guarded_by_exit(try_node, "db.verify_test_server", "db.verify_test_schema", "conn.execute")
+    # 서버·스키마 확인은 그 engine.begin() 블록의 conn 으로 하고, DROP SCHEMA 보다 앞에 있다 (호출 인자 구조로 확인)
+    target = with_node.items[0].optional_vars
+    assert isinstance(target, ast.Name) and target.id == "conn"
+    drop_at = _first(steps, lambda s: "DROP SCHEMA" in s)
+    for name, times in (("db.verify_test_server", 1), ("db.verify_test_schema", 2)):   # 스키마: 게이트 + 잠금 아래 재검사
+        verifies = [n for stmt in with_node.body for n in ast.walk(stmt)
+                    if isinstance(n, ast.Call) and _dotted(n.func) == name]
+        assert len(verifies) == times
+        for verify in verifies:
+            assert verify.args and isinstance(verify.args[0], ast.Name) and verify.args[0].id == "conn"
+            assert (verify.lineno, verify.col_offset) < drop_at
+    assert reset.body.index(try_node) < len(reset.body) - 1
+    assert _dotted(reset.body[-1].value.func) == "command.upgrade"
+
+    # B. 엔진: URL 보호 검사 → 엔진 생성 → 서버 확인 → 스키마 확인, 확인할 수 없으면 엔진을 닫고 멈춘다
+    opener = harness["open_verified_engine"]
+    steps = _steps(opener)
+    order = [_first(steps, lambda s: s == "db.check_test_database_url"),
+             _first(steps, lambda s: s == "db.make_engine"),
+             _first(steps, lambda s: s == "db.verify_test_server"),
+             _first(steps, lambda s: s == "db.verify_test_schema")]
+    assert order == sorted(order) and len(set(order)) == len(order)
+    (check_call,) = [n for n in ast.walk(opener) if isinstance(n, ast.Call)
+                     and _dotted(n.func) == "db.check_test_database_url"]
+    assert len(check_call.args) == 2 and ast.unparse(check_call.args[1]) == "os.environ.get('DATABASE_URL')"
+    (try_node,) = [n for n in opener.body if isinstance(n, ast.Try)]
+    _guarded_by_exit(try_node, "db.verify_test_server", "db.verify_test_schema")
+    assert "engine.dispose" in {_dotted(n.func) for n in ast.walk(try_node.handlers[0]) if isinstance(n, ast.Call)}
+    assert isinstance(opener.body[-1], ast.Return) and _dotted(opener.body[-1].value) == "engine"
+
+    # C. 호출 경로: 테스트 파일에는 DROP SCHEMA 가 없고, 두 fixture 는 이름·범위 그대로 하네스를 부른다
+    assert "DROP SCHEMA" not in t_src
+    assert not {"reset_test_schema", "open_verified_engine"} & set(tests)          # 같은 이름으로 덮어쓰지 않는다
+    imported = {a.name for n in t_tree.body if isinstance(n, ast.ImportFrom) and n.module == "pg_harness"
+                for a in n.names}
+    assert {"reset_test_schema", "open_verified_engine"} <= imported
+
+    fresh = tests["fresh_schema"]
+    assert _fixture_scope(fresh) is None and [a.arg for a in fresh.args.args] == ["engine", "alembic_cfg"]
+    (call,) = [n for n in ast.walk(fresh) if isinstance(n, ast.Call) and _dotted(n.func) == "reset_test_schema"]
+    assert [_dotted(a) for a in call.args] == ["engine", "alembic_cfg"] and not call.keywords
+    assert fresh.body[-2].value is call and isinstance(fresh.body[-1].value, ast.Yield)   # 초기화가 끝난 뒤에만 넘긴다
+
+    engine = tests["engine"]
+    assert _fixture_scope(engine) == "module" and not engine.args.args
+    first = engine.body[0]
+    assert isinstance(first, ast.Assign) and _dotted(first.value.func) == "open_verified_engine"
+    assert isinstance(engine.body[1].value, ast.Yield) and _dotted(engine.body[2].value.func) == "engine.dispose"
+
+
+WRITE_SQL = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|COPY|MERGE|CALL)\b", re.I)
+
+
+def test_ui_reset_is_gated_by_server_stop_and_origin():
+    # (3-2) test_ui.py 의 PostgreSQL UI 서버: reset_test_schema 는 정해진 3곳에서만 부르고, 종료 reset 은
+    # 서버 정리 확인 → 연결 정리 → 읽기 전용 게이트 → 출처 확인 뒤에만 온다. 엔진은 finally 에서 닫는다 (AST 로 확인)
+    def parse(name: str):
+        source = (APP_DIR / "tests" / name).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        return tree, {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+    trees = {name: parse(name) for name in ("pg_harness.py", "test_db_postgres.py", "test_ui.py")}
+    callers = sorted((name, fn.name) for name, (_, funcs) in trees.items() for fn in funcs.values()
+                     for n in ast.walk(fn) if isinstance(n, ast.Call) and _dotted(n.func) == "reset_test_schema")
+    assert callers == [("pg_harness.py", "_finish_ui_session"), ("pg_harness.py", "ui_server_session"),
+                       ("test_db_postgres.py", "fresh_schema")]
+    tree, harness = trees["pg_harness.py"]
+
+    # 종료 A′: 첫 문장이 서버 정리 문제·_LIVE_SERVERS 검사(→ exit), 그 뒤 순서대로 확인하고 reset 은 마지막 쪽에 1번
+    finish = harness["_finish_ui_session"]
+    guard = finish.body[0]
+    assert isinstance(guard, ast.If) and ast.unparse(guard.test) == "problems or _LIVE_SERVERS"
+    assert [_dotted(n.func) for n in ast.walk(guard) if isinstance(n, ast.Call)].count("pytest.exit") == 1
+    steps = _steps(finish)
+    order = [(guard.lineno, guard.col_offset),
+             _first(steps, lambda s: s == "wait_for_backends_released"),
+             _first(steps, lambda s: s == "verify_gate_readonly"),
+             _first(steps, lambda s: s == "verify_ui_origin"),
+             _first(steps, lambda s: s == "reset_test_schema"),
+             _first(steps, lambda s: s == "user_table_counts")]
+    assert order == sorted(order) and len(set(order)) == len(order)
+    origin_stop = [n for n in finish.body if isinstance(n, ast.If) and ast.unparse(n.test) == "origin"]
+    assert len(origin_stop) == 1 and "pytest.exit" in {_dotted(n.func) for n in ast.walk(origin_stop[0])
+                                                        if isinstance(n, ast.Call)}
+    assert finish.body.index(origin_stop[0]) < next(i for i, s in enumerate(finish.body) if isinstance(s, ast.With))
+    # 연결 정리 실패는 exit 로 바꾼다(삼키지 않는다)
+    (wait_try,) = [n for n in finish.body if isinstance(n, ast.Try)]
+    assert "pytest.exit" in {_dotted(n.func) for n in ast.walk(wait_try.handlers[0]) if isinstance(n, ast.Call)}
+
+    # 수명: 엔진 확인 → (try) 시작 0행 → 시작 reset → 서버 → 가입·로그인 → (finally) 서버 종료 → 종료 A′ / (finally) dispose
+    session = harness["ui_server_session"]
+    outer = [n for n in session.body if isinstance(n, ast.Try)]
+    assert len(outer) == 1 and [_dotted(s.value.func) for s in outer[0].finalbody] == ["engine.dispose"]
+    assert session.body.index(outer[0]) > next(i for i, s in enumerate(session.body)
+                                               if isinstance(s, ast.Assign) and _dotted(s.value.func) == "open_verified_engine")
+    steps = _steps(outer[0])
+    order = [_first(steps, lambda s: s == "user_table_counts"),
+             _first(steps, lambda s: s == "reset_test_schema"),
+             _first(steps, lambda s: s == "start_server"),
+             _first(steps, lambda s: s == "ui_register_logout_login"),
+             _first(steps, lambda s: s == "_stop_ui_server"),
+             _first(steps, lambda s: s == "_finish_ui_session")]
+    assert order == sorted(order) and len(set(order)) == len(order)
+    start_stop = outer[0].body[1]                                    # 시작 0행이 아니면 reset 전에 멈춘다
+    assert isinstance(start_stop, ast.If) and ast.unparse(start_stop.test) == "before"
+    assert "pytest.exit" in {_dotted(n.func) for n in ast.walk(start_stop) if isinstance(n, ast.Call)}
+    (inner,) = [n for n in outer[0].body if isinstance(n, ast.Try)]
+    assert [_dotted(n.func) for s in inner.finalbody for n in ast.walk(s) if isinstance(n, ast.Call)] == ["_stop_ui_server"]
+    assert any(isinstance(n, ast.Yield) for n in ast.walk(inner))   # 테스트는 서버 정리 finally 안에서 돈다
+
+    # 출처 확인·읽기 전용 게이트에는 쓰기 SQL 이 없다
+    (origin_sql,) = [n for n in tree.body if isinstance(n, ast.Assign) and _dotted(n.targets[0]) == "UI_ORIGIN_SQL"]
+    queries = ast.literal_eval(origin_sql.value)
+    assert queries and all(q.startswith("SELECT ") and not WRITE_SQL.search(q) for q in queries.values())
+    for name in ("verify_ui_origin", "verify_gate_readonly"):
+        fn = harness[name]
+        consts = [n.value for n in ast.walk(fn) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+        assert not any(WRITE_SQL.search(c) for c in consts), name
+        assert "SET TRANSACTION READ ONLY" in consts and "reset_test_schema" not in {
+            _dotted(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)}
+    consts = [n.value for n in ast.walk(harness["ui_origin_problems"])
+              if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    assert not any(WRITE_SQL.search(c) for c in consts)
+
+
+def test_reset_before_drop_locks_and_rechecks_in_same_transaction():
+    # (3-2) before_drop: 키워드 전용·기본 None, UI 종료 reset 만 전달. 같은 engine.begin() 안에서
+    # 게이트 → lock_timeout → 8개 표 ACCESS EXCLUSIVE → 통계 캐시 비우기 → 게이트 재검사 → 콜백 → (문제 있으면 중단) → DROP
+    def parse(name: str):
+        tree = ast.parse((APP_DIR / "tests" / name).read_text(encoding="utf-8"))
+        return tree, {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+    tree, harness = parse("pg_harness.py")
+    _, tests = parse("test_db_postgres.py")
+    reset = harness["reset_test_schema"]
+    assert [a.arg for a in reset.args.args] == ["engine", "alembic_cfg"] and not reset.args.defaults
+    assert [a.arg for a in reset.args.kwonlyargs] == ["before_drop"]
+    assert isinstance(reset.args.kw_defaults[0], ast.Constant) and reset.args.kw_defaults[0].value is None
+
+    # 호출: fresh_schema·시작 reset 은 인자 2개만, 종료 reset 만 before_drop=lambda conn: ui_origin_problems(conn, account)
+    def reset_calls(fn):
+        return [n for n in ast.walk(fn) if isinstance(n, ast.Call) and _dotted(n.func) == "reset_test_schema"]
+    for fn in (tests["fresh_schema"], harness["ui_server_session"]):
+        (call,) = reset_calls(fn)
+        assert len(call.args) == 2 and not call.keywords
+    (call,) = reset_calls(harness["_finish_ui_session"])
+    (kw,) = call.keywords
+    assert kw.arg == "before_drop" and isinstance(kw.value, ast.Lambda)
+    assert [a.arg for a in kw.value.args.args] == ["conn"]
+    assert ast.unparse(kw.value.body) == "ui_origin_problems(conn, account)"
+
+    # with 본문의 문장 구성: None 이면 기존과 같은 문장만 실행된다 (추가는 if before_drop 블록 하나)
+    (try_node,) = [n for n in reset.body if isinstance(n, ast.Try)]
+    (with_node,) = try_node.body
+    shape = [ast.unparse(s.test) if isinstance(s, ast.If) else _dotted(s.value.func) for s in with_node.body]
+    assert shape == ["db.verify_test_server", "db.verify_test_schema", "conn.execute", "before_drop is not None",
+                     "conn.execute"]
+    block = with_node.body[3]
+    create = with_node.body[4]
+    assert ast.unparse(create) == "conn.execute(text('CREATE SCHEMA public'))"
+    # (3-2 D안) None 경로(else)는 기존 CASCADE 한 문장뿐, before_drop 경로(if)에는 CASCADE 가 없다
+    assert [ast.unparse(s) for s in block.orelse] == ["conn.execute(text('DROP SCHEMA public CASCADE'))"]
+    assert not any("CASCADE" in ast.unparse(s) for s in block.body)
+
+    # 잠금 문장: 고정 문자열·고정 순서(이름순)·8개·ACCESS EXCLUSIVE, 식별자를 조합하지 않는다
+    (lock_sql,) = [n for n in tree.body if isinstance(n, ast.Assign) and _dotted(n.targets[0]) == "LOCK_TABLES_SQL"]
+    sql = ast.literal_eval(lock_sql.value)
+    m = re.fullmatch(r"LOCK TABLE (.+) IN ACCESS EXCLUSIVE MODE", sql)
+    tables = [t.strip() for t in m.group(1).split(",")]
+    assert tables == [f"public.{t}" for t in ("alembic_version", "auth_failures", "data_migrations", "sessions",
+                                              "subtasks", "task_templates", "todos", "users")]
+    assert tables == sorted(tables)
+    consts = {_dotted(n.targets[0]): ast.literal_eval(n.value) for n in tree.body
+              if isinstance(n, ast.Assign) and _dotted(n.targets[0]) in ("DROP_KNOWN_TABLES_SQL", "DROP_EMPTY_SCHEMA_SQL")}
+    m = re.fullmatch(r"DROP TABLE (.+) RESTRICT", consts["DROP_KNOWN_TABLES_SQL"])
+    assert [t.strip() for t in m.group(1).split(",")] == tables                       # 잠금 대상과 같은 8개·같은 순서
+    assert consts["DROP_EMPTY_SCHEMA_SQL"] == "DROP SCHEMA public RESTRICT"
+    assert not any("CASCADE" in v for v in consts.values())
+    # RESTRICT 상수는 before_drop 블록(if 쪽)에서만 쓴다
+    users = [(fn.name, n.id) for fn in harness.values() for n in ast.walk(fn)
+             if isinstance(n, ast.Name) and n.id in consts]
+    assert sorted(users) == [("reset_test_schema", "DROP_EMPTY_SCHEMA_SQL"), ("reset_test_schema", "DROP_KNOWN_TABLES_SQL")]
+    assert {n.id for s in block.body for n in ast.walk(s) if isinstance(n, ast.Name)} >= set(consts)
+
+    # 블록 안 순서: 잠금 → 통계 캐시 비우기 → 게이트 재검사 → 콜백 → 문제 있으면 ResetBlocked — 모두 DROP 앞
+    def at(pred):
+        hits = sorted((n.lineno, n.col_offset) for n in ast.walk(block) if pred(n))
+        assert len(hits) == 1
+        return hits[0]
+    order = [at(lambda n: isinstance(n, ast.Name) and n.id == "LOCK_TABLES_SQL"),
+             at(lambda n: isinstance(n, ast.Constant) and n.value == "SELECT pg_stat_clear_snapshot()"),
+             at(lambda n: isinstance(n, ast.Call) and _dotted(n.func) == "db.verify_test_schema"),
+             at(lambda n: isinstance(n, ast.Call) and _dotted(n.func) == "before_drop"),
+             at(lambda n: isinstance(n, ast.Raise) and "reset_origin_mismatch" in ast.unparse(n)),
+             at(lambda n: isinstance(n, ast.Name) and n.id == "DROP_KNOWN_TABLES_SQL"),
+             at(lambda n: isinstance(n, ast.Name) and n.id == "DROP_EMPTY_SCHEMA_SQL"),
+             (create.lineno, create.col_offset)]
+    assert order == sorted(order) and len(set(order)) == len(order)
+    # 출처 불일치 중단(if problems: raise)은 블록 본문의 문장이고, DROP 문장들은 그 뒤의 별도 try 안에 있다
+    mismatch_at = next(i for i, s in enumerate(block.body) if isinstance(s, ast.If) and ast.unparse(s.test) == "problems")
+    drop_try = block.body[-1]
+    assert isinstance(drop_try, ast.Try) and block.body.index(drop_try) > mismatch_at
+    assert [ast.unparse(s) for s in drop_try.body] == ["conn.execute(text(DROP_KNOWN_TABLES_SQL))",
+                                                      "conn.execute(text(DROP_EMPTY_SCHEMA_SQL))"]
+    (drop_handler,) = drop_try.handlers
+    assert _dotted(drop_handler.type) == "SQLAlchemyError"
+    lock_call = next(n for n in ast.walk(block)
+                     if isinstance(n, ast.Call) and ast.unparse(n) == "conn.execute(text(LOCK_TABLES_SQL))")
+    before_call = next(n for n in ast.walk(block) if isinstance(n, ast.Call) and _dotted(n.func) == "before_drop")
+    assert [ast.unparse(a) for a in before_call.args] == ["conn"]                     # 같은 연결
+    timeout_line = next(n.lineno for n in ast.walk(with_node)
+                        if isinstance(n, ast.Constant) and isinstance(n.value, str) and "lock_timeout" in n.value)
+    assert lock_call.lineno > timeout_line
+
+    # 중단: 잠금·콜백 SQL 오류는 검증한 SQLSTATE 만(원래 예외 연결 없음), 출처 불일치는 exit 3 — 모두 with 안에서 raise
+    raises = {ast.literal_eval(r.exc.args[0]): r for r in ast.walk(block)
+              if isinstance(r, ast.Raise) and isinstance(r.exc, ast.Call) and _dotted(r.exc.func) == "ResetBlocked"}
+    assert set(raises) == {"reset_lock_failed", "reset_origin_query_failed", "reset_origin_mismatch",
+                           "reset_restrict_drop_failed"}
+    for event in ("reset_lock_failed", "reset_origin_query_failed", "reset_restrict_drop_failed"):
+        r = raises[event]
+        assert ast.unparse(r.exc.args[1]) == "_safe_sqlstate(exc)" and ast.unparse(r.exc.args[2]) == "2"
+        assert isinstance(r.cause, ast.Constant) and r.cause.value is None
+    assert ast.unparse(raises["reset_origin_mismatch"].exc.args[2]) == "3"
+    (blocked,) = [h for h in try_node.handlers if _dotted(h.type) == "ResetBlocked"]
+    (exit_call,) = [n for n in ast.walk(blocked) if isinstance(n, ast.Call) and _dotted(n.func) == "pytest.exit"]
+    assert {k.arg: ast.unparse(k.value) for k in exit_call.keywords} == {"returncode": "e.returncode"}
+
+    # 콜백은 읽기만 하고 트랜잭션을 다루지 않는다 (commit·rollback·begin·connect·close·SET TRANSACTION 없음)
+    callback = harness["ui_origin_problems"]
+    assert [a.arg for a in callback.args.args] == ["conn", "account"]
+    names = {n.func.attr for n in ast.walk(callback) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert not names & {"commit", "rollback", "begin", "begin_nested", "connect", "close", "dispose"}
+    consts = [n.value for n in ast.walk(callback) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    assert not any(WRITE_SQL.search(c) or "SET TRANSACTION" in c.upper() for c in consts)
+    executes = [n for n in ast.walk(callback) if isinstance(n, ast.Call) and _dotted(n.func) == "conn.execute"]
+    assert executes and all(_dotted(n.args[0].func) == "text" for n in executes)
 
 
 # ---------- 테스트 DB 스키마 사전 게이트 (R-19) ----------

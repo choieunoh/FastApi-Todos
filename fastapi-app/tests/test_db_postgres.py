@@ -6,21 +6,11 @@
 - 이 파일은 그 DB 의 public 스키마를 지웠다 만든다 (지우기 직전 같은 연결에서 db.verify_test_server).
 - 개발 DB(todo_dev)·운영 DB 에는 절대 연결하지 않는다.
 """
-import base64
 import hashlib
-import json
 import logging
-import os
-import re
-import secrets
-import signal
-import socket
-import subprocess
-import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,12 +31,14 @@ from sqlalchemy.pool import NullPool
 import auth
 import db
 import main
-from conftest import free_port
+from pg_harness import (  # (3-2) 공용 하네스 — 본문은 그대로 옮겼다
+    APP_DIR, CONNECT_TIMEOUT, SERVER_FAILURE_KEY, SERVER_KEY, Server, TEST_URL, _UNFINISHED_WORKERS, nullpool_engine,
+    open_verified_engine, reset_test_schema, start_server, stop_server, wait_for_backends_released,
+    wait_until_single_backend,
+)
 
 pytestmark = pytest.mark.postgres
 
-APP_DIR = Path(__file__).resolve().parent.parent
-TEST_URL = os.environ.get("TEST_DATABASE_URL")
 
 if not TEST_URL:
     pytest.skip("TEST_DATABASE_URL 이 없어 PostgreSQL 테스트를 건너뜁니다 (Phase 1-B 보류)",
@@ -55,17 +47,7 @@ if not TEST_URL:
 
 @pytest.fixture(scope="module")
 def engine():
-    # URL(대상 고정) → 실제 서버(버전·주소·포트·DB·계정) 순서로 확인한 뒤에만 테스트를 시작한다
-    url = db.check_test_database_url(TEST_URL, os.environ.get("DATABASE_URL"))
-    engine = db.make_engine(url)
-    try:
-        with engine.connect() as conn:
-            db.verify_test_server(conn)
-            db.verify_test_schema(conn)          # R-19 — 읽기 전용, 처음 지우기 전에 한 번 더 일찍 멈춘다
-            conn.rollback()
-    except (db.DatabaseConfigError, SQLAlchemyError) as e:
-        engine.dispose()
-        pytest.exit(f"테스트 DB 보호: {e}", returncode=2)   # 다른 테스트도 진행하지 않는다 (확인할 수 없어도 멈춘다)
+    engine = open_verified_engine()                     # (3-2) 확인 절차는 pg_harness 로 옮겼다(그대로)
     yield engine
     engine.dispose()
 
@@ -78,53 +60,11 @@ def alembic_cfg(monkeypatch):
     return Config(str(APP_DIR / "alembic.ini"))
 
 
-def wait_until_single_backend(engine) -> None:
-    # (3-1B-2) fresh_schema 의 게이트 "앞"에서 읽기만 하며 기다린다 — 이 DB 의 연결 수(numbackends)가 점검 연결 1개로
-    # 돌아올 때까지 BACKEND_RELEASE_TIMEOUT 안에서만. 대기 종료는 R-19 통과가 아니다(바로 뒤 게이트가 다시 판정한다).
-    # 같은 역할의 다른 세션이 보이면 기다리지 않고 멈추고, 추가 백엔드의 정체는 추정하지 않는다. 쓰기는 하지 않는다.
-    if any(t.is_alive() for t in _UNFINISHED_WORKERS):
-        pytest.exit("끝나지 않은 작업 스레드가 있어 연결 수를 확인할 수 없습니다 — 이후 PostgreSQL 테스트를 진행하지 않습니다",
-                    returncode=3)
-    start = time.monotonic()
-    while True:
-        try:
-            with engine.connect() as conn:                                   # 풀의 점검 연결 1개 — 매번 새 트랜잭션
-                backends = conn.execute(text(db.TEST_SCHEMA_SQL["database_backends"])).scalar_one()
-                others = conn.execute(text(db.TEST_SCHEMA_SQL["other_sessions"])).scalar_one()
-                conn.rollback()                                              # 읽기만 — 스냅숏을 다음 반복으로 넘기지 않는다
-        except SQLAlchemyError as exc:
-            sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
-            safe = sqlstate if isinstance(sqlstate, str) and len(sqlstate) == 5 and sqlstate.isalnum() else None
-            pytest.exit(f"테스트 DB 보호: 게이트 전 연결 수 확인 실패 ({type(exc).__name__}, sqlstate={safe})", returncode=2)
-        elapsed = time.monotonic() - start
-        if type(backends) is not int or type(others) is not int:
-            pytest.exit("테스트 DB 보호: 게이트 전 연결 수를 확인할 수 없음", returncode=2)
-        if others != 0:
-            pytest.exit(f"테스트 DB 보호: 같은 역할의 다른 세션 {others}개 (DB 연결 수 {backends}, {elapsed:.2f}초) "
-                        "— 기다리지 않고 멈춘다", returncode=2)
-        if backends == 1:
-            return
-        if elapsed >= BACKEND_RELEASE_TIMEOUT:
-            pytest.exit(f"테스트 DB 보호: DB 연결 수 {backends} 가 {BACKEND_RELEASE_TIMEOUT}초 안에 1로 돌아오지 않음 "
-                        f"(다른 세션 0, {elapsed:.2f}초) — 추가 백엔드의 정체는 확인하지 않음", returncode=2)
-        time.sleep(0.05)
-
-
 @pytest.fixture
 def fresh_schema(engine, alembic_cfg):
     # 빈 스키마에서 head 까지 올린다. 지우기 직전에 같은 연결·트랜잭션에서 서버와 스키마 내용(R-19)을
     # 다시 확인한다. 하나라도 어긋나거나 확인할 수 없으면 지우지 않고 세션 전체를 멈춘다
-    wait_until_single_backend(engine)                                        # (3-1B-2) 읽기 전용 사전 대기 — 판정은 아래 게이트
-    try:
-        with engine.begin() as conn:
-            db.verify_test_server(conn)
-            db.verify_test_schema(conn)
-            conn.execute(text("SET LOCAL lock_timeout = '5s'"))   # 다른 세션이 잡고 있으면 기다리지 않고 실패
-            conn.execute(text("DROP SCHEMA public CASCADE"))
-            conn.execute(text("CREATE SCHEMA public"))
-    except (db.DatabaseConfigError, SQLAlchemyError) as e:
-        pytest.exit(f"테스트 DB 보호: {e}", returncode=2)
-    command.upgrade(alembic_cfg, "head")
+    reset_test_schema(engine, alembic_cfg)                                   # (3-2) 본문은 pg_harness 로 옮겼다(절차 그대로)
     yield engine
 
 
@@ -477,42 +417,8 @@ def failure_rows(conn) -> list:
     return conn.execute(select(db.AuthFailure.__table__).order_by(db.AuthFailure.id)).all()
 
 
-CONNECT_TIMEOUT = 10                              # 초 — 별도 연결의 접속 대기 상한 (libpq connect_timeout)
 BARRIER_TIMEOUT = 30                              # 초 — 동시 시작 대기 상한
 JOIN_TIMEOUT = 60                                 # 초 — 작업 스레드 전체 종료 대기 상한
-BACKEND_RELEASE_TIMEOUT = 10                      # 초 — 닫은 연결의 서버 백엔드가 사라질 때까지 기다리는 상한
-_UNFINISHED_WORKERS: list[threading.Thread] = []  # join 뒤에도 살아 있는 작업 스레드 — 있으면 연결 수 확인을 하지 않는다
-
-
-def nullpool_engine():
-    # 두 번째 이후 연결용. 풀에 남기지 않고(NullPool) 접속 대기에 상한을 둔다. URL·대상 검사는 그대로다
-    engine = db.make_engine(db.check_test_database_url(TEST_URL), poolclass=NullPool)
-
-    @event.listens_for(engine, "do_connect")
-    def _connect_timeout(dialect, conn_rec, cargs, cparams):
-        cparams["connect_timeout"] = CONNECT_TIMEOUT
-
-    return engine
-
-
-def wait_for_backends_released(engine) -> None:
-    # 별도 연결을 모두 닫은 "뒤"에 부른다. 다음 테스트의 R-19 게이트와 같은 조건(이 DB 연결 = 점검 연결 1개,
-    # 다른 세션 0)으로 돌아올 때까지 제한 시간 동안 읽기만 한다. 게이트 자체는 바꾸지 않고, 세션을 끊지 않는다.
-    # 끝나지 않은 작업 스레드가 있으면 그 연결이 언제 열리고 닫힐지 알 수 없으므로 확인하지 않고 세션을 멈춘다
-    if any(t.is_alive() for t in _UNFINISHED_WORKERS):
-        pytest.exit("끝나지 않은 작업 스레드가 있어 연결 수를 확인할 수 없습니다 — 이후 PostgreSQL 테스트를 진행하지 않습니다",
-                    returncode=3)
-    deadline = time.monotonic() + BACKEND_RELEASE_TIMEOUT
-    while True:
-        with engine.connect() as conn:                                       # 풀의 점검 연결 1개 — 매번 새 트랜잭션
-            backends = conn.execute(text(db.TEST_SCHEMA_SQL["database_backends"])).scalar_one()
-            others = conn.execute(text(db.TEST_SCHEMA_SQL["other_sessions"])).scalar_one()
-            conn.rollback()
-        if backends == 1 and others == 0:
-            return
-        if time.monotonic() >= deadline:
-            pytest.fail(f"닫은 연결이 {BACKEND_RELEASE_TIMEOUT}초 안에 정리되지 않음 (DB 연결 수 {backends}, 다른 세션 {others})")
-        time.sleep(0.05)
 
 
 def test_login_attempt_records_hmac_key_and_reads_hash(fresh_schema):
@@ -1834,328 +1740,9 @@ def test_template_name_lower_vs_casefold_observation(fresh_schema, case, a, b):
 # - 자식 프로세스에는 검증된 todo_test URL 을 DATABASE_URL 로만 준다(TEST_DATABASE_URL·PG* 는 뺀다). 앱 코드는 바꾸지 않고
 #   워커 식별은 uvicorn 로그(Started server process [PID])와 접근 로그 형식의 %(process)d 로만 한다.
 
-SERVER_KEY_BYTES = secrets.token_bytes(32)                       # 이 실행에서만 쓰는 합성 키 (출력하지 않는다)
-SERVER_KEY = base64.urlsafe_b64encode(SERVER_KEY_BYTES).rstrip(b"=").decode("ascii")
-SERVER_FAILURE_KEY = auth.FailureKey(SERVER_KEY_BYTES)
-SERVER_START_TIMEOUT = 30                                        # 초 — 기동·준비 확인 상한
-SERVER_START_ATTEMPTS = 3                                        # 포트 충돌 등으로 바로 죽으면 새 포트로 다시 (상한)
-SERVER_STOP_TIMEOUT = 10                                         # 초 — 정상 종료 대기, 강제 종료 뒤 확인 대기
 HTTP_TIMEOUT = 30                                                # 초 — 요청 하나의 상한
 MW_WRONG_PW = "mw-wrong-password-1"
 MW_PW = "mw-correct-pass-9"
-SERVER_ENV_DROP = ("TEST_DATABASE_URL", "DATABASE_URL", "AUTH_FAILURE_KEY", "APP_ENV", "COOKIE_SECURE",
-                   "REGISTRATION_ENABLED", "FORWARDED_ALLOW_IPS")
-_STARTED_WORKER = re.compile(r"Started server process \[(\d+)\]")
-_STARTED_PARENT = re.compile(r"Started parent process \[(\d+)\]")
-_ACCESS = re.compile(r'ACCESS pid=(\d+) \S+ "(\w+) (\S+) [^"]*" (\d{3})')
-
-SERVER_LOG_CONFIG = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "default": {"()": "uvicorn.logging.DefaultFormatter", "fmt": "%(levelprefix)s [%(process)d] %(message)s",
-                    "use_colors": False},
-        "access": {"()": "uvicorn.logging.AccessFormatter",
-                   "fmt": 'ACCESS pid=%(process)d %(client_addr)s "%(request_line)s" %(status_code)s',
-                   "use_colors": False},
-    },
-    "handlers": {
-        "default": {"formatter": "default", "class": "logging.StreamHandler", "stream": "ext://sys.stderr"},
-        "access": {"formatter": "access", "class": "logging.StreamHandler", "stream": "ext://sys.stdout"},
-    },
-    "loggers": {
-        "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
-        "uvicorn.error": {"level": "INFO"},
-        "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
-        "todo.auth": {"handlers": ["default"], "level": "WARNING", "propagate": False},
-    },
-}
-
-
-def server_database_url() -> str:
-    # 자식 프로세스의 DATABASE_URL — 고정 대상 검사를 통과한 todo_test URL 만 (값은 출력하지 않는다)
-    url = db.check_test_database_url(TEST_URL)
-    assert (url.username, url.host, url.port, url.database) == (db.TEST_DB_USER, db.TEST_DB_HOST,
-                                                                 db.TEST_DB_PORT, db.TEST_DB_NAME)
-    return url.render_as_string(hide_password=False)
-
-
-@dataclass
-class Server:
-    proc: subprocess.Popen
-    port: int
-    workers: int
-    folder: Path
-    worker_pids: list[int] = field(default_factory=list)
-    parent_pid: int | None = None
-    created: str | None = None                     # 감독(Popen) 프로세스의 생성 시각 (UTC ISO) — 식별에 쓴다
-    identities: dict[int, str] = field(default_factory=dict)   # 확인된 워커 PID → 생성 시각
-
-    @property
-    def base(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
-
-    def log_text(self) -> str:
-        parts = []
-        for name in ("stdout.log", "stderr.log"):
-            path = self.folder / name
-            parts.append(path.read_text(encoding="utf-8", errors="replace") if path.exists() else "")
-        return "\n".join(parts)
-
-    def access(self) -> list[tuple[int, str, str, int]]:
-        # (워커 PID, 메서드, 경로, 상태) — 접근 로그에서만 읽는다
-        return [(int(p), m, path, int(s)) for p, m, path, s in _ACCESS.findall(self.log_text())]
-
-    def collect_pids(self) -> None:
-        text = self.log_text()
-        self.worker_pids = sorted({int(p) for p in _STARTED_WORKER.findall(text)})
-        parents = {int(p) for p in _STARTED_PARENT.findall(text)}
-        self.parent_pid = next(iter(parents)) if len(parents) == 1 else None
-
-
-@dataclass(frozen=True)
-class ProcInfo:
-    pid: int
-    ppid: int
-    created: str                                   # UTC ISO 8601 ('o' 형식, 같은 형식끼리 문자열 비교 가능)
-    cmd: str
-
-
-_PROCESS_QUERY = (
-    "$ErrorActionPreference='Stop'; "
-    "Get-CimInstance Win32_Process -Filter \"Name='{name}'\" | ForEach-Object {{ [pscustomobject]@{{ "
-    "pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; "
-    "created=$_.CreationDate.ToUniversalTime().ToString('o'); cmd=[string]$_.CommandLine }} }} "
-    "| ConvertTo-Json -Compress"
-)
-
-
-def _process_table() -> dict[int, ProcInfo] | None:
-    # 이 python 실행 파일과 같은 이름의 프로세스 메타데이터 (Windows CIM, 외부 패키지 없음). 확인할 수 없으면 None
-    if os.name != "nt":
-        return None
-    script = _PROCESS_QUERY.format(name=Path(sys.executable).name.replace("'", ""))
-    try:
-        done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                              capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if done.returncode != 0:
-        return None
-    raw = done.stdout.strip()
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return None
-    rows = data if isinstance(data, list) else [data]
-    table = {}
-    for row in rows:
-        try:
-            info = ProcInfo(int(row["pid"]), int(row["ppid"]), str(row["created"]), str(row.get("cmd") or ""))
-        except (KeyError, TypeError, ValueError):
-            return None
-        table[info.pid] = info
-    return table
-
-
-def _is_supervisor(info: ProcInfo, server: Server) -> bool:
-    # 이 테스트가 띄운 uvicorn 명령(같은 포트)이고, 처음 기록한 생성 시각과 같아야 한다
-    return (info.pid == server.proc.pid and server.created is not None and info.created == server.created
-            and "-m uvicorn main:app" in info.cmd and f"--port {server.port}" in info.cmd)
-
-
-def _is_own_child(info: ProcInfo, server: Server) -> bool:
-    # 부모 PID 하나만으로 정하지 않는다: 부모 PID + multiprocessing spawn 명령의 parent_pid + 감독 이후 생성
-    return (server.created is not None and info.ppid == server.proc.pid and info.created >= server.created
-            and "spawn_main" in info.cmd and f"parent_pid={server.proc.pid}" in info.cmd)
-
-
-def _children(server: Server, table: dict[int, ProcInfo]) -> tuple[dict[int, ProcInfo], list[int]]:
-    # (확인된 자식, 감독이 만든 것으로 보이지만 명령이 달라 확인되지 않는 PID)
-    own, uncertain = {}, []
-    for info in table.values():
-        if info.pid == server.proc.pid or info.ppid != server.proc.pid:
-            continue
-        if server.created is not None and info.created < server.created:
-            continue                                                 # 예전에 같은 PID 번호를 쓰던 부모의 자식 — 무관
-        if _is_own_child(info, server):
-            own[info.pid] = info
-        else:
-            uncertain.append(info.pid)
-    return own, sorted(uncertain)
-
-
-def _pid_present(pid: int) -> bool:
-    # 프로세스 표를 얻지 못했을 때의 보조 확인 (종료 판단에만 쓰고, 이것으로 강제 종료하지 않는다)
-    if os.name != "nt":
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True
-    try:
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                             capture_output=True, text=True, timeout=30).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return True                                                   # 모르면 남아 있다고 본다
-    return f'"{pid}"' in out
-
-
-def _port_open(port: int) -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=1):
-            return True
-    except OSError:
-        return False
-
-
-def _start_once(folder: Path, workers: int) -> Server:
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "log.json").write_text(json.dumps(SERVER_LOG_CONFIG), encoding="utf-8")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("PG") and k not in SERVER_ENV_DROP}
-    env.update(APP_ENV="test", AUTH_FAILURE_KEY=SERVER_KEY, DATABASE_URL=server_database_url(),
-               TODO_FILE=str(folder / "todo.json"), TEMPLATE_FILE=str(folder / "task_templates.json"))
-    port = free_port()
-    with open(folder / "stdout.log", "wb") as out, open(folder / "stderr.log", "wb") as err:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port),
-             "--workers", str(workers), "--no-proxy-headers", "--log-config", str(folder / "log.json")],
-            cwd=APP_DIR, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
-    return Server(proc=proc, port=port, workers=workers, folder=folder)
-
-
-def _record_identity(server: Server) -> None:
-    # Popen 직후 감독의 생성 시각을 기록한다 (이 테스트가 띄운 명령인지도 함께). 확인하지 못하면 created 는 None
-    table = _process_table()
-    info = (table or {}).get(server.proc.pid)
-    if info is not None and "-m uvicorn main:app" in info.cmd and f"--port {server.port}" in info.cmd:
-        server.created = info.created
-
-
-def _wait_ready(server: Server) -> str | None:
-    # 준비되면 None, 아니면 이유. 워커 수만큼 PID 가 로그에 나오고 /auth/me 가 401 이어야 준비된 것
-    deadline = time.monotonic() + SERVER_START_TIMEOUT
-    while time.monotonic() < deadline:
-        if server.proc.poll() is not None:
-            return f"서버 프로세스가 바로 끝남 (exit {server.proc.returncode})"
-        server.collect_pids()
-        if len(server.worker_pids) >= server.workers:
-            try:
-                if httpx.get(server.base + "/auth/me", timeout=2).status_code == 401:
-                    return None
-            except httpx.HTTPError:
-                pass
-        time.sleep(0.2)
-    return "준비 시간 초과 또는 워커 PID 수집 실패"
-
-
-def _verify_workers(server: Server) -> str | None:
-    # 로그의 워커 PID 가 모두 이 테스트가 띄운 프로세스인지 확인하고 생성 시각을 기록한다. 아니면 이유
-    if os.name != "nt":
-        return None
-    table = _process_table()
-    if table is None or server.created is None:
-        return "프로세스 식별 정보(CIM)를 얻지 못함"
-    for pid in server.worker_pids:
-        info = table.get(pid)
-        if info is None:
-            return f"워커 PID {pid} 가 프로세스 목록에 없음"
-        ok = _is_supervisor(info, server) if pid == server.proc.pid else _is_own_child(info, server)
-        if not ok:
-            return f"워커 PID {pid} 를 이 테스트의 프로세스로 확인하지 못함"
-        server.identities[pid] = info.created
-    return None
-
-
-def start_server(folder: Path, workers: int) -> Server:
-    # 상한 있는 재시도. Popen 이후 어떤 예외(BaseException 포함)가 나도 그 시도의 프로세스를 정리하고 원래 예외를 다시 올린다.
-    # 정리하지 못하면 다음 fresh_schema 가 돌지 않게 세션을 멈춘다
-    reasons = []
-    for attempt in range(SERVER_START_ATTEMPTS):
-        server = _start_once(folder / f"try{attempt}", workers)
-        try:
-            _record_identity(server)
-            reason = _wait_ready(server) or _verify_workers(server)
-        except BaseException:
-            try:
-                problems = stop_server(server)
-            except BaseException as cleanup_error:                     # noqa: BLE001
-                pytest.exit(f"기동 중 예외 뒤 서버 정리도 실패 ({type(cleanup_error).__name__}) — 로그: {server.folder}",
-                            returncode=3)
-            if problems:
-                pytest.exit(f"기동 중 예외 뒤 서버를 정리하지 못했습니다 — {problems} (로그: {server.folder})",
-                            returncode=3)
-            raise
-        if reason is None:
-            return server
-        reasons.append(reason)
-        problems = stop_server(server)
-        if problems:
-            pytest.exit(f"기동 실패한 서버를 정리하지 못했습니다 — {problems} (로그: {server.folder})", returncode=3)
-    pytest.fail(f"uvicorn 서버 기동 실패 ({SERVER_START_ATTEMPTS}회): {reasons} (로그: {folder})")
-
-
-def stop_server(server: Server) -> list[str]:
-    # 정상 종료(CTRL_BREAK) → 감독은 Popen 핸들로 종료(핸들이 열려 있어 PID 재사용 없음) → 자식은 식별을 확인한 것만
-    # 하나씩 강제 종료 → 감독·자식 PID 와 포트가 사라졌는지 확인. 문제 목록을 돌려준다(빈 목록이면 정리됨).
-    # taskkill /T 는 부모 PID 번호만 보고 트리를 만들므로 쓰지 않는다. 식별이 불확실한 프로세스는 죽이지 않고 문제로 보고한다
-    problems: list[str] = []
-    try:
-        server.collect_pids()
-    except OSError:
-        problems.append("서버 로그를 읽지 못함")
-    tracked: dict[int, str] = dict(server.identities)                   # PID → 생성 시각 (확인된 것만)
-    table = _process_table()
-    if table is not None:
-        own, _ = _children(server, table)
-        tracked.update({pid: info.created for pid, info in own.items()})   # 로그에 아직 안 나온 워커 포함
-    # (3-1B) Windows 다중 워커 서버에는 콘솔 신호를 보내지 않는다 — 감독이 워커 PID(그룹 대표가 아님)에
-    # CTRL_BREAK 를 다시 보내면 같은 콘솔의 pytest 까지 끝날 수 있다(exit 0xC000013A). 이 경우 정상 종료 단계를
-    # 건너뛰고 아래의 기존 경로(핸들 기반 감독 종료 → 식별을 확인한 워커만 PID 별 종료 → PID·포트 확인)만 쓴다
-    console_signal_ok = not (os.name == "nt" and server.workers > 1)
-    if console_signal_ok and server.proc.poll() is None:
-        try:
-            if os.name == "nt":
-                server.proc.send_signal(signal.CTRL_BREAK_EVENT)
-            else:
-                server.proc.terminate()
-            server.proc.wait(SERVER_STOP_TIMEOUT)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    if server.proc.poll() is None:
-        server.proc.kill()                                             # 핸들 기반 — 우리 프로세스만
-        try:
-            server.proc.wait(SERVER_STOP_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            problems.append(f"감독 PID {server.proc.pid} 종료 안 됨")
-    deadline = time.monotonic() + SERVER_STOP_TIMEOUT
-    uncertain: list[int] = []
-    while True:
-        table = _process_table()
-        if table is not None:
-            own, uncertain = _children(server, table)
-            tracked.update({pid: info.created for pid, info in own.items()})
-            alive = sorted(pid for pid, created in tracked.items()
-                           if pid != server.proc.pid and pid in table and table[pid].created == created)
-            for pid in alive:                                          # 직전에 PID·생성 시각을 다시 확인한 것만
-                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=30)
-        else:
-            alive = sorted(pid for pid in tracked if pid != server.proc.pid and _pid_present(pid))
-        port_open = _port_open(server.port)
-        if not alive and not uncertain and not port_open and server.proc.poll() is not None:
-            break
-        if time.monotonic() >= deadline:
-            problems += [f"남은 워커 PID {alive}"] * bool(alive)
-            problems += [f"식별되지 않은 자식 PID {uncertain} (강제 종료하지 않음)"] * bool(uncertain)
-            problems += [f"포트 {server.port} 열림"] * port_open
-            if table is None and alive:
-                problems.append("프로세스 식별 정보(CIM)를 얻지 못해 강제 종료하지 않음")
-            break
-        time.sleep(0.5)
-    return problems
 
 
 @contextmanager
