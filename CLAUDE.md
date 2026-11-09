@@ -42,6 +42,7 @@ FastApi_Todos/
 ├── .env.dev.example            # (7.0.0) 개발·테스트 DB 접속 예시 (비밀번호 없음, 비밀번호는 pgpass.conf)
 ├── docker-compose.yml
 ├── docker-compose.dev.yml      # (7.0.0, 선택) Docker 개발용 PostgreSQL만, 운영과 분리. 기본은 로컬 PostgreSQL 18.6
+├── docker-compose.v7-demo.yml  # (7.0.0, 2026-11-10) 학교 서버 SSH 터널 제한 시연 전용(프로젝트 fastapi-v7-demo, 앱 127.0.0.1:8007, DB 포트 비공개, 전용 볼륨). 외부 공개 금지 — README "7.0.0 학교 서버 제한 시연", V7_PLAN.md §P13·R-37
 ├── scripts/load-data.sh        # 백업 → 데이터 볼륨 이전·복구 (README "배포와 데이터 관리")
 ├── scripts/dev-postgres-init/  # (7.0.0, 선택) Docker 개발 DB 첫 기동 때 테스트 DB 생성 SQL
 └── fastapi-app/

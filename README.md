@@ -60,6 +60,30 @@ FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 할 일과 작업 템�
 > - 7.0.0 앱은 시작할 때 `APP_ENV`(`development`·`test`·`production`)와 시도 제한 비밀키 `AUTH_FAILURE_KEY`를 확인합니다(`V7_SPEC.md` §28.1). 코드를 읽어 보면 `APP_ENV`가 `development`·`test`로 명시되지 않고 `AUTH_FAILURE_KEY`도 없으면 시작을 거부하므로, 지금의 compose 설정이나 `uvicorn main:app --reload`만으로는 시작되지 않을 것으로 판단합니다. **코드 분석에 따른 판단이며 실행해서 확인하지는 않았습니다.**
 > - 인증 경로(`/auth/*`)는 `DATABASE_URL`의 PostgreSQL이 필요합니다. 할 일·템플릿 경로는 JSON 파일만 씁니다.
 > - 7.0.0 로컬 시연 실행 명령은 아직 이 저장소에서 확인하지 않아 여기에 적지 않습니다. 개발·테스트 DB 접속 형식은 [`.env.dev.example`](.env.dev.example)을 참고하세요(비밀번호는 넣지 않고 `pgpass.conf`에 둡니다).
+> - 유일한 예외는 아래 [7.0.0 학교 서버 제한 시연](#700-학교-서버-제한-시연-ssh-터널-전용)입니다. 이 구성도 아직 서버에서 실행해 확인하지 않았습니다.
+
+### 7.0.0 학교 서버 제한 시연 (SSH 터널 전용)
+**예외 범위**: 7.0.0은 운영에 배포하지 않습니다. 다만 학교 개인 서버에서 **SSH 터널을 통한 제한적 시연**만 예외로 둡니다(`V7_PLAN.md` §P13 "학교 서버 제한 시연", R-37).
+
+**외부 공개 금지 조건** — 하나라도 어기면 시연하지 않습니다.
+- 앱은 서버의 `127.0.0.1:8007`에만 바인딩합니다. `0.0.0.0`·외부 IP·다른 포트로 바꾸지 않고, 리버스 프록시·방화벽 개방·포트 포워딩으로 외부에 노출하지 않습니다. 데이터 API 15개에 인증이 없기 때문입니다(위 "보안 한계").
+- 브라우저는 SSH 터널(예: MobaXterm 로컬 포워딩 `localhost:8007 → 127.0.0.1:8007`)로만 접속합니다.
+- PostgreSQL은 호스트 포트를 공개하지 않습니다(Compose 내부 네트워크만).
+- 운영 v6.0.0(`docker-compose.yml`, 프로젝트 `fastapi_todos`, 컨테이너 `FastApi-app`, 포트 5001, 볼륨 `fastapi_todos_fastapi-data`)과 서버의 다른 프로젝트(PostgreSQL 5432~5434 등)는 쓰지도 바꾸지도 않습니다.
+- 시연 데이터는 합성 값만 씁니다. 실제 개인정보·운영 데이터를 넣지 않습니다.
+
+**구성** — [`docker-compose.v7-demo.yml`](docker-compose.v7-demo.yml), 프로젝트 `fastapi-v7-demo`
+| 서비스 | 내용 |
+|---|---|
+| `db` | `postgres:18.6-trixie`, 볼륨 `fastapi_v7_demo_pg-data`, 호스트 포트 없음. 첫 기동 때 비슈퍼유저 `todo_migrator`(스키마 객체 소유)·`todo_app`(표 읽기·쓰기만)을 만든다 |
+| `migrate` | 일회성 단계(`todo_migrator`): `alembic upgrade head` → `todo_app`의 `alembic_version` 권한 회수 → 권한 검증(업무 표 7개·시퀀스 권한 유지 확인). `up`에 포함되지 않고 앱 실행 전에 따로 실행한다. **실패하면(종료 코드 0이 아님) 앱을 띄우지 않는다** |
+| `app` | v7 이미지, `127.0.0.1:8007:8000`, `todo_app`으로 접속, 할 일·템플릿은 새 볼륨 `fastapi_v7_demo_app-data`(빈 목록에서 시작) |
+
+- 네트워크는 `fastapi_v7_demo_backend`(내부 전용)와 `fastapi_v7_demo_frontend`(앱 포트 공개용)입니다.
+- 비밀번호·키는 저장소에 넣지 않고 서버의 시연 폴더 `.env`(권한 600, Git 제외)에 둡니다. 필요한 변수와 실행 순서는 compose 파일 머리 주석에 있습니다. `docker compose config`는 `.env` 값을 채워 출력하므로 `--no-interpolate`로만 확인합니다.
+- 앱 설정은 `APP_ENV=development`, `COOKIE_SECURE=false`(터널이 HTTP라서), 명시적 `AUTH_FAILURE_KEY`(공개 대체 키 사용 안 함), 워커 1개, `--no-proxy-headers`입니다.
+- 중단은 `docker compose -f docker-compose.v7-demo.yml stop`(데이터 유지)입니다. `down -v`·`docker volume prune`은 쓰지 않습니다. 볼륨 삭제는 별도 승인 후 이름을 지정해서만 합니다.
+- **검증 상태**: 이 구성과 Dockerfile 수정은 아직 이미지 빌드·실행·마이그레이션으로 확인하지 않았습니다. 이미지는 Python 3.13이고 로컬 테스트는 Python 3.14 기준입니다(`V7_PLAN.md` R-20). 시도 제한은 모든 요청이 Docker 게이트웨이 IP 하나로 보여 사실상 전역 제한이 됩니다(R-12).
 
 ### Docker
 ```bash
