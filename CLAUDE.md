@@ -40,11 +40,14 @@ FastApi_Todos/
 ├── V7_SPEC.md, V7_PLAN.md      # (7.0.0) 명세·구현 계획
 ├── .gitignore                  # (7.0.0) 실제 환경파일(.env, .env.*)·DB 덤프 제외, .env.dev.example만 추적
 ├── .env.dev.example            # (7.0.0) 개발·테스트 DB 접속 예시 (비밀번호 없음, 비밀번호는 pgpass.conf)
-├── docker-compose.yml
+├── docker-compose.yml          # (과제, 2026-11) Jenkins + JMeter 과제 스택(프로젝트 fastapi-jmeter, 앱 fastapi-jmeter-app 5002:8000) + 기존 모니터링 서비스(main 그대로) — 아래 "과제용 배포 스택"
 ├── docker-compose.dev.yml      # (7.0.0, 선택) Docker 개발용 PostgreSQL만, 운영과 분리. 기본은 로컬 PostgreSQL 18.6
 ├── docker-compose.v7-demo.yml  # (7.0.0, 2026-11-10) 학교 서버 SSH 터널 제한 시연 전용(프로젝트 fastapi-v7-demo, 앱 127.0.0.1:8007, DB 포트 비공개, 전용 볼륨). 외부 공개 금지 — README "7.0.0 학교 서버 제한 시연", V7_PLAN.md §P13·R-37
 ├── scripts/load-data.sh        # 백업 → 데이터 볼륨 이전·복구 (README "배포와 데이터 관리")
 ├── scripts/dev-postgres-init/  # (7.0.0, 선택) Docker 개발 DB 첫 기동 때 테스트 DB 생성 SQL
+├── ci/test-runner.Dockerfile   # (과제 CI) pytest 실행 이미지 — Python 3.13 + Playwright 1.65.0, Jenkins 호스트에서만 빌드(push 안 함)
+├── grafana-jmeter/provisioning/ # (과제) 과제 전용 Grafana 의 InfluxDB 데이터 소스
+├── jmeter/                     # (과제) JMeter 이미지(Dockerfile)·계획(fastapi_test_plan.jmx)·결과 판정(check_results.py). 결과는 jmeter/out/ (Git 제외)
 └── fastapi-app/
     ├── main.py                 # API + 모델 + 저장 로직 (7.0.0: 라우트·Pydantic 모델·순수 로직). (Phase 2-E) `/auth/*` 4개·시작 가드(lifespan)·`require_user`·`require_csrf`·인증 경로 422 처리기, (3-1) 요청 Session 의존성 `RequestDbDep`(응답 전 commit, DB 오류 고정 500·R-27)·`require_user`가 같은 Session 사용 — v6 데이터 경로는 JSON·인증 없음(v7.0.0 최종, 전환은 8.0.0 예정)
     ├── db.py                   # (7.0.0 Phase 1·2-A·2-C·2-D) 엔진·ORM 7개(2-A `auth_failures`)·세션·테스트 DB 보호·삭제 전 스키마 게이트(R-19)·downgrade 보호, (2-C) 로그인 세션 저장·조회·삭제·만료 정리, (2-D) 시도 제한 잠금·검사·선기록·자기 id 삭제·정리, (2-E) 가입·rehash 헬퍼(`username_exists`·SAVEPOINT `create_user`·`update_password_hash_if_unchanged`·`is_lock_timeout`) (모두 commit 은 호출자), (3-1) 사용자 데이터 헬퍼(`lock_user`·잠금 확인, 할 일·하위 할 일·템플릿 소유자 조건 조회·쓰기, soft delete·100건 정리·30초 복구·`position`) — 데이터 경로 연결은 8.0.0 예정(v7.0.0에서는 구현됨·미연결)
@@ -354,6 +357,25 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 데이터 이전·백업·복구 절차는 README의 "배포와 데이터 관리"를 따른다. 이전한 데이터를 검증하기 전에는 이전 컨테이너와 백업을 지우지 않는다.
 - Prometheus는 `fastapi-app:8000`(서비스명·내부 포트)으로 수집하므로 외부 포트와 무관하다.
 
+### 과제용 배포 스택 — Jenkins + JMeter (2026-11, 제한적 예외)
+이 절은 Jenkins + JMeter 과제에만 적용하는 예외다. 위 "배포 설정" 표와 `V7_PLAN.md` R-34·R-35의 다른 규칙은 그대로다.
+위 표는 v6 운영 명세의 기록이다. 과제 적용 뒤 `docker-compose.yml`의 `fastapi-app` 서비스는 아래 과제 앱으로 바뀌었고, v6 컨테이너 `FastApi-app`·볼륨 `fastapi_todos_fastapi-data`는 서버에 그대로 남아 있지만 이 파일은 더 이상 참조하지 않는다.
+
+| 항목 | 값 |
+|---|---|
+| Compose 파일 / 프로젝트 | `docker-compose.yml` / `fastapi-jmeter` (Jenkins 는 항상 `-p fastapi-jmeter`, 서비스 이름 지정) |
+| 앱 컨테이너 / 포트 | `fastapi-jmeter-app` / `5002:8000` (고정) |
+| 이미지 | Jenkins 가 빌드·push 한 `eunohchoi/fastapi-app:<빌드번호>` (`APP_IMAGE`, `up --no-build`) |
+| 과제 전용 서비스 | `fastapi-jmeter-db`(PostgreSQL 18, 호스트 포트 없음), `migrate`(일회성), `fastapi-jmeter-influxdb`(호스트 포트 없음), `fastapi-jmeter-grafana`(`127.0.0.1:3001`), `jmeter`(일회성) |
+| 볼륨 / 네트워크 | `fastapi_jmeter_*` 만 사용 |
+| 비밀값 | Jenkins Credentials(`jm-*` 5개, `dockerhub-credentials`)만. 저장소·로그에 넣지 않는다 |
+
+- 영향 금지: 5001 의 v7 공개 시연(프로젝트 `fastapi-v7-demo`, `fastapi_v7_demo_*`), 과거 컨테이너 `FastApi-app`·볼륨 `fastapi_todos_fastapi-data`, 서버 PostgreSQL 5432~5434, 기존 sonarqube·prometheus·grafana·node-exporter 컨테이너.
+- `docker-compose.yml` 의 기존 모니터링 서비스 정의(sonarqube·prometheus·grafana·node-exporter)와 그 볼륨 선언은 main 과 같게 유지한다. 서비스 이름 없이 `docker compose up -d` 를 실행하지 않는다.
+- 이 앱은 v7.0.0 코드라 데이터 API 15개가 인증 없이 열려 있다(R-34). 5002 에는 합성 데이터만 두고, 가입은 기본으로 막는다(`REGISTRATION_ENABLED=false`).
+- JMeter 는 5002 의 과제 앱만 대상으로 한다. 만든 할 일은 `fastapi_jmeter_app-data` 에만 쌓인다.
+- 과제가 끝나면 이 스택을 내리는 절차는 별도 승인으로 정한다(볼륨 삭제 포함).
+
 ### 배포 설정 변경 예정 (8.0.0 예정 — 7.0.0은 운영 배포하지 않음)
 - (2026-11-09) v7.0.0은 운영에 배포·공개하지 않고 main 병합·push·Jenkins 배포도 하지 않는다 — 데이터 API 15개가 인증 없이 열려 있다(`V7_PLAN.md` R-34·R-35). 아래 변경안은 8.0.0에서 다룬다.
 - 위 표가 **현재 운영 명세**다. v7의 compose·Jenkins 변경안(postgres 서비스, `DATABASE_URL`·`APP_ENV`·`COOKIE_SECURE`·`REGISTRATION_ENABLED`, `alembic upgrade head` 단계)은 `V7_PLAN.md` §P10에 있고, Phase 6 이후 별도 승인을 받아 적용한다.
@@ -389,6 +411,7 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
   - API 테스트는 `tmp_path` + monkeypatch, UI 테스트는 `conftest.py`가 임시 파일로 띄운 uvicorn을 쓴다.
   - `conftest.py`가 세션 종료 시 실제 `todo.json`, `task_templates.json`의 해시(없으면 없는 상태)가 그대로인지 확인한다.
   - (7.0.0) DB 테스트는 `TEST_DATABASE_URL`의 PostgreSQL 테스트 DB에서만 돈다. 고정 대상 `todo_test_user@127.0.0.1:5433/todo_test`(18.x)가 아니면 테스트 세션을 시작하지 않고, 접속 후 실제 서버와 스키마 내용(R-19 게이트: 알려진 리비전 상태·소유자·연결 수 1)을 확인한 뒤에만 스키마를 지운다. 게이트가 있어도 `todo_test` 실행은 실행마다 승인받는다. 운영·개발 DB와 PostgreSQL 16(5432)에 연결하지 않는다. 대상 변경은 사용자 승인 사항이다. (3-2) `tests/test_ui.py`도 이 테스트 DB를 쓰므로 DB 없는 회귀에서는 뺀다(`V7_SPEC.md` §33).
+  - (과제 CI 예외, 2026-11) Jenkins 의 Test 단계는 빌드마다 새로 만드는 PostgreSQL 18 컨테이너(호스트 포트 없음, tmpfs, 빌드 후 삭제)를 쓰고, 테스트 컨테이너가 그 네트워크 이름공간을 공유해 `127.0.0.1:5433/todo_test`(`todo_test_user`, 비슈퍼유저)로 접속한다. 고정 대상·서버 확인·R-19 게이트는 그대로 적용되며 바꾸지 않는다. 이 임시 인스턴스는 개발 PC 의 `todo_test` 와 다른 DB 라서 "실행마다 승인" 규칙의 예외로 둔다 — 단, 이 예외는 위 Jenkins 작업에만 적용되고 개발 PC·서버의 다른 PostgreSQL(서버의 5432~5434 포함)에는 적용하지 않는다. 비밀번호는 빌드마다 무작위로 만들고 `.pgpass` 로만 전달한다(URL 에 넣지 않는다).
   - (7.0.0) 마이그레이션 왕복(downgrade)은 테스트 DB에서 pytest로만 한다. 다른 DB의 downgrade는 `V7_PLAN.md` §P1.2 승인 절차를 따른다. 비밀번호는 `pgpass.conf`에만 두고 읽거나 출력하지 않는다.
 - 배포 서버 테스트(`test_integration.py`)는 `integration` 마커로 분리하고 기본 실행에서 제외한다.
   - (7.0.0) 외부 서버에 POST·DELETE를 보내므로 `pytest -m integration`을 포함해 **명시적 승인 없이 실행하지 않는다.**

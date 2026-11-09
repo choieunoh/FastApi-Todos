@@ -1,0 +1,14 @@
+# 과제 전용 Grafana(fastapi-jmeter-grafana)의 InfluxDB 데이터 소스 — 첫 기동 때 자동 등록된다.
+# 대시보드는 Grafana UI 에서 ID 5496("Apache JMeter Dashboard using Core InfluxdbBackendListenerClient")을
+# 가져오기(Import) 하고 이 데이터 소스를 고른다.
+apiVersion: 1
+datasources:
+  - name: InfluxDB-JMeter
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086          # 같은 compose 네트워크(fastapi_jmeter_loadtest) 안의 이름
+    isDefault: true
+    editable: false
+    jsonData:
+      dbName: jmeter
+      httpMode: GET

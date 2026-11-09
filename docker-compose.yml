@@ -1,21 +1,143 @@
+# 과제(Jenkins + JMeter) 배포 스택 — Jenkins 는 항상 `docker compose -p fastapi-jmeter` 로 실행한다. 앱 호스트 포트 5002.
+# - 과제 서비스(fastapi-app·jm-db·migrate·influxdb·jmeter-grafana·jmeter)는 컨테이너·볼륨 이름이 fastapi-jmeter / fastapi_jmeter_ 로 시작한다.
+#   v7 공개 시연(프로젝트 fastapi-v7-demo, 5001), 과거 v6 흔적(FastApi-app, fastapi_todos_fastapi-data)은 참조하지 않는다.
+# - 아래 sonarqube·prometheus·grafana·node-exporter 정의는 main 의 이전 파일 그대로다(과제 배포와 무관). Jenkins 는 서비스 이름을
+#   지정해서만 up 하므로 이 서비스들은 만들거나 다시 만들지 않는다. 손으로 `docker compose up -d`(서비스 이름 없이)를 실행하지 않는다.
+# - 비밀값은 이 파일에 넣지 않는다. Jenkins Credentials 가 환경변수로 넣는다(JM_*).
+#   `docker compose config` 는 값을 채워 출력하므로 확인은 `config --no-interpolate` 로만 한다.
+
+x-app-image: &app-image
+  image: ${APP_IMAGE:-eunohchoi/fastapi-app:latest}   # Jenkins 가 eunohchoi/fastapi-app:<빌드번호> 로 지정
+  build:
+    context: ./fastapi-app
+    dockerfile: Dockerfile
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+
 services:
+  # ---------- 과제용 FastAPI (v7 코드) ----------
   fastapi-app:
-    build:
-      context: ./fastapi-app      # Dockerfile이 위치한 디렉토리 경로
-      dockerfile: Dockerfile      # Dockerfile 이름 (생략 가능, 기본값은 'Dockerfile')
-    container_name: FastApi-app
-    ports:
-      - "5001:8000"
-    restart: unless-stopped       # 서버 재부팅·오류 시 자동 재시작
-    environment:                  # main.py 가 읽는 데이터 경로 (아래 볼륨 안)
-      - TODO_FILE=/app/data/todo.json
-      - TEMPLATE_FILE=/app/data/task_templates.json
-    volumes:
-      - fastapi-data:/app/data    # 할 일·템플릿 보존 (컨테이너를 다시 만들어도 유지)
-    security_opt:
-      - no-new-privileges:true    # 컨테이너 안에서 권한 상승 차단
+    <<: [*app-image, *hardening]
+    container_name: fastapi-jmeter-app            # 기존 FastApi-app 과 다른 이름
+    restart: unless-stopped
     cap_drop:
-      - ALL                       # 불필요한 커널 권한 모두 제거
+      - ALL
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-proxy-headers"]
+    environment:
+      APP_ENV: development                        # HTTP 라 production(COOKIE_SECURE=true 필수)을 쓰지 않는다
+      COOKIE_SECURE: "false"
+      REGISTRATION_ENABLED: ${JM_REGISTRATION_ENABLED:-false}   # 공개 포트라 기본은 가입 막음
+      AUTH_FAILURE_KEY: ${JM_AUTH_FAILURE_KEY:?JM_AUTH_FAILURE_KEY 가 필요합니다 (Jenkins Credentials)}
+      # URL 에는 비밀번호를 넣지 않는다 — libpq 가 PGPASSWORD 를 읽는다 (v7 시연 구성과 같은 방식)
+      DATABASE_URL: postgresql://todo_app@jm-db:5432/todo_jmeter
+      PGPASSWORD: ${JM_APP_DB_PASSWORD:?JM_APP_DB_PASSWORD 가 필요합니다}
+      TODO_FILE: /app/data/todo.json              # 과제 전용 볼륨 — JMeter 가 만든 할 일은 여기에만 쌓인다
+      TEMPLATE_FILE: /app/data/task_templates.json
+    ports:
+      - "5002:8000"                               # 과제 최종 배포·부하 테스트 포트 (고정)
+    volumes:
+      - jm-app-data:/app/data
+    networks:
+      - jm-backend
+      - jm-net
+    depends_on:
+      jm-db:
+        condition: service_healthy
+
+  # ---------- 과제 전용 PostgreSQL 18 (users·sessions·auth_failures) ----------
+  jm-db:
+    image: postgres:18.6-trixie
+    container_name: fastapi-jmeter-db
+    restart: unless-stopped
+    <<: *hardening
+    environment:
+      POSTGRES_USER: jm_admin                     # 초기화 전용 슈퍼유저. 앱·마이그레이션은 쓰지 않는다
+      POSTGRES_PASSWORD: ${JM_PG_ADMIN_PASSWORD:?JM_PG_ADMIN_PASSWORD 가 필요합니다}
+      POSTGRES_DB: todo_jmeter
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+      MIGRATOR_DB_PASSWORD: ${JM_MIGRATOR_DB_PASSWORD:?JM_MIGRATOR_DB_PASSWORD 가 필요합니다}
+      APP_DB_PASSWORD: ${JM_APP_DB_PASSWORD:?JM_APP_DB_PASSWORD 가 필요합니다}
+    configs:
+      - source: jm-pg-init-roles
+        target: /docker-entrypoint-initdb.d/10-roles.sh
+    volumes:
+      - jm-pg-data:/var/lib/postgresql
+    networks:
+      - jm-backend
+    # ports 없음 — 호스트·외부에서 접속할 수 없다 (서버의 PostgreSQL 5432~5434 와 무관)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U jm_admin -d todo_jmeter"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # 일회성 마이그레이션 — `run --rm --no-deps migrate` 로만 실행 (profile 때문에 up 에 포함되지 않음)
+  migrate:
+    <<: [*app-image, *hardening]
+    profiles: ["migrate"]
+    restart: "no"
+    cap_drop:
+      - ALL
+    command: ["sh", "-c", "alembic upgrade head && python /opt/jm/post_migrate_grants.py"]
+    configs:
+      - source: jm-post-migrate-grants
+        target: /opt/jm/post_migrate_grants.py
+    environment:
+      DATABASE_URL: postgresql://todo_migrator@jm-db:5432/todo_jmeter
+      PGPASSWORD: ${JM_MIGRATOR_DB_PASSWORD:?JM_MIGRATOR_DB_PASSWORD 가 필요합니다}
+    networks:
+      - jm-backend
+
+  # ---------- 과제 전용 성능 측정 저장소 (JMeter Backend Listener → InfluxDB 1.x) ----------
+  influxdb:
+    image: influxdb:1.8.10
+    container_name: fastapi-jmeter-influxdb
+    restart: unless-stopped
+    <<: *hardening
+    environment:
+      INFLUXDB_DB: jmeter                         # 첫 기동 때 DB 생성
+      INFLUXDB_REPORTING_DISABLED: "true"
+      INFLUXDB_HTTP_LOG_ENABLED: "false"
+    volumes:
+      - jm-influx-data:/var/lib/influxdb
+    networks:
+      - jm-net
+    # ports 없음 — JMeter·Grafana 는 네트워크 안의 이름(influxdb:8086)으로 접속한다
+
+  # ---------- 과제 전용 Grafana (기존 grafana 컨테이너·3000 포트와 분리) ----------
+  jmeter-grafana:
+    image: grafana/grafana:13.3.0
+    container_name: fastapi-jmeter-grafana
+    restart: unless-stopped
+    <<: *hardening
+    ports:
+      - "127.0.0.1:3001:3000"                     # 서버 자신에게만. 브라우저는 SSH 터널(ssh -L 3001:127.0.0.1:3001)
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${JM_GRAFANA_ADMIN_PASSWORD:?JM_GRAFANA_ADMIN_PASSWORD 가 필요합니다}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+    volumes:
+      - jm-grafana-data:/var/lib/grafana
+      - ./grafana-jmeter/provisioning:/etc/grafana/provisioning:ro   # InfluxDB 데이터 소스 자동 등록
+    networks:
+      - jm-net
+
+  # ---------- JMeter 실행기 (Jenkins 가 `run --rm` 으로만 실행, 대상은 호스트의 5002) ----------
+  jmeter:
+    build:
+      context: ./jmeter
+      dockerfile: Dockerfile
+    image: fastapi-jmeter-runner:5.6.3
+    profiles: ["loadtest"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"       # 호스트에 공개된 5002 로 접속 (실제 배포 포트를 측정)
+    volumes:
+      - ./jmeter:/jmeter
+    networks:
+      - jm-net                              # influxdb:8086 접속용
 
   sonarqube:
     image: sonarqube:26.9.0.129388-community
@@ -87,6 +209,91 @@ volumes:                                        # ← 최상위(0칸)로 이동
   sonarqube_temp:
   prometheus-data:                              # ← #7 추가
   grafana-data:                                 # ← #7 추가
-  fastapi-data:
-    name: fastapi_todos_fastapi-data            # 이름 고정: Compose 프로젝트 이름(Jenkins 작업 폴더 등)이 달라도 같은 데이터를 쓴다
+  jm-app-data:
+    name: fastapi_jmeter_app-data                 # 과제 전용 할 일·템플릿 JSON (운영·시연 볼륨과 분리)
+  jm-pg-data:
+    name: fastapi_jmeter_pg-data
+  jm-influx-data:
+    name: fastapi_jmeter_influx-data
+  jm-grafana-data:
+    name: fastapi_jmeter_grafana-data
 
+networks:                                         # 과제 서비스 전용 (모니터링 서비스는 이전처럼 기본 네트워크)
+  jm-backend:
+    name: fastapi_jmeter_backend
+    internal: true                                # jm-db·migrate·fastapi-app 만. 외부로 나가는 경로 없음
+  jm-net:
+    name: fastapi_jmeter_net
+    driver: bridge
+
+configs:
+  # 첫 기동(빈 데이터 폴더) 때 한 번만 실행. 비밀번호는 환경변수에서 읽고 출력하지 않는다 (v7 시연 구성과 같은 역할 설계)
+  jm-pg-init-roles:
+    content: |
+      #!/bin/sh
+      set -eu
+      if [ $${#MIGRATOR_DB_PASSWORD} -lt 24 ] || [ $${#APP_DB_PASSWORD} -lt 24 ]; then
+        echo "MIGRATOR_DB_PASSWORD·APP_DB_PASSWORD 는 24자 이상이어야 합니다" >&2; exit 1
+      fi
+      psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" --dbname "$$POSTGRES_DB" \
+        -v migrator_pw="$$MIGRATOR_DB_PASSWORD" -v app_pw="$$APP_DB_PASSWORD" <<'EOSQL'
+      CREATE ROLE todo_migrator LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD :'migrator_pw';
+      CREATE ROLE todo_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD :'app_pw';
+      REVOKE ALL ON DATABASE todo_jmeter FROM PUBLIC;
+      GRANT CONNECT ON DATABASE todo_jmeter TO todo_migrator, todo_app;
+      REVOKE ALL ON SCHEMA public FROM PUBLIC;
+      GRANT USAGE, CREATE ON SCHEMA public TO todo_migrator;
+      GRANT USAGE ON SCHEMA public TO todo_app;
+      ALTER DEFAULT PRIVILEGES FOR ROLE todo_migrator IN SCHEMA public
+        GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO todo_app;
+      ALTER DEFAULT PRIVILEGES FOR ROLE todo_migrator IN SCHEMA public
+        GRANT USAGE, SELECT ON SEQUENCES TO todo_app;
+      EOSQL
+
+  # migrate 의 마지막 단계 — docker-compose.v7-demo.yml 의 post-migrate-grants 와 같은 내용 (DB 이름과 무관)
+  jm-post-migrate-grants:
+    content: |
+      import os
+      import sys
+
+      import psycopg
+
+      APP = "todo_app"
+      MIGRATOR = "todo_migrator"
+      BUSINESS = ("users", "sessions", "auth_failures", "todos", "subtasks", "task_templates", "data_migrations")
+      DML = ("SELECT", "INSERT", "UPDATE", "DELETE")
+      ALL_TABLE_PRIVS = "SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN"
+
+
+      def fail(message):
+          print("POST_MIGRATE_FAIL: " + message, file=sys.stderr)
+          sys.exit(1)
+
+
+      with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+          if conn.execute("SELECT current_user").fetchone()[0] != MIGRATOR:
+              fail("todo_migrator 로 접속하지 않았습니다")
+          owner = conn.execute(
+              "SELECT tableowner FROM pg_tables WHERE schemaname = 'public' AND tablename = 'alembic_version'").fetchone()
+          if owner is None or owner[0] != MIGRATOR:
+              fail("alembic_version 이 없거나 소유자가 todo_migrator 가 아닙니다")
+          with conn.transaction():
+              conn.execute("REVOKE ALL ON TABLE public.alembic_version FROM todo_app")
+          if conn.execute("SELECT has_table_privilege(%s, 'public.alembic_version', %s)", (APP, ALL_TABLE_PRIVS)).fetchone()[0]:
+              fail("todo_app 에 alembic_version 권한이 남아 있습니다")
+          if not conn.execute("SELECT has_table_privilege(%s, 'public.alembic_version', 'SELECT,INSERT,UPDATE,DELETE')",
+                              (MIGRATOR,)).fetchone()[0]:
+              fail("todo_migrator 의 alembic_version 권한이 없습니다")
+          for table in BUSINESS:
+              for priv in DML:
+                  if not conn.execute("SELECT has_table_privilege(%s, %s, %s)", (APP, "public." + table, priv)).fetchone()[0]:
+                      fail("todo_app 의 " + table + " " + priv + " 권한이 없습니다")
+          seqs = [r[0] for r in conn.execute(
+              "SELECT c.oid::regclass::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+              "WHERE n.nspname = 'public' AND c.relkind = 'S'").fetchall()]
+          for seq in seqs:
+              if not conn.execute("SELECT has_sequence_privilege(%s, %s, 'USAGE')", (APP, seq)).fetchone()[0]:
+                  fail("todo_app 의 시퀀스 USAGE 권한이 없습니다")
+          if conn.execute("SELECT rolsuper FROM pg_roles WHERE rolname = %s", (APP,)).fetchone()[0]:
+              fail("todo_app 이 슈퍼유저입니다")
+      print("POST_MIGRATE_OK")

@@ -23,3 +23,6 @@ backups/
 !.env.dev.example
 *.dump
 *.sql.gz
+
+# (과제) JMeter 결과·리포트 (빌드마다 생성)
+jmeter/out/

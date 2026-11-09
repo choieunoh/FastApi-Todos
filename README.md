@@ -86,6 +86,8 @@ FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 할 일과 작업 템�
 - **검증 상태**: 이 구성과 Dockerfile 수정은 아직 이미지 빌드·실행·마이그레이션으로 확인하지 않았습니다. 이미지는 Python 3.13이고 로컬 테스트는 Python 3.14 기준입니다(`V7_PLAN.md` R-20). 시도 제한은 모든 요청이 Docker 게이트웨이 IP 하나로 보여 사실상 전역 제한이 됩니다(R-12).
 
 ### Docker
+> (2026-11 과제 적용 뒤) `docker-compose.yml`의 `fastapi-app`은 과제용 5002 스택(`fastapi-jmeter-app`)입니다 — 아래 [Jenkins + JMeter 과제 배포 (5002)](#jenkins--jmeter-과제-배포-5002). 이 절의 아래 내용(5001, `FastApi-app`)은 그 이전 compose 파일 기준의 기록입니다.
+
 ```bash
 docker compose up --build fastapi-app
 ```
@@ -138,6 +140,16 @@ CSV 컬럼은 `id,title,description,completed,priority,due_date,tags,favorite,re
 
 - `Origin` 불일치·로그아웃 CSRF 오류는 403, 로그인·가입 시도가 많으면 429(`Retry-After`), 해시 처리 혼잡·잠금 대기 초과는 503입니다.
 - **위 API 표의 데이터 경로 15개는 6.0.0과 같이 인증·CSRF·사용자별 격리 없이 동작합니다.** 로그인 여부와 상관없이 모든 호출자가 같은 JSON 데이터를 씁니다. 인증·격리는 8.0.0 예정입니다.
+
+## Jenkins + JMeter 과제 배포 (5002)
+> 과제 전용 예외입니다. v7 공개 시연(5001)과 아래 "배포와 데이터 관리"의 v6 기록은 바뀌지 않습니다.
+
+- Jenkins 파이프라인: Checkout → 의존성 점검 → pytest(빌드 전용 PostgreSQL 18) → 이미지 빌드 → Docker Hub push(`eunohchoi/fastapi-app:<빌드번호>`) → `docker compose -p fastapi-jmeter` 배포(5002) → JMeter 부하 테스트.
+- 앱: `http://<서버>:5002` (컨테이너 `fastapi-jmeter-app`). 데이터는 `fastapi_jmeter_app-data` 볼륨의 합성 데이터뿐입니다.
+- JMeter 결과: Jenkins 빌드의 "JMeter HTML Report"와 아티팩트(`results.jtl`, `jmeter.log`). 샘플 실패·샘플 수 불일치·InfluxDB 미기록이면 빌드가 실패합니다.
+- 성능 그래프: 과제 전용 Grafana `http://127.0.0.1:3001`(SSH 터널 `ssh -L 3001:127.0.0.1:3001 <서버>`), 데이터 소스 `InfluxDB-JMeter`, 대시보드 ID 5496 가져오기.
+- pytest 의 PostgreSQL 테스트는 빌드마다 만드는 임시 DB 에서만 돕니다(호스트 포트 없음, 빌드 후 삭제). 테스트 DB 보호 장치는 그대로입니다.
+- 손으로 실행할 때는 반드시 `-p fastapi-jmeter` 와 서비스 이름을 붙입니다. `docker compose config`(값 출력)·`down -v`·`volume prune` 은 쓰지 않습니다.
 
 ## 배포와 데이터 관리
 > **이 절은 6.0.0(JSON) 운영 절차입니다.** 7.0.0은 운영에 배포하지 않습니다. 현재 compose·Jenkins 설정에는 7.0.0 앱이 요구하는 설정(`APP_ENV`, `AUTH_FAILURE_KEY`, PostgreSQL)이 없어서, 이 절차로 7.0.0 코드를 배포하면 앱이 시작되지 않을 것으로 판단합니다(코드 분석, 실행 미확인). 7.0.0용 compose·Jenkins 변경안은 8.0.0에서 다룹니다(`V7_PLAN.md` §P10).
