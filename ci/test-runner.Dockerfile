@@ -12,7 +12,12 @@ ENV PIP_NO_CACHE_DIR=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 COPY requirements.txt requirements-dev.txt /tmp/req/
-RUN pip install -r /tmp/req/requirements-dev.txt "playwright==${PLAYWRIGHT_VERSION}" \
+# Playwright 에 번들된 Node 는 libatomic.so.1 을 동적 링크한다. slim 이미지에는 이 라이브러리가 없어
+# `python -m playwright ...` 가 "error while loading shared libraries" 로 exit 127 이 된다 (Jenkins 첫 빌드 실패 원인).
+# 테스트 실행 중에도 같은 Node 가 쓰이므로 이미지에 설치해 둔다.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libatomic1 \
+ && pip install -r /tmp/req/requirements-dev.txt "playwright==${PLAYWRIGHT_VERSION}" \
  && python -m playwright install --with-deps chromium \
  && chmod -R a+rX /ms-playwright \
  && rm -rf /tmp/req /var/lib/apt/lists/*
