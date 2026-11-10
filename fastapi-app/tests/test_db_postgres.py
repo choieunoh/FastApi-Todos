@@ -202,6 +202,7 @@ def test_stepwise_0002_0001_round_trip(fresh_schema, alembic_cfg):
     command.downgrade(alembic_cfg, "0001")
     tables = set(inspect(fresh_schema).get_table_names())
     assert "auth_failures" not in tables and {"users", "todos", "alembic_version"} <= tables
+    wait_until_single_backend(fresh_schema)                                  # downgrade 직후 — 판정은 아래 게이트
     with fresh_schema.connect() as conn:
         assert db.verify_test_schema(conn) == "0001"
     command.upgrade(alembic_cfg, "head")
