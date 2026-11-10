@@ -46,8 +46,11 @@ FastApi_Todos/
 ├── scripts/load-data.sh        # 백업 → 데이터 볼륨 이전·복구 (README "배포와 데이터 관리")
 ├── scripts/dev-postgres-init/  # (7.0.0, 선택) Docker 개발 DB 첫 기동 때 테스트 DB 생성 SQL
 ├── ci/test-runner.Dockerfile   # (과제 CI) pytest 실행 이미지 — Python 3.13 + Playwright 1.65.0, Jenkins 호스트에서만 빌드(push 안 함)
+├── ci/Jenkinsfile.team3004     # (과제) 팀 서버 3004 검증 Jenkins 파이프라인 사본(작업에 "Pipeline script"로 붙여 넣도록 만든 판 — 작업의 실제 스크립트와 같은지는 미확인, 다르면 작업 쪽이 기준)
+├── deploy/team/docker-compose.team.yml # (과제) 팀 서버 3004 배포 — 이름은 .env 의 TEAM_ACCOUNT 로 만든다(계정명은 저장소에 넣지 않음)
 ├── grafana-jmeter/provisioning/ # (과제) 과제 전용 Grafana 의 InfluxDB 데이터 소스
 ├── jmeter/                     # (과제) JMeter 이미지(Dockerfile)·계획(fastapi_test_plan.jmx)·결과 판정(check_results.py). 결과는 jmeter/out/ (Git 제외)
+│   └── experiments/            # (과제) 읽기 전용 동시 사용자 실험(u1·u3·u5) 계획·실행·분석 스크립트. 결과는 서버 ~/jmeter-exp/ (저장소 밖)
 └── fastapi-app/
     ├── main.py                 # API + 모델 + 저장 로직 (7.0.0: 라우트·Pydantic 모델·순수 로직). (Phase 2-E) `/auth/*` 4개·시작 가드(lifespan)·`require_user`·`require_csrf`·인증 경로 422 처리기, (3-1) 요청 Session 의존성 `RequestDbDep`(응답 전 commit, DB 오류 고정 500·R-27)·`require_user`가 같은 Session 사용 — v6 데이터 경로는 JSON·인증 없음(v7.0.0 최종, 전환은 8.0.0 예정)
     ├── db.py                   # (7.0.0 Phase 1·2-A·2-C·2-D) 엔진·ORM 7개(2-A `auth_failures`)·세션·테스트 DB 보호·삭제 전 스키마 게이트(R-19)·downgrade 보호, (2-C) 로그인 세션 저장·조회·삭제·만료 정리, (2-D) 시도 제한 잠금·검사·선기록·자기 id 삭제·정리, (2-E) 가입·rehash 헬퍼(`username_exists`·SAVEPOINT `create_user`·`update_password_hash_if_unchanged`·`is_lock_timeout`) (모두 commit 은 호출자), (3-1) 사용자 데이터 헬퍼(`lock_user`·잠금 확인, 할 일·하위 할 일·템플릿 소유자 조건 조회·쓰기, soft delete·100건 정리·30초 복구·`position`) — 데이터 경로 연결은 8.0.0 예정(v7.0.0에서는 구현됨·미연결)
@@ -373,8 +376,15 @@ CRUD, 검색(제목·설명), 상태 필터, 기본순/우선순위순/마감일
 - 영향 금지: 5001 의 v7 공개 시연(프로젝트 `fastapi-v7-demo`, `fastapi_v7_demo_*`), 과거 컨테이너 `FastApi-app`·볼륨 `fastapi_todos_fastapi-data`, 서버 PostgreSQL 5432~5434, 기존 sonarqube·prometheus·grafana·node-exporter 컨테이너.
 - `docker-compose.yml` 의 기존 모니터링 서비스 정의(sonarqube·prometheus·grafana·node-exporter)와 그 볼륨 선언은 main 과 같게 유지한다. 서비스 이름 없이 `docker compose up -d` 를 실행하지 않는다.
 - 이 앱은 v7.0.0 코드라 데이터 API 15개가 인증 없이 열려 있다(R-34). 5002 에는 합성 데이터만 두고, 가입은 기본으로 막는다(`REGISTRATION_ENABLED=false`).
-- JMeter 는 5002 의 과제 앱만 대상으로 한다. 만든 할 일은 `fastapi_jmeter_app-data` 에만 쌓인다.
+- 개인 서버 작업의 JMeter 는 5002 의 과제 앱만 대상으로 한다. 만든 할 일은 `fastapi_jmeter_app-data` 에만 쌓인다. 팀 서버 3004 는 아래 절.
 - 과제가 끝나면 이 스택을 내리는 절차는 별도 승인으로 정한다(볼륨 삭제 포함).
+
+#### 팀 서버 3004 (2026-11, 같은 과제 예외)
+- 배포: `deploy/team/docker-compose.team.yml`, 팀 서버 `163.239.77.78:3004`. 프로젝트·컨테이너·네트워크·볼륨 이름은 `.env` 의 `TEAM_ACCOUNT` 로 만들며(`<TEAM_ACCOUNT>-todo3004`, `<TEAM_ACCOUNT>_todo3004_*`), 이미 배포된 이름을 바꾸지 않는다. 계정명·비밀값은 저장소·로그에 넣지 않는다.
+- `TEAM_REGISTRATION_ENABLED`(기본 `false`, 소문자 `true|false`만) → 앱의 `REGISTRATION_ENABLED`. `false` 면 가입이 403 `회원가입이 비활성화되어 있습니다`. 바꾸면 앱만 재생성(`up -d --no-deps app`)하고, 계정을 만든 뒤 `false` 로 되돌린다.
+- Jenkins: `ci/Jenkinsfile.team3004` 는 작업에 붙여 넣도록 만든 스크립트의 사본이다(작업의 실제 스크립트와 동일성 미확인). 팀 서버에는 HTTP GET 확인과 JMeter 30 샘플(`POST /todos` 10건 포함)만 보내고 배포·SSH 는 하지 않는다. Test 단계의 `[PG 진단]` 블록은 R-19 연결 수 2 원인 확인용 임시 코드다.
+- InfluxDB: 개인 서버의 `fastapi-jmeter-influxdb`(`jmeter` DB)를 같이 쓰고 `application` 태그로 구분한다(`fastapi-todos-team3004`, 실험은 `team3004-exp-<STAMP>-uN`). 집계는 `transaction='all' AND statut='all'` 행만.
+- 동시 사용자 실험 `jmeter/experiments/`: 읽기 전용(`GET /`, `GET /todos`), u1·u3·u5 총 900요청, 개인 서버에서 수동 실행. 실험 중에는 Jenkins 빌드를 돌리지 않는다.
 
 ### 배포 설정 변경 예정 (8.0.0 예정 — 7.0.0은 운영 배포하지 않음)
 - (2026-11-09) v7.0.0은 운영에 배포·공개하지 않고 main 병합·push·Jenkins 배포도 하지 않는다 — 데이터 API 15개가 인증 없이 열려 있다(`V7_PLAN.md` R-34·R-35). 아래 변경안은 8.0.0에서 다룬다.

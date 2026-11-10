@@ -151,6 +151,37 @@ CSV 컬럼은 `id,title,description,completed,priority,due_date,tags,favorite,re
 - pytest 의 PostgreSQL 테스트는 빌드마다 만드는 임시 DB 에서만 돕니다(호스트 포트 없음, 빌드 후 삭제). 테스트 DB 보호 장치는 그대로입니다.
 - 손으로 실행할 때는 반드시 `-p fastapi-jmeter` 와 서비스 이름을 붙입니다. `docker compose config`(값 출력)·`down -v`·`volume prune` 은 쓰지 않습니다.
 
+## 팀 서버 배포 (3004)와 JMeter 동시 사용자 실험
+> 과제 전용입니다. 앱은 같은 v7.0.0 코드라 데이터 API 15개가 인증 없이 열려 있습니다(`V7_PLAN.md` R-34) — 합성 데이터만 둡니다.
+
+**팀 서버 배포** — `deploy/team/docker-compose.team.yml`
+- 팀 서버 `163.239.77.78:3004`에 앱·전용 PostgreSQL 18(호스트 포트 없음)·일회성 `migrate`를 올립니다. 이미지는 Jenkins가 push한 `eunohchoi/fastapi-app`을 digest로 고정해 pull만 합니다(서버에서 빌드하지 않음).
+- 같은 폴더의 `.env`(권한 600, 서버에서만 만들고 출력·커밋하지 않음)에 다음을 둡니다.
+  - 비밀값: `TEAM_PG_ADMIN_PASSWORD`, `TEAM_MIGRATOR_DB_PASSWORD`, `TEAM_APP_DB_PASSWORD`, `TEAM_AUTH_FAILURE_KEY`
+  - 설정: `TEAM_ACCOUNT`(필수, 팀 서버 계정명 — 저장소에는 넣지 않음), `TEAM_REGISTRATION_ENABLED`(선택)
+- 프로젝트·컨테이너·네트워크·볼륨 이름은 `<TEAM_ACCOUNT>-todo3004`, `<TEAM_ACCOUNT>_todo3004_*`입니다. 이미 배포된 이름을 바꾸지 않습니다.
+- 순서: `config --quiet` → `up -d db`(healthy 확인) → `run --rm -T migrate` → `up -d --no-deps app`. `down`·`down -v`·`volume prune`과 값이 출력되는 `config`는 쓰지 않습니다.
+
+**회원가입 설정 `TEAM_REGISTRATION_ENABLED`**
+- 기본은 `false`입니다(공개 포트). 이때 가입하면 403 `회원가입이 비활성화되어 있습니다`가 화면에 표시됩니다 — 오류가 아니라 설정입니다.
+- 켜려면 `.env`에 `TEAM_REGISTRATION_ENABLED=true`(소문자만 — 다른 값이면 앱이 시작하지 않음)를 넣고 앱만 다시 만듭니다: `up -d --no-deps app`. 설정은 시작할 때만 읽습니다. DB·할 일 볼륨은 그대로이고 기존 로그인 세션도 유지됩니다.
+- 필요한 계정을 만든 뒤에는 `false`로 되돌리는 것을 권합니다. 가입·로그인은 HTTP로 오가고, 계정이 있어도 할 일 데이터는 모든 사용자가 공유합니다.
+
+**Jenkins 검증 파이프라인** — `ci/Jenkinsfile.team3004`
+- Jenkins 작업("Jenkins Deploy Jmeter")에 "Pipeline script"로 붙여 넣도록 만든 스크립트의 저장소 사본입니다. 작업에 실제로 들어 있는 스크립트(빌드 Replay 화면)와 같은지는 아직 확인하지 않았습니다 — 다르면 작업 쪽이 기준입니다.
+- main 체크아웃 → pip-audit → pytest(빌드 전용 PostgreSQL 18) → 팀 전용 태그로 로컬 이미지 빌드(push 없음) → 팀 서버 HTTP 확인(`/` 200, `/todos` 200, `/auth/me` 401, `Version 7.0.0`) → JMeter 30 샘플(`POST /todos` 10건 포함) → 결과·InfluxDB 확인. 배포·SSH는 하지 않습니다.
+- Test 단계의 `[PG 진단]` 블록(PostgreSQL 로그 옵션, 백엔드 샘플러, `pg-diag/` 아티팩트)은 R-19 연결 수 2 원인 확인용 임시 코드입니다. 판정에는 쓰이지 않으며, 원인이 확인되면 따로 제거합니다.
+
+**InfluxDB·Grafana**
+- JMeter Backend Listener가 개인 서버의 기존 InfluxDB(`fastapi-jmeter-influxdb`, 네트워크 `fastapi_jmeter_net`)에 `http://influxdb:8086/write?db=jmeter`로 기록합니다.
+- 구분 태그: Jenkins 팀 검증은 `application=fastapi-todos-team3004`, 실험은 `team3004-exp-<STAMP>-u1|u3|u5`. 시작·종료는 `events` 측정값의 `build=<RUN_ID>`입니다.
+- 집계는 `transaction='all' AND statut='all'` 행만 씁니다. 그래프는 위 Grafana(3001, SSH 터널)에서 봅니다.
+
+**동시 사용자 실험** — `jmeter/experiments/` (절차는 [jmeter/experiments/README.md](jmeter/experiments/README.md))
+- 동시 사용자 1·3·5명 × 사용자당 50회 × (`GET /`, `GET /todos`) = 총 900요청, 요청마다 400~600ms 대기. **읽기 전용**이라 팀 서버 데이터가 바뀌지 않습니다.
+- 개인 서버에서 손으로 실행합니다(Jenkins와 무관): `--check-only`로 사전 점검 → 실행. 단계마다 판정이 실패하면 다음 단계로 가지 않습니다.
+- 결과는 서버의 `~/jmeter-exp/<STAMP>/`(`summary.md`, 단계별 JTL·HTML 리포트)이며 저장소에 넣지 않습니다.
+
 ## 배포와 데이터 관리
 > **이 절은 6.0.0(JSON) 운영 절차입니다.** 7.0.0은 운영에 배포하지 않습니다. 현재 compose·Jenkins 설정에는 7.0.0 앱이 요구하는 설정(`APP_ENV`, `AUTH_FAILURE_KEY`, PostgreSQL)이 없어서, 이 절차로 7.0.0 코드를 배포하면 앱이 시작되지 않을 것으로 판단합니다(코드 분석, 실행 미확인). 7.0.0용 compose·Jenkins 변경안은 8.0.0에서 다룹니다(`V7_PLAN.md` §P10).
 
@@ -384,5 +415,8 @@ fastapi-app/
 └── tests/                # pytest (API, UI, 통합, DB 없는 인증·스키마, PostgreSQL)
     └── pg_harness.py     # (7.0.0) PostgreSQL 테스트 공용 하네스
 scripts/load-data.sh      # 백업 → 데이터 볼륨 이전·복구 (6.0.0 운영)
+ci/                       # (과제) test-runner.Dockerfile(pytest 이미지), Jenkinsfile.team3004(팀 서버 검증 파이프라인 기록)
+jmeter/                   # (과제) JMeter 이미지·계획·판정, experiments/(읽기 전용 동시 사용자 실험)
+deploy/team/              # (과제) 팀 서버 3004 compose (계정명·비밀값은 서버의 .env)
 ```
 `migrate_json.py`(JSON → PostgreSQL 이전 도구)는 8.0.0 예정이며 아직 없습니다.
