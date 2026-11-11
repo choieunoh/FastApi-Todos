@@ -25,19 +25,18 @@ services:
     cap_drop:
       - ALL
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-proxy-headers"]
+    ports:
+      - "5002:8000"                               # 과제 최종 배포·부하 테스트 포트 (고정)
     environment:
-      APP_ENV: development                        # HTTP 라 production(COOKIE_SECURE=true 필수)을 쓰지 않는다
-      COOKIE_SECURE: "false"
+      PYTHONUNBUFFERED: "1"
+      APP_ENV: "development"                        # HTTP 라 production(COOKIE_SECURE=true 필수)을 쓰지 않는다
+      COOKIE_SECURE: "False"
       REGISTRATION_ENABLED: ${JM_REGISTRATION_ENABLED:-false}   # 공개 포트라 기본은 가입 막음
       AUTH_FAILURE_KEY: ${JM_AUTH_FAILURE_KEY:?JM_AUTH_FAILURE_KEY 가 필요합니다 (Jenkins Credentials)}
-      # URL 에는 비밀번호를 넣지 않는다 — libpq 가 PGPASSWORD 를 읽는다 (v7 시연 구성과 같은 방식)
       DATABASE_URL: postgresql://todo_app@jm-db:5432/todo_jmeter
       PGPASSWORD: ${JM_APP_DB_PASSWORD:?JM_APP_DB_PASSWORD 가 필요합니다}
       TODO_FILE: /app/data/todo.json              # 과제 전용 볼륨 — JMeter 가 만든 할 일은 여기에만 쌓인다
       TEMPLATE_FILE: /app/data/task_templates.json
-      - PYTHONUNBUFFERED=1
-    ports:
-      - "5002:8000"                               # 과제 최종 배포·부하 테스트 포트 (고정)
     volumes:
       - jm-app-data:/app/data
     networks:
