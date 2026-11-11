@@ -35,6 +35,7 @@ services:
       PGPASSWORD: ${JM_APP_DB_PASSWORD:?JM_APP_DB_PASSWORD 가 필요합니다}
       TODO_FILE: /app/data/todo.json              # 과제 전용 볼륨 — JMeter 가 만든 할 일은 여기에만 쌓인다
       TEMPLATE_FILE: /app/data/task_templates.json
+      - PYTHONUNBUFFERED=1
     ports:
       - "5002:8000"                               # 과제 최종 배포·부하 테스트 포트 (고정)
     volumes:
@@ -202,6 +203,37 @@ services:
       - ALL
     # ports 없음: Prometheus가 내부 네트워크(node-exporter:9100)로 수집하므로 외부 공개 불필요
 
+    # services: 아래에 추가 (앞의 들여쓰기 2칸까지 그대로)
+  loki:
+    image: grafana/loki:3.7.9
+    container_name: loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - loki-data:/loki
+    networks:
+      - loadtest-net
+
+  alloy:
+    image: grafana/alloy:v1.21.3
+    container_name: alloy
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "127.0.0.1:12345:12345"
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on:
+      - loki
+    networks:
+      - loadtest-net
+
 volumes:                                        # ← 최상위(0칸)로 이동
   sonarqube_data:
   sonarqube_extensions:
@@ -217,6 +249,8 @@ volumes:                                        # ← 최상위(0칸)로 이동
     name: fastapi_jmeter_influx-data
   jm-grafana-data:
     name: fastapi_jmeter_grafana-data
+  loki-data:                      # ← #9 추가
+  alloy-data:                     # ← #9 추가
 
 networks:                                         # 과제 서비스 전용 (모니터링 서비스는 이전처럼 기본 네트워크)
   jm-backend:

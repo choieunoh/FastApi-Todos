@@ -2,8 +2,12 @@ import calendar
 import csv
 import io
 import json
+import logging                                   # ← 추가
+import sys                                       # ← 추가
+import time
 import logging
 import os
+from fastapi import FastAPI, HTTPException, Request
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -53,6 +57,28 @@ app = FastAPI(title="To-Do List API", lifespan=lifespan)
 app.state.auth = None                            # 시작 가드를 거치기 전에는 인증 경로가 500 (fail-closed)
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+
+# ← 추가: 액세스 로그를 표준 출력(stdout)으로 기록
+#   Docker가 stdout을 컨테이너 로그로 저장하고, Alloy가 그 로그를 읽어 Loki로 전송
+custom_logger = logging.getLogger("custom.access")
+custom_logger.setLevel(logging.INFO)
+custom_logger.addHandler(logging.StreamHandler(sys.stdout))
+custom_logger.propagate = False                  # 상위 로거로 넘겨 두 번 찍히는 것을 방지
+
+logging.getLogger("uvicorn.access").disabled = True
+
+@app.middleware("http")                          # ← 추가: 모든 요청을 한 줄씩 기록
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration = time.perf_counter() - start
+    client = request.client.host if request.client else "-"
+    # 형식: IP - "METHOD PATH HTTP/1.1" 상태코드 응답시간 → 7번 LogQL 쿼리가 이 형식으로 파싱
+    custom_logger.info(
+        f'{client} - "{request.method} {request.url.path} HTTP/1.1" '
+        f'{response.status_code} {duration:.3f}s'
+    )
+    return response
 
 Priority = Literal["높음", "보통", "낮음"]
 Recurrence = Literal["none", "daily", "weekly", "monthly"]
