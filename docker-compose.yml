@@ -212,7 +212,7 @@ services:
     volumes:
       - loki-data:/loki
     networks:
-      - loadtest-net
+      - jm-net
 
   alloy:
     image: grafana/alloy:v1.21.3
@@ -231,7 +231,7 @@ services:
     depends_on:
       - loki
     networks:
-      - loadtest-net
+      - jm-net
 
 volumes:                                        # ← 최상위(0칸)로 이동
   sonarqube_data:
