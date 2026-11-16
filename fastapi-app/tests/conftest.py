@@ -84,7 +84,7 @@ def base_url(ui_data_file, ui_template_file):
     deadline = time.time() + 15
     while time.time() < deadline:
         try:
-            urllib.request.urlopen(f"{url}/todos", timeout=1)
+            urllib.request.urlopen(f"{url}/", timeout=1)   # (8.0.0) /todos 는 로그인 필수(401)라 화면 경로로 확인
             break
         except OSError:
             time.sleep(0.1)

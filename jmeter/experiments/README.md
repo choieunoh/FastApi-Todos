@@ -6,7 +6,7 @@ Jenkins 작업과 무관하게 개인 서버에서 수동으로 실행한다.
 ## 파일
 | 파일 | 역할 |
 |---|---|
-| `concurrency_readonly.jmx` | JMeter 계획 — `GET /`, `GET /todos`만 보낸다(POST 없음). 요청 전 400~600ms 대기(Uniform Random Timer). Backend Listener 설정은 `../fastapi_test_plan.jmx`와 같다 |
+| `concurrency_readonly.jmx` | JMeter 계획 — `GET /`, `GET /todos`만 측정한다(할 일 쓰기 없음. (8.0.0) 스레드마다 AUTH 로그인·로그아웃 1회씩 추가, 지표 제외). 요청 전 400~600ms 대기(Uniform Random Timer). Backend Listener 설정은 `../fastapi_test_plan.jmx`와 같다 |
 | `analyze_jtl.py` | 결과(JTL) 분석·판정 — 요청 수, 성공/실패, 평균, p95, 실제 처리량, 라벨별 평균. 요약 CSV·Markdown 표 |
 | `run_concurrency_experiment.sh` | 사전 점검 → u1 → u3 → u5 실행. 단계마다 판정이 통과해야 다음 단계로 간다 |
 | `../check_results.py` | 기존 판정 스크립트(샘플 수·실패율)를 그대로 재사용한다 |
@@ -38,16 +38,25 @@ Jenkins 작업과 무관하게 개인 서버에서 수동으로 실행한다.
    scp -r jmeter <계정>@163.239.77.92:~/fastapi-exp/
    ```
 2. **실행 금지 시간 확인**: 실험하는 동안 Jenkins 빌드를 돌리지 않는다(빌드마다 `POST /todos` 10건이 생겨 `GET /todos` 조건이 바뀐다).
+   - **(8.0.0) 테스트 계정 속성 파일**: 팀 서버가 v8 이면 데이터 API 가 로그인 필수다. 팀 서버의 합성 테스트 계정으로 속성 파일을 한 번 만든다.
+     ```bash
+     mkdir -p -m 700 ~/.config/fastapi-todos
+     python3 ~/fastapi-exp/jmeter/auth_properties.py write ~/.config/fastapi-todos/jmeter-auth.properties
+     ```
+     아이디·비밀번호는 대화형으로 입력한다(화면·명령줄·셸 기록에 남지 않음). 파일은 권한 600 의 새 파일로만 만들어지고, 다른 경로를 쓰려면
+     `JMETER_AUTH_FILE` 환경변수로 지정한다. 스크립트는 이 파일을 JMeter 컨테이너에 읽기 전용으로 붙여 `-q` 로 넘긴다(명령줄 `-J` 금지).
+     실험이 끝나면 `rm ~/.config/fastapi-todos/jmeter-auth.properties` 로 직접 지운다.
 3. **사전 점검만** (읽기 전용, 부하 없음):
    ```bash
    cd ~/fastapi-exp/jmeter/experiments
    bash run_concurrency_experiment.sh --check-only
    ```
    `PRECHECK_OK`가 나와야 한다. 점검 항목:
-   - 계획 파일에 POST가 없고 샘플러가 2개인지
+   - 계획 파일의 샘플러가 `GET /`, `GET /todos` + (8.0.0) `AUTH POST /auth/login`·`AUTH POST /auth/logout` 4개뿐인지(할 일 쓰기 없음)
+   - (8.0.0) 속성 파일이 있고 권한 600·소유자가 이 계정인지
    - JMeter 이미지, InfluxDB 컨테이너, `fastapi_jmeter_net`이 있는지
    - JMeter 컨테이너에서 팀 서버(200)와 InfluxDB(204)에 닿는지
-   - 실험 전 할 일 개수
+   - 실험 전 할 일 개수 (8.0.0: 테스트 계정으로 로그인해 세고 로그아웃한다)
 4. **실험 실행** (승인 후):
    ```bash
    bash run_concurrency_experiment.sh; echo "exit=$?"
@@ -63,9 +72,9 @@ Jenkins 작업과 무관하게 개인 서버에서 수동으로 실행한다.
 ## 단계마다 하는 판정 (하나라도 실패하면 중단)
 1. JMeter 종료 코드가 0
 2. `jmeter.log`에 ERROR/FATAL이 없음
-3. `check_results.py` — 샘플 수가 기대값(100/300/500)과 같고 실패율이 0%
+3. `check_results.py` — 측정 샘플 수가 기대값(100/300/500)과 같고 실패율이 0%. (8.0.0) 인증 샘플(로그인·로그아웃)은 따로 세어 사용자 수 × 2(2/6/10)이고 모두 성공
 4. `analyze_jtl.py check`
-   - 라벨이 `GET /`, `GET /todos` 두 개뿐이고 각각 절반씩
+   - 측정 라벨이 `GET /`, `GET /todos` 두 개뿐이고 각각 절반씩 (`AUTH ` 라벨은 지표·평균·처리량에서 뺀다)
    - 응답 코드가 모두 200, 실패 0건
    - u1은 평균 1,000ms 이하
 5. HTML 리포트(`report/index.html`)가 생성됨

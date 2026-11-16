@@ -10,6 +10,8 @@
   - 결과 파일이 있고 CSV 헤더에 timeStamp, elapsed, label, responseCode, success 열이 있다
   - 전체 샘플 수 == --expected (u1=100, u3=300, u5=500)
   - 라벨은 'GET /', 'GET /todos' 두 개뿐이고 각각 expected/2 건 (읽기 전용 계획인지 확인 — POST 가 섞이면 실패)
+  - (8.0.0) 'AUTH ' 로 시작하는 라벨(스레드마다 로그인·로그아웃)은 측정 지표·샘플 수에서 뺀다. --expected-auth 를 주면
+    그 수와 같고 모두 성공해야 한다(라벨은 'AUTH POST /auth/login'·'AUTH POST /auth/logout' 만 허용)
   - 실패 샘플 0건, 응답 코드는 모두 200
   - --max-avg-ms 를 주면 전체 평균 응답 시간이 그 값 이하
 
@@ -28,6 +30,8 @@ from pathlib import Path
 
 REQUIRED = ("timeStamp", "elapsed", "label", "responseCode", "success")
 LABELS = ("GET /", "GET /todos")
+AUTH_PREFIX = "AUTH "                         # (8.0.0) 로그인·로그아웃 샘플 — 지표에서 뺀다
+AUTH_LABELS = ("AUTH POST /auth/login", "AUTH POST /auth/logout")
 FIELDS = ("label", "users", "samples", "expected", "success", "failure", "error_rate_pct",
           "avg_ms", "p95_ms", "min_ms", "max_ms", "throughput_rps", "duration_s",
           "avg_ms_get_root", "avg_ms_get_todos", "p95_ms_get_root", "p95_ms_get_todos", "status")
@@ -46,7 +50,9 @@ def analyze(jtl: Path) -> dict:
         missing = [c for c in REQUIRED if c not in (reader.fieldnames or [])]
         if missing:
             raise ValueError(f"CSV 헤더에 {missing} 열이 없음 (jmeter.save.saveservice.output_format=csv 필요)")
-        rows = [r for r in reader]
+        all_rows = [r for r in reader]
+    auth = [r for r in all_rows if r["label"].startswith(AUTH_PREFIX)]
+    rows = [r for r in all_rows if not r["label"].startswith(AUTH_PREFIX)]
     if not rows:
         raise ValueError("샘플이 0건")
     elapsed = [int(r["elapsed"]) for r in rows]
@@ -72,11 +78,22 @@ def analyze(jtl: Path) -> dict:
         "p95_ms_get_todos": p95(by_label["GET /todos"]) if by_label["GET /todos"] else "",
         "_labels": Counter(r["label"] for r in rows),
         "_codes": Counter((r["label"], r["responseCode"]) for r in rows),
+        "_auth_labels": Counter(r["label"] for r in auth),
+        "_auth_failed": sum(1 for r in auth if r["success"].strip().lower() != "true"),
     }
 
 
-def judge(m: dict, expected: int, max_avg_ms: float | None) -> list[str]:
+def judge(m: dict, expected: int, max_avg_ms: float | None, expected_auth: int | None = None) -> list[str]:
     problems = []
+    if expected_auth is not None:
+        n_auth = sum(m["_auth_labels"].values())
+        if n_auth != expected_auth:
+            problems.append(f"인증 샘플 수 {n_auth} != 기대 {expected_auth}")
+        if m["_auth_failed"]:
+            problems.append(f"인증 샘플 실패 {m['_auth_failed']}건")
+        unknown = sorted(set(m["_auth_labels"]) - set(AUTH_LABELS))
+        if unknown:
+            problems.append(f"알 수 없는 인증 라벨 {unknown}")
     if m["samples"] != expected:
         problems.append(f"샘플 수 {m['samples']} != 기대 {expected}")
     extra = sorted(set(m["_labels"]) - set(LABELS))
@@ -116,7 +133,7 @@ def cmd_check(a: argparse.Namespace) -> int:
         if a.csv:
             write_row(Path(a.csv), {"label": a.label, "users": a.users, "expected": a.expected, "status": "FAIL"})
         return 1
-    problems = judge(m, a.expected, a.max_avg_ms)
+    problems = judge(m, a.expected, a.max_avg_ms, a.expected_auth)
     status = "FAIL" if problems else "OK"
     print(f"RESULT[{a.label}] users={a.users} samples={m['samples']}/{a.expected} success={m['success']} "
           f"failure={m['failure']} error_rate={m['error_rate_pct']}% avg={m['avg_ms']}ms p95={m['p95_ms']}ms "
@@ -124,6 +141,7 @@ def cmd_check(a: argparse.Namespace) -> int:
     print(f"  per-label: GET / avg={m['avg_ms_get_root']}ms p95={m['p95_ms_get_root']}ms | "
           f"GET /todos avg={m['avg_ms_get_todos']}ms p95={m['p95_ms_get_todos']}ms")
     print(f"  codes: {dict(sorted(m['_codes'].items()))}")
+    print(f"  auth(지표 제외): {dict(sorted(m['_auth_labels'].items()))} failed={m['_auth_failed']}")
     if a.csv:
         write_row(Path(a.csv), {**m, "label": a.label, "users": a.users, "expected": a.expected, "status": status})
     if problems:
@@ -164,6 +182,7 @@ def main() -> int:
     c.add_argument("--jtl", required=True)
     c.add_argument("--expected", type=int, required=True)
     c.add_argument("--max-avg-ms", type=float, default=None)
+    c.add_argument("--expected-auth", type=int, default=None, help="(8.0.0) 인증 샘플 수 (사용자 수 x 2)")
     c.add_argument("--csv", default=None)
     t = sub.add_parser("table")
     t.add_argument("--csv", required=True)

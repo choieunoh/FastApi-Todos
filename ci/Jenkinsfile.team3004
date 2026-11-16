@@ -1,23 +1,99 @@
-// Pipeline script — 팀 서버 3004 검증 + JMeter (사용자 결정: 기존 Jenkins 작업 "Jenkins Deploy Jmeter"에 붙여 넣어 사용)
+// Pipeline script — 팀 3004 검증 작업 + JMeter (사용자 결정: 기존 Jenkins 작업 "Jenkins Deploy Jmeter"에 붙여 넣어 사용)
 // [임시 진단 포함] Test & Coverage 단계의 PostgreSQL 진단(로그 옵션·샘플러·pg-diag 보관)은 numbackends=2 원인 확인 뒤 제거한다.
 //
-// 이 작업이 하는 일: GitHub main 체크아웃 → 전체 pytest(빌드 전용 PostgreSQL 18) → 팀 전용 태그로 이미지 빌드(push 없음)
-//   → 이미 배포된 팀 서버 163.239.77.78:3004 의 HTTP 상태 검증(배포·SSH 없음) → JMeter 30 샘플 → 결과·InfluxDB 검증 → 보고서 게시·보관
+// (8.0.0, 2026-11-16 C안) 이 작업이 하는 일:
+//   선택한 브랜치(CHECKOUT_BRANCH) 체크아웃·검증 → 전체 pytest(빌드 전용 PostgreSQL 18) → 이 커밋으로 v8 이미지 로컬 빌드(push 없음)
+//   → 이미 배포된 팀 서버 163.239.77.78:3004 의 HTTP GET 확인(읽기만, 배포·SSH·쓰기 없음)
+//   → **빌드 전용 일회용 v8 앱 + PostgreSQL**(내부 네트워크, 호스트 포트 없음, tmpfs, 빌드 라벨) 기동 → 합성 테스트 계정 생성
+//   → 격리 게이트(대상·DB·마운트·포트·네트워크·라벨) → JMeter 로그인 → 측정 → 로그아웃(대상은 일회용 앱뿐) → 결과·InfluxDB 판정
+//   → 일회용 자원 정리(이 빌드 라벨이 붙은 정확한 이름만) → 보고서 게시·보관
+//   팀 서버 대상 JMeter 쓰기 검증은 없앴다 — 팀 서버의 공유 todo.json 에 빌드마다 할 일 10건이 쌓이고 정리를 입증할 수 없기 때문이다.
 //
 // 바꾸지 않는 것
 // - 기존 작업 "Jenkins Deploy Jmeter"와 그 빌드 기록(#8 포함), 개인 서버 5001·5002, 팀 서버 앱·DB 컨테이너 설정, 다른 학생의 리소스.
 // - 이 작업은 compose 를 쓰지 않는다(up·down·run 없음). 개인 서버의 기존 InfluxDB(fastapi-jmeter-influxdb)와 네트워크
-//   fastapi_jmeter_net 에 JMeter 일회성 컨테이너를 붙여 기록만 보낸다.
+//   fastapi_jmeter_net 에는 JMeter 일회성 컨테이너만 잠시 붙여 측정값을 보낸다(일회용 앱·DB 는 그 네트워크에 붙이지 않는다).
+// - Test & Coverage 단계와 R-19 테스트 DB 게이트는 그대로다.
 //
-// 기존 작업과 겹치지 않는 이름
+// 기존 작업과 겹치지 않는 이름 (모두 빌드 번호 포함, 컨테이너·네트워크에는 라벨 org.fastapi-todos.ci-build=<BUILD_TAG>)
 // - 앱 이미지 태그: eunohchoi/fastapi-app:team3004-<빌드번호> (로컬만, push·latest 없음)
-// - JMeter 이미지: fastapi-jmeter-runner:team3004 / JMeter 컨테이너: jm-team3004-<빌드번호>
+// - JMeter 이미지: fastapi-jmeter-runner:team3004 / JMeter 컨테이너: jm-eph-team3004-<빌드번호>
 // - CI 임시 리소스: todo-ci-team3004-<빌드번호>-{pg,runner,net}
-// - JMeter 결과: 이 작업 워크스페이스의 jmeter-out/<빌드번호>/ (기존 작업 워크스페이스·#8 결과와 무관)
-// - InfluxDB: application=fastapi-todos-team3004, eventTags build=team3004-jenkins-<빌드번호>
+// - 일회용 대상: todo-eph-team3004-<빌드번호>-{net,pg,migrate,app,probe}
+// - JMeter 결과: 이 작업 워크스페이스의 jmeter-out/<빌드번호>/
+// - InfluxDB: application=fastapi-todos-eph-team3004-<빌드번호>(빌드마다 고유), eventTags build=team3004-jenkins-<빌드번호>
 //
-// 비밀값: 이 스크립트에는 비밀값이 없고 Credentials 도 쓰지 않는다(push·SSH 없음). CI DB 비밀번호는 빌드마다 무작위로 만들어
-// 워크스페이스 밖 임시 파일로만 다루고 끝나면 지운다. 셸 블록은 '#!/bin/bash' 로 시작해 명령 출력(+ ...)이 없다.
+// 비밀값: 이 스크립트에는 비밀값이 없다. CI DB·일회용 DB 비밀번호와 일회용 앱 키는 빌드마다 무작위로 만들어
+// 워크스페이스 밖 임시 폴더(700)·파일(600)로만 다루고 끝나면 지운다. 셸 블록은 '#!/bin/bash' 로 시작해 명령 출력(+ ...)이 없다.
+// (8.0.0) 데이터 API 가 로그인 필수라 JMeter 는 테스트 계정으로 로그인한다(인증 우회 없음, V8_SPEC §42).
+//   - 계정: JM_AUTH_MODE='generated'(기본) — 빌드마다 무작위 합성 계정을 일회용 앱에만 만든다(Credentials 불필요).
+//     'credentials' — Jenkins Credentials "Username with password"(ID = JM_AUTH_CRED_ID)를 withCredentials 로 받아 같은
+//     방식으로 일회용 앱에 가입시킨다(바인딩 경로 검증용, 등록·사용은 별도 승인). 어느 쪽도 팀 서버에는 계정을 만들지 않는다.
+//   - 값은 환경변수로만 다루고, jmeter/auth_properties.py 가 워크스페이스 밖 임시 디렉터리(700)에 속성 파일(600)을 만든다
+//     → JMeter 컨테이너에 읽기 전용으로 붙여 `-q` 로 넘긴다(-J 금지) → 끝나면 삭제. 가입 본문도 600 파일로만 넘기고 바로 지운다.
+//   - 샘플: 스레드마다 AUTH 로그인 1 + 측정 3 + AUTH 로그아웃 1. AUTH 샘플은 InfluxDB 지표에 보내지 않고 판정도 따로 센다.
+//   - 이 스크립트를 작업에 붙여 넣기·Credentials 등록·빌드 실행은 각각 별도 승인이다(V8_SPEC §44.4).
+
+// 테스트 계정 준비 — 두 모드가 같은 셸을 쓴다. generated 모드에서는 여기서 무작위 값을 만든다(출력하지 않음)
+// 바인딩 변수(def 없음) — declarative script 블록에서 보이게
+PREPARE_ACCOUNT_SH = '''#!/bin/bash
+set -euo pipefail
+case "$JM_AUTH_MODE" in
+  generated)
+    JM_AUTH_USER="jm-eph-$(openssl rand -hex 6)"
+    JM_AUTH_PASS="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32)"
+    export JM_AUTH_USER JM_AUTH_PASS ;;
+  credentials)
+    [ -n "${JM_AUTH_USER:-}" ] && [ -n "${JM_AUTH_PASS:-}" ] || { echo "ACCOUNT_FAIL: Credentials 값이 비어 있음"; exit 1; } ;;
+  *) echo "ACCOUNT_FAIL: 알 수 없는 JM_AUTH_MODE"; exit 1 ;;
+esac
+AUTHDIR="${WORKSPACE_TMP:?}/jm-auth-${BUILD_NUMBER}"
+[ ! -e "$AUTHDIR" ] || { echo "ACCOUNT_FAIL: 자격 증명 폴더가 이미 있음 — 재사용하지 않는다"; exit 1; }
+umask 077
+mkdir -m 700 "$AUTHDIR"
+python3 jmeter/auth_properties.py write "$AUTHDIR/auth.properties"      # 값은 환경변수에서 읽고 출력하지 않는다
+[ "$(stat -c %a "$AUTHDIR/auth.properties")" = 600 ] || { echo "ACCOUNT_FAIL: 속성 파일 권한이 600 이 아님"; exit 1; }
+# 가입 본문 — 600 파일로만 만들어 프로브 컨테이너에 읽기 전용으로 붙인다(명령줄에 값 없음), 요청 뒤 바로 지운다
+python3 - "$AUTHDIR/register.json" <<'PY'
+import json, os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump({"username": os.environ["JM_AUTH_USER"], "password": os.environ["JM_AUTH_PASS"]}, f)
+PY
+unset JM_AUTH_USER JM_AUTH_PASS                                         # 이후 명령(docker 등)에 넘기지 않는다
+umask 022
+code="$(docker run --rm --name "${EPH_ID}-probe" --label "org.fastapi-todos.ci-build=${CI_BUILD_LABEL}" \\
+          --network "${EPH_ID}-net" -u "$(id -u):$(id -g)" -e HOME=/tmp \\
+          -v "$AUTHDIR/register.json:/secrets/register.json:ro" "$JMETER_IMAGE" \\
+          curl -s -o /dev/null --max-time 30 -w '%{http_code}' -H 'Content-Type: application/json' \\
+          --data @/secrets/register.json "http://${EPH_ID}-app:${EPH_APP_PORT}/auth/register" || true)"
+rm -f "$AUTHDIR/register.json"
+[ "$code" = 201 ] || { echo "ACCOUNT_FAIL: 일회용 앱 가입 응답 ${code} (201 기대)"; exit 1; }
+echo "ACCOUNT_OK: 일회용 앱에 합성 테스트 계정 생성 (모드 ${JM_AUTH_MODE}, 값은 출력하지 않음)"
+'''
+
+// 일회용 자원 정리 — 이 빌드의 정확한 이름이고 라벨이 이 빌드(BUILD_TAG)와 같을 때만 지운다. 라벨이 다르거나 없으면 건드리지 않는다
+// 바인딩 변수(def 없음)
+CLEANUP_EPH_SH = '''#!/bin/bash
+for c in "jm-eph-team3004-${BUILD_NUMBER}" "${EPH_ID}-probe" "${EPH_ID}-app" "${EPH_ID}-migrate" "${EPH_ID}-pg"; do
+  lab="$(docker inspect -f '{{index .Config.Labels "org.fastapi-todos.ci-build"}}' "$c" 2>/dev/null)" || continue
+  if [ "$lab" = "$CI_BUILD_LABEL" ]; then
+    docker rm -f -v "$c" >/dev/null 2>&1 && echo "EPH_CLEANUP: $c"
+  else
+    echo "EPH_CLEANUP_SKIP: $c — 이 빌드 라벨이 아니라 지우지 않는다"
+  fi
+done
+lab="$(docker network inspect -f '{{index .Labels "org.fastapi-todos.ci-build"}}' "${EPH_ID}-net" 2>/dev/null)" && {
+  if [ "$lab" = "$CI_BUILD_LABEL" ]; then
+    docker network rm "${EPH_ID}-net" >/dev/null 2>&1 && echo "EPH_CLEANUP: ${EPH_ID}-net"
+  else
+    echo "EPH_CLEANUP_SKIP: ${EPH_ID}-net — 이 빌드 라벨이 아니라 지우지 않는다"
+  fi
+}
+rm -rf "${WORKSPACE_TMP:-/nonexistent}/eph-team3004-${BUILD_NUMBER}" "${WORKSPACE_TMP:-/nonexistent}/jm-auth-${BUILD_NUMBER}"
+echo "EPH_CLEANUP_DONE"
+exit 0
+'''
 
 pipeline {
     agent any
@@ -29,6 +105,8 @@ pipeline {
     }
 
     environment {
+        CHECKOUT_BRANCH    = 'feature/v8.0.0'                               // (8.0.0 C안) 검증할 브랜치 — 아래 허용 목록만
+        ALLOWED_BRANCHES   = '^(main|feature/v8\\.0\\.0)$'                  // 이 밖의 브랜치는 Verify Checkout 에서 거부
         TEAM_HOST          = '163.239.77.78'
         TEAM_PORT          = '3004'
         REQUIRED_COMMIT    = '1a258cca5184c4a08e7914cce50d52e010bb15bd'   // CI·JMeter 파일이 들어 있는 커밋 — 체크아웃에 포함돼야 한다
@@ -37,21 +115,28 @@ pipeline {
         CI_PG_IMAGE        = 'postgres:18.6-trixie'
         CI_RUNNER_IMAGE    = 'fastapi-todos-ci:py313-pw1.65.0'              // 기존 작업과 같은 Dockerfile·같은 내용 — 재빌드는 캐시로 끝난다
         CI_ID              = "todo-ci-team3004-${BUILD_NUMBER}"
+        CI_BUILD_LABEL     = "${BUILD_TAG}"                                 // (C안) 이 빌드가 만든 자원의 라벨 값 — 정리 대상 판별
+        EPH_ID             = "todo-eph-team3004-${BUILD_NUMBER}"            // (C안) 일회용 대상 자원 이름 접두어
+        EPH_APP_PORT       = '8000'                                         // 일회용 앱 컨테이너 내부 포트(호스트에 공개하지 않음)
         JMETER_IMAGE       = 'fastapi-jmeter-runner:team3004'
         JMETER_NET         = 'fastapi_jmeter_net'                          // 개인 서버 기존 네트워크 (InfluxDB 가 붙어 있음)
         INFLUX_CONTAINER   = 'fastapi-jmeter-influxdb'
-        JM_APP_NAME        = 'fastapi-todos-team3004'
+        JM_APP_NAME        = "fastapi-todos-eph-team3004-${BUILD_NUMBER}"   // (C안) 빌드마다 고유 — InfluxDB 조회 범위
         JM_RUN_ID          = "team3004-jenkins-${BUILD_NUMBER}"
         JM_THREADS         = '10'
         JM_LOOPS           = '1'
-        JM_SAMPLERS        = '3'                                            // GET / , POST /todos , GET /todos
+        JM_SAMPLERS        = '3'                                            // 측정: GET / , POST /todos , GET /todos
+        JM_AUTH_PER_THREAD = '2'                                            // (8.0.0) AUTH 로그인 1 + 로그아웃 1 (지표 제외)
+        JM_AUTH_MODE       = 'generated'                                    // (C안) generated(기본) | credentials
+        JM_AUTH_CRED_ID    = 'jm-team3004-test-account'                     // (8.0.0) credentials 모드의 Jenkins Credentials ID
+        TEAM_APP_VERSION   = '7.0.0'                                        // 팀 서버에 지금 배포된 앱 버전 — GET 확인 기준
         JM_OUT             = "jmeter-out/${BUILD_NUMBER}"                   // 워크스페이스 기준 상대 경로
     }
 
     stages {
         stage('Checkout') {
             steps {
-                git branch: 'main', url: 'https://github.com/choieunoh/FastApi-Todos.git'
+                git branch: env.CHECKOUT_BRANCH, url: 'https://github.com/choieunoh/FastApi-Todos.git'
             }
         }
 
@@ -60,16 +145,19 @@ pipeline {
             steps {
                 sh '''#!/bin/bash
 set -euo pipefail
-head="$(git rev-parse HEAD)"; remote="$(git rev-parse refs/remotes/origin/main)"
-echo "CHECKOUT: HEAD=${head} origin/main=${remote}"
-[ "$head" = "$remote" ] || { echo "VERIFY_FAIL: HEAD 가 origin/main 과 다름"; exit 1; }
+# (C안) 허용된 브랜치만, HEAD 는 그 브랜치의 원격 최신과 같아야 한다(로컬 변경·다른 커밋 금지)
+[[ "$CHECKOUT_BRANCH" =~ $ALLOWED_BRANCHES ]] || { echo "VERIFY_FAIL: 허용되지 않은 브랜치 ${CHECKOUT_BRANCH}"; exit 1; }
+head="$(git rev-parse HEAD)"; remote="$(git rev-parse "refs/remotes/origin/${CHECKOUT_BRANCH}")"
+echo "CHECKOUT: branch=${CHECKOUT_BRANCH} HEAD=${head} origin/${CHECKOUT_BRANCH}=${remote}"
+[ "$head" = "$remote" ] || { echo "VERIFY_FAIL: HEAD 가 origin/${CHECKOUT_BRANCH} 과 다름"; exit 1; }
 git merge-base --is-ancestor "$REQUIRED_COMMIT" HEAD || { echo "VERIFY_FAIL: 필요한 커밋 ${REQUIRED_COMMIT} 이 없음"; exit 1; }
 [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "VERIFY_FAIL: 추적 파일에 로컬 변경이 있음"; exit 1; }
 for f in ci/test-runner.Dockerfile fastapi-app/Dockerfile fastapi-app/requirements.txt fastapi-app/requirements-dev.txt \\
-         jmeter/Dockerfile jmeter/fastapi_test_plan.jmx jmeter/check_results.py; do
+         fastapi-app/alembic.ini jmeter/Dockerfile jmeter/fastapi_test_plan.jmx jmeter/check_results.py jmeter/auth_properties.py; do
   [ -f "$f" ] || { echo "VERIFY_FAIL: $f 없음"; exit 1; }
 done
-for p in '__P(TARGET_HOST,' '__P(TARGET_PORT,' '__P(APP_NAME,' '__P(RUN_ID,' '__P(THREADS,' '__P(LOOPS,' 'InfluxdbBackendListenerClient'; do
+for p in '__P(TARGET_HOST,' '__P(TARGET_PORT,' '__P(APP_NAME,' '__P(RUN_ID,' '__P(THREADS,' '__P(LOOPS,' 'InfluxdbBackendListenerClient' \\
+         'AUTH POST /auth/login' 'AUTH POST /auth/logout' "props.get('AUTH_PASSWORD')" 'X-CSRF-Token' 'vars.getIteration()'; do
   grep -qF "$p" jmeter/fastapi_test_plan.jmx || { echo "VERIFY_FAIL: jmx 에 ${p} 없음"; exit 1; }
 done
 # docker 명령이 개인 서버(v7 시연이 도는 데몬)의 로컬 데몬을 쓰는지, 재사용할 InfluxDB·네트워크가 있는지 (읽기 전용)
@@ -80,6 +168,9 @@ docker ps --format '{{.Names}}' | grep -qx 'fastapi-v7-demo-app-1' || { echo "VE
 [ "$(docker inspect -f '{{.State.Running}}' "$INFLUX_CONTAINER" 2>/dev/null)" = true ] || { echo "VERIFY_FAIL: ${INFLUX_CONTAINER} 가 실행 중이 아님"; exit 1; }
 docker network inspect "$JMETER_NET" --format '{{range .Containers}}{{.Name}} {{end}}' | grep -qw "$INFLUX_CONTAINER" \\
   || { echo "VERIFY_FAIL: ${JMETER_NET} 에 ${INFLUX_CONTAINER} 가 없음"; exit 1; }
+# (C안) 호스트 도구 — auth_properties.py 는 Python 3.8+ (bytes.hex 구분자), 권한 확인은 stat -c
+python3 -c 'import sys; assert sys.version_info >= (3, 8), sys.version' || { echo "VERIFY_FAIL: python3 3.8 이상 필요"; exit 1; }
+echo "HOST_TOOLS: $(python3 -c 'import platform; print("python", platform.python_version())') stat=$(stat --version 2>/dev/null | head -1 || echo busybox)"
 echo "VERIFY_OK"
 '''
             }
@@ -272,14 +363,20 @@ base="http://${TEAM_HOST}:${TEAM_PORT}"
 code() { curl -s -o /dev/null --max-time 10 -w '%{http_code}' "$1" || true; }
 for i in $(seq 1 10); do [ "$(code "$base/")" = 200 ] && break; sleep 3; done
 c_root="$(code "$base/")"; c_todos="$(code "$base/todos")"; c_me="$(code "$base/auth/me")"
-echo "TEAM_HTTP: GET / -> ${c_root}, GET /todos -> ${c_todos}, GET /auth/me -> ${c_me}"
+echo "TEAM_HTTP: GET / -> ${c_root}, GET /todos -> ${c_todos}, GET /auth/me -> ${c_me} (기대 버전 ${TEAM_APP_VERSION})"
+# (8.0.0) 비로그인 GET /todos: v8 은 401(데이터 API 로그인 필수), v7 은 200. 그 밖의 버전 값은 거부한다
+case "$TEAM_APP_VERSION" in
+  8.0.0) want_todos=401 ;;
+  7.0.0) want_todos=200 ;;
+  *) echo "VERIFY_TEAM_FAIL: 알 수 없는 TEAM_APP_VERSION"; exit 1 ;;
+esac
 [ "$c_root" = 200 ]  || { echo "VERIFY_TEAM_FAIL: GET / (200 기대)"; exit 1; }
-[ "$c_todos" = 200 ] || { echo "VERIFY_TEAM_FAIL: GET /todos (200 기대)"; exit 1; }
+[ "$c_todos" = "$want_todos" ] || { echo "VERIFY_TEAM_FAIL: 비로그인 GET /todos (${want_todos} 기대)"; exit 1; }
 [ "$c_me" = 401 ]    || { echo "VERIFY_TEAM_FAIL: GET /auth/me (비로그인 401 기대 — DB·인증 설정 확인)"; exit 1; }
 # 본문을 끝까지 받은 뒤 셸 안에서 비교한다. `curl | grep -q` 는 grep 이 먼저 끝나면 curl 이 SIGPIPE 로 실패하고
 # pipefail 때문에 전체가 실패로 판정된다(빌드 #9: 문자열은 105KB 중 23KB 지점에 있었는데 "없음"으로 실패)
 html="$(curl -s --max-time 10 "$base/")" || { echo "VERIFY_TEAM_FAIL: GET / 본문을 받지 못함"; exit 1; }
-[[ "$html" == *'Version 7.0.0'* ]] || { echo "VERIFY_TEAM_FAIL: 화면에 Version 7.0.0 없음 (본문 ${#html}자)"; exit 1; }
+[[ "$html" == *"Version ${TEAM_APP_VERSION}"* ]] || { echo "VERIFY_TEAM_FAIL: 화면에 Version ${TEAM_APP_VERSION} 없음 (본문 ${#html}자)"; exit 1; }
 echo "VERIFY_TEAM_OK: ${base} (배포는 이 작업이 하지 않음 — 기존 배포 상태 확인)"
 '''
             }
@@ -295,80 +392,225 @@ echo "JMETER_IMAGE_OK: $JMETER_IMAGE"
             }
         }
 
-        stage('Run JMeter Load Test') {
+        stage('Start Ephemeral v8 Target') {
+            // (C안) 이 빌드에서 만든 v8 이미지로 일회용 앱 + PostgreSQL 을 띄운다. 내부 전용 네트워크(--internal), 호스트 포트 없음,
+            // 데이터는 tmpfs, 실제 팀 서버·DB·JSON 파일은 마운트하지 않는다. 같은 이름이 이미 있으면 재사용하지 않고 멈춘다
+            steps {
+                sh '''#!/bin/bash
+set -euo pipefail
+LBL=(--label "org.fastapi-todos.ci-build=${CI_BUILD_LABEL}")
+EPH_SEC="${WORKSPACE_TMP:?}/eph-team3004-${BUILD_NUMBER}"
+for c in "${EPH_ID}-pg" "${EPH_ID}-migrate" "${EPH_ID}-app" "${EPH_ID}-probe" "jm-eph-team3004-${BUILD_NUMBER}"; do
+  if docker inspect "$c" >/dev/null 2>&1; then echo "EPH_FAIL: 같은 이름의 컨테이너 $c 가 이미 있음 — 재사용하지 않는다"; exit 1; fi
+done
+if docker network inspect "${EPH_ID}-net" >/dev/null 2>&1; then echo "EPH_FAIL: 같은 이름의 네트워크가 이미 있음"; exit 1; fi
+[ ! -e "$EPH_SEC" ] || { echo "EPH_FAIL: 일회용 비밀 폴더가 이미 있음"; exit 1; }
+umask 077
+mkdir -m 700 "$EPH_SEC"
+openssl rand -hex 32 > "$EPH_SEC/pg_pw"
+python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode())' > "$EPH_SEC/app_key"
+umask 022
+DB_URL="postgresql://eph_admin@${EPH_ID}-pg:5432/todo_eph"           # 비밀번호는 URL 이 아니라 PGPASSWORD 로(팀 compose 와 같은 방식)
+
+docker network create --internal "${LBL[@]}" "${EPH_ID}-net" >/dev/null
+POSTGRES_PASSWORD="$(cat "$EPH_SEC/pg_pw")" docker run -d --name "${EPH_ID}-pg" "${LBL[@]}" --network "${EPH_ID}-net" \\
+  --tmpfs /var/lib/postgresql:rw --security-opt no-new-privileges:true \\
+  -e POSTGRES_USER=eph_admin -e POSTGRES_PASSWORD -e POSTGRES_DB=todo_eph "$CI_PG_IMAGE" >/dev/null
+for i in $(seq 1 60); do
+  docker exec "${EPH_ID}-pg" pg_isready -q -h 127.0.0.1 -p 5432 -U eph_admin -d todo_eph && break
+  sleep 1
+done
+docker exec "${EPH_ID}-pg" pg_isready -q -h 127.0.0.1 -p 5432 -U eph_admin -d todo_eph
+
+# 마이그레이션이 끝난 뒤에만 앱을 띄운다 (실패하면 set -e 로 여기서 멈춘다)
+PGPASSWORD="$(cat "$EPH_SEC/pg_pw")" docker run --rm --name "${EPH_ID}-migrate" "${LBL[@]}" --network "${EPH_ID}-net" \\
+  --security-opt no-new-privileges:true -e PGPASSWORD -e DATABASE_URL="$DB_URL" \\
+  "${APP_IMAGE_REPO}:${APP_IMAGE_TAG}" alembic upgrade head
+echo "EPH_MIGRATE_OK"
+
+PGPASSWORD="$(cat "$EPH_SEC/pg_pw")" AUTH_FAILURE_KEY="$(cat "$EPH_SEC/app_key")" \\
+docker run -d --name "${EPH_ID}-app" "${LBL[@]}" --network "${EPH_ID}-net" \\
+  --tmpfs /app/data:rw,uid=10001,gid=10001,mode=0700 --security-opt no-new-privileges:true \\
+  -e PGPASSWORD -e AUTH_FAILURE_KEY -e DATABASE_URL="$DB_URL" \\
+  -e APP_ENV=development -e COOKIE_SECURE=false -e REGISTRATION_ENABLED=true \\
+  -e TODO_FILE=/app/data/todo.json -e TEMPLATE_FILE=/app/data/task_templates.json \\
+  "${APP_IMAGE_REPO}:${APP_IMAGE_TAG}" >/dev/null
+rm -f "$EPH_SEC/pg_pw" "$EPH_SEC/app_key"                               # 값은 컨테이너 환경에만 남는다(빌드 끝에 컨테이너와 함께 삭제)
+
+# 준비 확인 — 같은 내부 네트워크의 일회성 프로브(JMeter 이미지의 curl)로만 접속한다
+P=(docker run --rm --name "${EPH_ID}-probe" "${LBL[@]}" --network "${EPH_ID}-net" "$JMETER_IMAGE")
+base="http://${EPH_ID}-app:${EPH_APP_PORT}"
+code() { "${P[@]}" curl -s -o /dev/null --max-time 5 -w '%{http_code}' "$1" || true; }
+for i in $(seq 1 30); do [ "$(code "$base/")" = 200 ] && break; sleep 2; done
+c_root="$(code "$base/")"; c_todos="$(code "$base/todos")"; c_me="$(code "$base/auth/me")"
+echo "EPH_HTTP: GET / -> ${c_root}, 비로그인 GET /todos -> ${c_todos}, GET /auth/me -> ${c_me}"
+[ "$c_root" = 200 ] && [ "$c_todos" = 401 ] && [ "$c_me" = 401 ] || { echo "EPH_FAIL: 일회용 v8 앱 준비 상태가 아님"; exit 1; }
+html="$("${P[@]}" curl -s --max-time 10 "$base/")" || { echo "EPH_FAIL: GET / 본문을 받지 못함"; exit 1; }
+[[ "$html" == *'Version 8.0.0'* ]] || { echo "EPH_FAIL: 일회용 앱 화면에 Version 8.0.0 없음"; exit 1; }
+echo "EPH_READY: ${EPH_ID}-app (v8, 내부 네트워크 전용)"
+'''
+            }
+        }
+
+        stage('Prepare Test Account') {
+            // (C안) 기본은 빌드마다 무작위 합성 계정(generated). credentials 모드는 기존 Credentials 바인딩 경로를 그대로 쓴다.
+            // 어느 쪽도 계정은 일회용 앱에만 만든다(팀 서버 계정 없음)
+            steps {
+                script {
+                    if (env.JM_AUTH_MODE == 'credentials') {
+                        withCredentials([usernamePassword(credentialsId: env.JM_AUTH_CRED_ID,
+                                                          usernameVariable: 'JM_AUTH_USER', passwordVariable: 'JM_AUTH_PASS')]) {
+                            sh PREPARE_ACCOUNT_SH
+                        }
+                    } else if (env.JM_AUTH_MODE == 'generated') {
+                        sh PREPARE_ACCOUNT_SH
+                    } else {
+                        error('ACCOUNT_FAIL: JM_AUTH_MODE 는 generated 또는 credentials 만 허용')
+                    }
+                }
+            }
+        }
+
+        stage('Isolation Gate') {
+            // (C안) JMeter 를 시작하기 전에 격리를 확인한다. 하나라도 어긋나면 이 단계에서 실패하고 JMeter 단계는 돌지 않는다.
+            // 비밀값이 든 환경변수(PGPASSWORD·AUTH_FAILURE_KEY)는 읽지 않는다 — DATABASE_URL·TODO_FILE 줄만 본다
+            steps {
+                sh '''#!/bin/bash
+set -euo pipefail
+fail() { echo "ISOLATION_FAIL: $*"; exit 1; }
+label_of() { docker inspect -f '{{index .Config.Labels "org.fastapi-todos.ci-build"}}' "$1" 2>/dev/null; }
+env_line() { docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" | grep -E "^$2=" | head -1; }
+# 1) 대상 호스트 — 이 빌드의 일회용 앱 컨테이너 이름이어야 하고 팀 서버 주소가 아니어야 한다
+TARGET="${EPH_ID}-app"
+[[ "$TARGET" =~ ^todo-eph-team3004-[0-9]+-app$ ]] || fail "대상 이름 형식"
+[ "$TARGET" != "$TEAM_HOST" ] && [[ "$TARGET" != *"$TEAM_HOST"* ]] || fail "대상이 팀 서버 주소"
+# 2) 이 빌드 라벨 — 다른 빌드 자원을 재사용하지 않는다
+for c in "${EPH_ID}-app" "${EPH_ID}-pg"; do
+  [ "$(label_of "$c")" = "$CI_BUILD_LABEL" ] || fail "$c 라벨이 이 빌드(${CI_BUILD_LABEL})가 아님"
+  [ "$(docker inspect -f '{{.State.Running}}' "$c")" = true ] || fail "$c 가 실행 중이 아님"
+  [ -z "$(docker port "$c")" ] || fail "$c 에 호스트로 공개된 포트가 있음"
+  [ "$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}bind {{end}}{{end}}' "$c")" = "" ] || fail "$c 에 bind 마운트가 있음"
+  nets="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$c" | xargs)"
+  [ "$nets" = "${EPH_ID}-net" ] || fail "$c 의 네트워크가 ${EPH_ID}-net 하나가 아님 (${nets})"
+done
+[ "$(docker network inspect -f '{{.Internal}}' "${EPH_ID}-net")" = true ] || fail "${EPH_ID}-net 이 내부 전용(--internal)이 아님"
+[ "$(docker network inspect -f '{{index .Labels "org.fastapi-todos.ci-build"}}' "${EPH_ID}-net")" = "$CI_BUILD_LABEL" ] || fail "네트워크 라벨"
+members="$(docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' "${EPH_ID}-net" | tr ' ' '\\n' | grep . | sort | xargs)"
+[ "$members" = "${EPH_ID}-app ${EPH_ID}-pg" ] || fail "내부 네트워크에 다른 컨테이너가 있음 (${members})"
+# 3) 앱의 DB 대상은 이 빌드의 일회용 PostgreSQL, 데이터 파일은 컨테이너 안 tmpfs (마운트 없음)
+[ "$(env_line "${EPH_ID}-app" DATABASE_URL)" = "DATABASE_URL=postgresql://eph_admin@${EPH_ID}-pg:5432/todo_eph" ] || fail "앱 DATABASE_URL 대상"
+[ "$(env_line "${EPH_ID}-app" TODO_FILE)" = "TODO_FILE=/app/data/todo.json" ] || fail "TODO_FILE 경로"
+[ "$(env_line "${EPH_ID}-app" TEMPLATE_FILE)" = "TEMPLATE_FILE=/app/data/task_templates.json" ] || fail "TEMPLATE_FILE 경로"
+[ "$(docker inspect -f '{{len .Mounts}}' "${EPH_ID}-app")" = 0 ] || fail "앱 컨테이너에 마운트가 있음"
+docker inspect -f '{{json .HostConfig.Tmpfs}}' "${EPH_ID}-app" | grep -q '"/app/data"' || fail "/app/data 가 tmpfs 가 아님"
+# 4) 자격 증명 속성 파일 — 이 빌드 폴더, 600
+AUTHDIR="${WORKSPACE_TMP:?}/jm-auth-${BUILD_NUMBER}"
+[ "$(stat -c %a "$AUTHDIR")" = 700 ] && [ "$(stat -c %a "$AUTHDIR/auth.properties")" = 600 ] || fail "자격 증명 폴더 700·파일 600 아님"
+[ ! -e "$AUTHDIR/register.json" ] || fail "가입 본문 파일이 남아 있음"
+echo "ISOLATION_OK: 대상 ${TARGET}(내부 전용), DB ${EPH_ID}-pg, 데이터 tmpfs, 포트·bind 마운트 없음, 라벨 ${CI_BUILD_LABEL}"
+'''
+            }
+        }
+
+        stage('Run JMeter Load Test (ephemeral v8)') {
+            // (C안) 대상은 일회용 앱뿐. JMeter 컨테이너는 내부 네트워크로 앱에, fastapi_jmeter_net 으로 InfluxDB 에만 닿는다.
+            // HTTP 샘플러는 죽은 프록시(127.0.0.1:9)를 쓰고 일회용 앱·InfluxDB 만 예외(-N) — 다른 주소로는 요청이 나갈 수 없다
             steps {
                 sh '''#!/bin/bash
 set -euo pipefail
 OUT="${WORKSPACE}/${JM_OUT}"
 rm -rf "$OUT" && mkdir -p "$OUT"                            # -e -o 리포트 폴더는 비어 있어야 한다 (이 빌드 번호 폴더만)
-JR=(docker run --rm --network "$JMETER_NET" -u "$(id -u):$(id -g)" -e HOME=/tmp)
+AUTHDIR="${WORKSPACE_TMP:?}/jm-auth-${BUILD_NUMBER}"
+JMC="jm-eph-team3004-${BUILD_NUMBER}"
+TARGET="${EPH_ID}-app"
+EXPECTED_MEASURED=$(( JM_THREADS * JM_LOOPS * JM_SAMPLERS ))
+EXPECTED_AUTH=$(( JM_THREADS * JM_AUTH_PER_THREAD ))
 
-# 0) JMeter 와 같은 이미지·네트워크에서 대상과 InfluxDB 에 닿는지 먼저 확인 — 안 되면 부하 테스트를 하지 않는다
-t="$("${JR[@]}" "$JMETER_IMAGE" curl -s -o /dev/null --max-time 10 -w '%{http_code}' "http://${TEAM_HOST}:${TEAM_PORT}/" || true)"
-i="$("${JR[@]}" "$JMETER_IMAGE" curl -s -o /dev/null --max-time 10 -w '%{http_code}' "http://influxdb:8086/ping" || true)"
-echo "PRECHECK: team ${TEAM_HOST}:${TEAM_PORT} -> ${t}, influxdb -> ${i}"
-[ "$t" = 200 ] || { echo "JMETER_FAIL: JMeter 컨테이너에서 팀 서버에 접속할 수 없음"; exit 1; }
-[ "$i" = 204 ] || { echo "JMETER_FAIL: JMeter 컨테이너에서 InfluxDB 에 접속할 수 없음"; exit 1; }
+# 0) InfluxDB 에 닿는지 먼저 확인 — 안 되면 부하 테스트를 하지 않는다
+i="$(docker run --rm --network "$JMETER_NET" -u "$(id -u):$(id -g)" -e HOME=/tmp "$JMETER_IMAGE" \\
+       curl -s -o /dev/null --max-time 10 -w '%{http_code}' "http://influxdb:8086/ping" || true)"
+echo "PRECHECK: influxdb -> ${i}"
+[ "$i" = 204 ] || { echo "JMETER_FAIL: InfluxDB 에 접속할 수 없음"; exit 1; }
 
-set +e
-"${JR[@]}" --name "jm-team3004-${BUILD_NUMBER}" \\
-  -v "${WORKSPACE}/jmeter:/plan:ro" -v "${OUT}:/out" -w /out \\
+RUN_START_NS="$(date +%s%N)"                                            # InfluxDB 조회 시작 시각 (이 실행 구간만)
+docker create --name "$JMC" --label "org.fastapi-todos.ci-build=${CI_BUILD_LABEL}" \\
+  --network "${EPH_ID}-net" -u "$(id -u):$(id -g)" -e HOME=/tmp \\
+  -v "${WORKSPACE}/jmeter:/plan:ro" -v "${OUT}:/out" -v "${AUTHDIR}/auth.properties:/secrets/auth.properties:ro" -w /out \\
   "$JMETER_IMAGE" \\
-  jmeter -n -t /plan/fastapi_test_plan.jmx \\
+  jmeter -n -t /plan/fastapi_test_plan.jmx -q /secrets/auth.properties \\
     -l /out/results.jtl -j /out/jmeter.log -e -o /out/report \\
-    -JTARGET_HOST="$TEAM_HOST" -JTARGET_PORT="$TEAM_PORT" \\
+    -H 127.0.0.1 -P 9 -N "${TARGET}|influxdb" \\
+    -JTARGET_HOST="${TARGET}" -JTARGET_PORT="${EPH_APP_PORT}" \\
     -JTHREADS="$JM_THREADS" -JLOOPS="$JM_LOOPS" -JRAMP=10 \\
     -JAPP_NAME="$JM_APP_NAME" -JRUN_ID="$JM_RUN_ID" \\
     "-JINFLUX_URL=http://influxdb:8086/write?db=jmeter" \\
-    -Jjmeter.save.saveservice.output_format=csv
+    -Jjmeter.save.saveservice.output_format=csv >/dev/null
+docker network connect "$JMETER_NET" "$JMC"                              # InfluxDB 전송용 — 일회용 앱·DB 는 이 네트워크에 붙이지 않는다
+set +e
+docker start -a "$JMC"
 rc=$?
 set -e
+RUN_END_NS="$(( $(date +%s%N) + 5000000000 ))"                         # 끝 + 5초 (마지막 전송까지)
+docker rm -f "$JMC" >/dev/null 2>&1 || true
 [ $rc -eq 0 ] || { echo "JMETER_FAIL: 종료 코드 $rc"; exit 1; }
-if grep -E " (ERROR|FATAL) " "$OUT/jmeter.log" >/dev/null; then
-  echo "JMETER_FAIL: jmeter.log 에 ERROR/FATAL 기록"; grep -E " (ERROR|FATAL) " "$OUT/jmeter.log" | cut -c1-200 | head -20; exit 1
+# (8.0.0) Groovy 함수 오류는 WARN 으로만 남는다(로컬 실측: 로그아웃 조건식 NPE) — ERROR·FATAL 과 함께 실패로 본다
+JM_LOG_FAIL=' (ERROR|FATAL) |Error running groovy script'
+if grep -E "$JM_LOG_FAIL" "$OUT/jmeter.log" >/dev/null; then
+  echo "JMETER_FAIL: jmeter.log 에 ERROR/FATAL 또는 Groovy 오류 기록"; grep -E "$JM_LOG_FAIL" "$OUT/jmeter.log" | cut -c1-200 | head -20; exit 1
 fi
 
-# 1) 샘플 수 30·실패 0 (JMeter 는 샘플 실패에도 0 으로 끝난다)
-python3 jmeter/check_results.py "$OUT/results.jtl" --expected $(( JM_THREADS * JM_LOOPS * JM_SAMPLERS )) --max-error-rate 0
-# 2) 샘플러별 응답 코드: GET / 200, POST /todos 201, GET /todos 200 — 각 THREADS*LOOPS 건
-python3 - "$OUT/results.jtl" "$(( JM_THREADS * JM_LOOPS ))" <<'PY'
+# 1) 측정 샘플 30·실패 0, 인증 샘플(로그인·로그아웃) THREADS*2 모두 성공 — 따로 센다 (JMeter 는 샘플 실패에도 0 으로 끝난다)
+python3 jmeter/check_results.py "$OUT/results.jtl" --expected "$EXPECTED_MEASURED" \\
+  --expected-auth "$EXPECTED_AUTH" --max-error-rate 0
+# 2) 샘플러별 응답 코드: GET / 200, POST /todos 201, GET /todos 200 — 각 THREADS*LOOPS 건,
+#    AUTH 로그인 200·로그아웃 204 — 각 THREADS 건. 모든 요청 URL 이 일회용 앱이어야 한다
+python3 - "$OUT/results.jtl" "$(( JM_THREADS * JM_LOOPS ))" "$JM_THREADS" "http://${TARGET}:${EPH_APP_PORT}/" <<'PY'
 import csv, sys
 from collections import Counter
-want = {"GET /": "200", "POST /todos": "201", "GET /todos": "200"}
-per = int(sys.argv[2])
+want = {"GET /": "200", "POST /todos": "201", "GET /todos": "200",
+        "AUTH POST /auth/login": "200", "AUTH POST /auth/logout": "204"}
+per = {lbl: int(sys.argv[3]) if lbl.startswith("AUTH ") else int(sys.argv[2]) for lbl in want}
 with open(sys.argv[1], newline="", encoding="utf-8") as f:
-    got = Counter((r["label"], r["responseCode"]) for r in csv.DictReader(f))
+    rows = list(csv.DictReader(f))
+got = Counter((r["label"], r["responseCode"]) for r in rows)
 bad = {k: v for k, v in got.items() if want.get(k[0]) != k[1]}
-short = {lbl: got[(lbl, code)] for lbl, code in want.items() if got[(lbl, code)] != per}
+short = {lbl: got[(lbl, code)] for lbl, code in want.items() if got[(lbl, code)] != per[lbl]}
+foreign = sorted({r["URL"].split("/", 3)[2] for r in rows if not r["URL"].startswith(sys.argv[4])})
 print("CODES:", dict(sorted(got.items())))
-if bad or short:
-    print("JMETER_FAIL: 응답 코드 불일치", bad or "", short or "")
+if bad or short or foreign:
+    print("JMETER_FAIL: 응답 코드·대상 불일치", bad or "", short or "", foreign or "")
     sys.exit(1)
-print("CODES_OK")
+print("CODES_OK: 모든 요청 대상이 일회용 앱")
 PY
 # 3) HTML 리포트
 [ -f "$OUT/report/index.html" ] || { echo "JMETER_FAIL: HTML 리포트 없음"; exit 1; }
-# 4) InfluxDB — 이번 실행의 시작·종료 이벤트(build=<RUN_ID>)와 이 application 의 최근 측정값
-q() { docker exec "$INFLUX_CONTAINER" influx -database jmeter -format csv -execute "$1" | tail -n +2 | cut -d, -f3; }
-n="$(q "SELECT count(\\"count\\") FROM \\"jmeter\\" WHERE \\"application\\"='${JM_APP_NAME}' AND time > now() - 15m")"
-e="$(q "SELECT count(\\"text\\") FROM \\"events\\" WHERE \\"application\\"='${JM_APP_NAME}' AND \\"tags\\" = 'build=${JM_RUN_ID}'")"
-[ "${n:-0}" -gt 0 ] 2>/dev/null || { echo "JMETER_FAIL: InfluxDB 에 ${JM_APP_NAME} 최근 측정값 없음"; exit 1; }
+# 4) InfluxDB — 이 빌드 고유 application 과 이번 실행 구간만 본다. 쿼리 실패(명령 오류·ERR 응답)와 실제 0건을 구분한다
+q() {
+  local out
+  if ! out="$(docker exec "$INFLUX_CONTAINER" influx -database jmeter -format csv -execute "$1" 2>&1)"; then
+    echo "INFLUX_QUERY_FAIL: $(printf '%s' "$out" | head -c 200)" >&2; return 1
+  fi
+  case "$out" in ERR*|*"error parsing"*|*"error:"*) echo "INFLUX_QUERY_FAIL: $(printf '%s' "$out" | head -c 200)" >&2; return 1 ;; esac
+  printf '%s\\n' "$out" | tail -n +2 | cut -d, -f3
+}
+RANGE="\\"application\\"='${JM_APP_NAME}' AND time >= ${RUN_START_NS} AND time <= ${RUN_END_NS}"
+e="$(q "SELECT count(\\"text\\") FROM \\"events\\" WHERE ${RANGE} AND \\"tags\\" = 'build=${JM_RUN_ID}'")" || { echo "JMETER_FAIL: InfluxDB 쿼리 실패(events)"; exit 1; }
+a="$(q "SELECT count(\\"count\\") FROM \\"jmeter\\" WHERE ${RANGE} AND \\"transaction\\" =~ /^AUTH /")" || { echo "JMETER_FAIL: InfluxDB 쿼리 실패(AUTH)"; exit 1; }
+s="$(q "SELECT sum(\\"count\\") FROM \\"jmeter\\" WHERE ${RANGE} AND \\"transaction\\"='all' AND \\"statut\\"='all'")" || { echo "JMETER_FAIL: InfluxDB 쿼리 실패(all 합계)"; exit 1; }
 [ "${e:-0}" -gt 0 ] 2>/dev/null || { echo "JMETER_FAIL: InfluxDB 에 이번 실행(build=${JM_RUN_ID}) 이벤트 없음"; exit 1; }
-echo "INFLUX_OK: application=${JM_APP_NAME} 최근 15분 측정값 ${n}건, 이번 실행 이벤트 ${e}건"
+[ -z "${a}" ] || [ "${a}" = 0 ] || { echo "JMETER_FAIL: InfluxDB 에 AUTH 샘플 지표 ${a}건 — 로그인이 측정 지표에 섞였다"; exit 1; }
+[ "${s:-0}" = "$EXPECTED_MEASURED" ] || { echo "JMETER_FAIL: InfluxDB all/all 합계 ${s:-없음} != 측정 ${EXPECTED_MEASURED}"; exit 1; }
+echo "INFLUX_OK: application=${JM_APP_NAME} 구간 [${RUN_START_NS}, ${RUN_END_NS}] 이벤트 ${e}건, AUTH 지표 0건, all/all 합계 ${s} = 측정 ${EXPECTED_MEASURED}"
 '''
             }
             post {
                 always {
-                    // 중단으로 --rm 이 안 된 경우를 대비해 이 빌드의 JMeter 컨테이너 이름만 정리
-                    sh '''#!/bin/bash
-docker rm -f "jm-team3004-${BUILD_NUMBER}" >/dev/null 2>&1 || true
-'''
                     // CSP 때문에 Jenkins 안에서 차트가 안 보일 수 있으므로 보고서 전체를 아티팩트로도 보관한다 (Artifacts 에서 zip 으로 받기 가능)
                     archiveArtifacts artifacts: "${env.JM_OUT}/results.jtl, ${env.JM_OUT}/jmeter.log, ${env.JM_OUT}/report/**",
                                      allowEmptyArchive: true, fingerprint: false
                     publishHTML(target: [allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true,
                                          reportDir: "${env.JM_OUT}/report", reportFiles: 'index.html',
-                                         reportName: 'JMeter HTML Report (Team 3004)'])
+                                         reportName: 'JMeter HTML Report (ephemeral v8)'])
                 }
             }
         }
@@ -376,7 +618,9 @@ docker rm -f "jm-team3004-${BUILD_NUMBER}" >/dev/null 2>&1 || true
 
     post {
         always {
-            echo "Pipeline completed: team ${env.TEAM_HOST}:${env.TEAM_PORT}, image ${env.APP_IMAGE_REPO}:${env.APP_IMAGE_TAG} (local only), JMeter ${env.JM_RUN_ID}"
+            // (C안) 성공·실패·중단 모두 — 이 빌드 라벨이 붙은 일회용 자원과 자격 증명·비밀 폴더만 지운다
+            sh CLEANUP_EPH_SH
+            echo "Pipeline completed: branch ${env.CHECKOUT_BRANCH}, team ${env.TEAM_HOST}:${env.TEAM_PORT} (GET only), image ${env.APP_IMAGE_REPO}:${env.APP_IMAGE_TAG} (local only), JMeter ${env.JM_RUN_ID} → ephemeral ${env.EPH_ID}-app"
         }
     }
 }

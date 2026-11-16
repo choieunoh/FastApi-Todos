@@ -58,22 +58,26 @@ def wait_until_single_backend(engine) -> None:
             with engine.connect() as conn:                                   # 풀의 점검 연결 1개 — 매번 새 트랜잭션
                 backends = conn.execute(text(db.TEST_SCHEMA_SQL["database_backends"])).scalar_one()
                 others = conn.execute(text(db.TEST_SCHEMA_SQL["other_sessions"])).scalar_one()
+                elapsed = time.monotonic() - start
+                # (8.0.0) 멈출 조건이면 같은 트랜잭션에서 백엔드 진단을 읽는다(읽기만). 멈출지는 아래 조건이 그대로 정한다
+                stopping = (type(backends) is not int or type(others) is not int or others != 0
+                            or (backends != 1 and elapsed >= BACKEND_RELEASE_TIMEOUT))
+                diag = describe_backends(conn) if stopping else ""
                 conn.rollback()                                              # 읽기만 — 스냅숏을 다음 반복으로 넘기지 않는다
         except SQLAlchemyError as exc:
             sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
             safe = sqlstate if isinstance(sqlstate, str) and len(sqlstate) == 5 and sqlstate.isalnum() else None
             pytest.exit(f"테스트 DB 보호: 게이트 전 연결 수 확인 실패 ({type(exc).__name__}, sqlstate={safe})", returncode=2)
-        elapsed = time.monotonic() - start
         if type(backends) is not int or type(others) is not int:
-            pytest.exit("테스트 DB 보호: 게이트 전 연결 수를 확인할 수 없음", returncode=2)
+            pytest.exit(f"테스트 DB 보호: 게이트 전 연결 수를 확인할 수 없음 {diag}", returncode=2)
         if others != 0:
             pytest.exit(f"테스트 DB 보호: 같은 역할의 다른 세션 {others}개 (DB 연결 수 {backends}, {elapsed:.2f}초) "
-                        "— 기다리지 않고 멈춘다", returncode=2)
+                        f"— 기다리지 않고 멈춘다 {diag}", returncode=2)
         if backends == 1:
             return
         if elapsed >= BACKEND_RELEASE_TIMEOUT:
             pytest.exit(f"테스트 DB 보호: DB 연결 수 {backends} 가 {BACKEND_RELEASE_TIMEOUT}초 안에 1로 돌아오지 않음 "
-                        f"(다른 세션 0, {elapsed:.2f}초) — 추가 백엔드의 정체는 확인하지 않음", returncode=2)
+                        f"(다른 세션 0, {elapsed:.2f}초) — 추가 백엔드의 정체는 판정하지 않음 {diag}", returncode=2)
         time.sleep(0.05)
 
 
@@ -100,11 +104,15 @@ def wait_for_backends_released(engine) -> None:
         with engine.connect() as conn:                                       # 풀의 점검 연결 1개 — 매번 새 트랜잭션
             backends = conn.execute(text(db.TEST_SCHEMA_SQL["database_backends"])).scalar_one()
             others = conn.execute(text(db.TEST_SCHEMA_SQL["other_sessions"])).scalar_one()
+            released = backends == 1 and others == 0
+            timed_out = time.monotonic() >= deadline
+            diag = describe_backends(conn) if (not released and timed_out) else ""   # (8.0.0) 실패할 때만, 읽기만
             conn.rollback()
-        if backends == 1 and others == 0:
+        if released:
             return
-        if time.monotonic() >= deadline:
-            pytest.fail(f"닫은 연결이 {BACKEND_RELEASE_TIMEOUT}초 안에 정리되지 않음 (DB 연결 수 {backends}, 다른 세션 {others})")
+        if timed_out:
+            pytest.fail(f"닫은 연결이 {BACKEND_RELEASE_TIMEOUT}초 안에 정리되지 않음 (DB 연결 수 {backends}, 다른 세션 {others}) "
+                        f"{diag}")
         time.sleep(0.05)
 
 
@@ -115,7 +123,8 @@ def open_verified_engine() -> Engine:
     try:
         with engine.connect() as conn:
             db.verify_test_server(conn)
-            db.verify_test_schema(conn)          # R-19 — 읽기 전용, 처음 지우기 전에 한 번 더 일찍 멈춘다
+            with diagnose_backends_on_failure(conn):    # (8.0.0) 멈출 때만 같은 연결의 백엔드 진단을 덧붙인다
+                db.verify_test_schema(conn)      # R-19 — 읽기 전용, 처음 지우기 전에 한 번 더 일찍 멈춘다
             conn.rollback()
     except (db.DatabaseConfigError, SQLAlchemyError) as e:
         engine.dispose()
@@ -156,6 +165,70 @@ def _safe_sqlstate(exc: BaseException) -> str | None:
     return state if isinstance(state, str) and len(state) == 5 and state.isalnum() else None
 
 
+# ---------- (8.0.0) R-19 연결 수 진단 — 읽기 전용, 판정·중단 조건은 바꾸지 않는다 ----------
+# 게이트(db.verify_test_schema)·사전 대기가 멈출 때, 멈추게 한 그 연결·트랜잭션에서 이 DB 의 백엔드 목록을 읽어 중단 메시지에
+# 붙인다. 새 연결을 열지 않는다(진단 연결이 연결 수를 바꾸지 않게). PostgreSQL 은 한 트랜잭션 안에서 백엔드 상태 스냅숏을
+# 재사용하므로 게이트가 센 numbackends 와 같은 시점일 것으로 기대한다 — 확인을 위해 numbackends 와 행 수를 함께 적는다.
+# 기록하지 않는 것: SQL 본문(query 열은 권한 부족 표시인지 비교만 한다), 비밀번호·토큰, 클라이언트 IP(종류만), 행 데이터.
+# 진단은 원인을 판정하지 않는다(예: autovacuum 은 가설일 뿐). 진단이 실패해도 원래 중단은 그대로 일어난다.
+BACKEND_DIAG_SQL = {
+    "numbackends": "SELECT numbackends FROM pg_stat_database WHERE datname = current_database()",
+    "backends": (
+        "SELECT a.pid, a.pid = pg_backend_pid() AS is_self, a.backend_type, a.usename, a.application_name, a.state, "
+        "a.backend_start, a.query = '<insufficient privilege>' AS hidden, "
+        "CASE WHEN a.client_addr IS NULL THEN 'none' WHEN host(a.client_addr) IN ('127.0.0.1', '::1') THEN 'loopback' "
+        "ELSE 'other' END AS client_kind "
+        "FROM pg_stat_activity a WHERE a.datid = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+        "ORDER BY a.backend_start NULLS LAST, a.pid"),
+    "server_kinds": ("SELECT coalesce(backend_type, '?') AS kind, count(*) AS n FROM pg_stat_activity "
+                     "GROUP BY 1 ORDER BY 1"),
+}
+_DIAG_TEXT_LIMIT = 40
+
+
+def _diag_text(value: object) -> str:
+    # 진단 값 한 칸 — 없으면 '-', 인쇄 가능한 문자만, 공백은 '_', 길이 제한 (application_name 은 클라이언트가 정한 값이다)
+    if value is None:
+        return "-"
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    text_value = "".join(ch if ch.isprintable() and not ch.isspace() else "_" for ch in str(value))
+    return text_value[:_DIAG_TEXT_LIMIT] + ("…" if len(text_value) > _DIAG_TEXT_LIMIT else "")
+
+
+def describe_backends(conn: Connection) -> str:
+    # 주어진 연결·트랜잭션에서 읽기만 한다(commit·rollback·새 연결 없음). 어떤 실패도 문자열로 돌려주고 예외를 올리지 않는다 —
+    # 호출자는 진단 결과와 관계없이 원래대로 멈춘다
+    try:
+        counted = conn.execute(text(BACKEND_DIAG_SQL["numbackends"])).scalar_one_or_none()
+        rows = conn.execute(text(BACKEND_DIAG_SQL["backends"])).all()
+        kinds = conn.execute(text(BACKEND_DIAG_SQL["server_kinds"])).all()
+    except SQLAlchemyError as exc:
+        return f"[연결 진단 실패: {type(exc).__name__}, sqlstate={_safe_sqlstate(exc)}]"
+    except Exception as exc:                                     # noqa: BLE001 — 진단은 중단을 막지 않는다
+        return f"[연결 진단 실패: {type(exc).__name__}]"
+    lines = []
+    for r in rows:
+        who = "자기(진단·점검) 연결" if r.is_self else "다른 연결"
+        lines.append(f"pid={_diag_text(r.pid)}({who}) type={_diag_text(r.backend_type)} user={_diag_text(r.usename)} "
+                     f"app={_diag_text(r.application_name)} state={_diag_text(r.state)} "
+                     f"start={_diag_text(r.backend_start)} client={_diag_text(r.client_kind)}"
+                     + (" 세부=권한부족" if r.hidden else ""))
+    server = ", ".join(f"{_diag_text(k.kind)}={_diag_text(k.n)}" for k in kinds)
+    return (f"[연결 진단 (같은 트랜잭션, 원인 판정 아님): numbackends={_diag_text(counted)}, 이 DB 백엔드 {len(rows)}개 — "
+            + "; ".join(lines) + f" | 서버 전체 종류별: {server}]")
+
+
+@contextmanager
+def diagnose_backends_on_failure(conn: Connection) -> Iterator[None]:
+    # 게이트 호출을 감싼다. 게이트가 DatabaseConfigError 로 멈추면 같은 연결의 진단을 덧붙여 **같은 예외 종류**로 다시 올린다
+    # (호출자의 기존 처리기가 그대로 pytest.exit 로 멈춘다). 그 밖의 예외·성공은 손대지 않는다. 판정은 db.py 그대로다
+    try:
+        yield
+    except db.DatabaseConfigError as exc:
+        raise db.DatabaseConfigError(f"{exc} {describe_backends(conn)}") from None
+
+
 def reset_test_schema(engine: Engine, alembic_cfg: Config, *,
                       before_drop: Callable[[Connection], list[str]] | None = None) -> None:
     # (fresh_schema 본문) 빈 스키마에서 head 까지 올린다. 지우기 직전에 같은 연결·트랜잭션에서 서버와 스키마 내용(R-19)을
@@ -170,7 +243,8 @@ def reset_test_schema(engine: Engine, alembic_cfg: Config, *,
     try:
         with engine.begin() as conn:
             db.verify_test_server(conn)
-            db.verify_test_schema(conn)
+            with diagnose_backends_on_failure(conn):                          # (8.0.0) 진단만 — 판정·중단은 그대로
+                db.verify_test_schema(conn)
             conn.execute(text("SET LOCAL lock_timeout = '5s'"))   # 다른 세션이 잡고 있으면 기다리지 않고 실패
             if before_drop is not None:
                 try:
@@ -178,7 +252,8 @@ def reset_test_schema(engine: Engine, alembic_cfg: Config, *,
                     conn.execute(text("SELECT pg_stat_clear_snapshot()"))     # 통계·세션 정보 캐시만 비운다(데이터 스냅숏 아님)
                 except SQLAlchemyError as exc:
                     raise ResetBlocked("reset_lock_failed", _safe_sqlstate(exc), 2) from None
-                db.verify_test_schema(conn)                                   # 잠금 아래 재검사 — 구조·소유자·연결 수 1
+                with diagnose_backends_on_failure(conn):
+                    db.verify_test_schema(conn)                               # 잠금 아래 재검사 — 구조·소유자·연결 수 1
                 try:
                     problems = before_drop(conn)                              # 같은 연결·트랜잭션에서 출처 확인
                 except SQLAlchemyError as exc:
@@ -223,7 +298,10 @@ SERVER_ENV_DROP = ("TEST_DATABASE_URL", "DATABASE_URL", "AUTH_FAILURE_KEY", "APP
                    "REGISTRATION_ENABLED", "FORWARDED_ALLOW_IPS")
 _STARTED_WORKER = re.compile(r"Started server process \[(\d+)\]")
 _STARTED_PARENT = re.compile(r"Started parent process \[(\d+)\]")
-_ACCESS = re.compile(r'ACCESS pid=(\d+) \S+ "(\w+) (\S+) [^"]*" (\d{3})')
+# (8.0.0 1단계 보정) 앱은 77bb6fa(Loki·Alloy)부터 uvicorn.access 를 끄고 custom.access 로 한 줄씩 남긴다
+#   (형식 `IP - "METHOD PATH HTTP/1.1" 상태 0.000s`). 하네스는 그 로거에 PID 접두 처리기를 더해 같은 줄을 PID 와 함께 읽는다.
+#   앱의 로그 설정·형식(stdout 원문 줄)은 바꾸지 않는다. 줄 전체 형식을 고정해 다른 줄과 섞이지 않게 한다.
+_ACCESS = re.compile(r'^ACCESS pid=(\d+) \S+ - "(\w+) (\S+) HTTP/1\.1" (\d{3}) \d+\.\d{3}s\r?$', re.MULTILINE)
 
 SERVER_LOG_CONFIG = {
     "version": 1,
@@ -234,15 +312,19 @@ SERVER_LOG_CONFIG = {
         "access": {"()": "uvicorn.logging.AccessFormatter",
                    "fmt": 'ACCESS pid=%(process)d %(client_addr)s "%(request_line)s" %(status_code)s',
                    "use_colors": False},
+        "custom_access": {"format": "ACCESS pid=%(process)d %(message)s"},       # (8.0.0) 앱 custom.access 줄 + 워커 PID
     },
     "handlers": {
         "default": {"formatter": "default", "class": "logging.StreamHandler", "stream": "ext://sys.stderr"},
         "access": {"formatter": "access", "class": "logging.StreamHandler", "stream": "ext://sys.stdout"},
+        "custom_access": {"formatter": "custom_access", "class": "logging.StreamHandler", "stream": "ext://sys.stdout"},
     },
     "loggers": {
         "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
         "uvicorn.error": {"level": "INFO"},
         "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+        # (8.0.0) 앱이 import 때 자기 stdout 처리기를 덧붙여 원문 줄도 함께 나온다 — _ACCESS 는 PID 줄만 읽는다
+        "custom.access": {"handlers": ["custom_access"], "level": "INFO", "propagate": False},
         "todo.auth": {"handlers": ["default"], "level": "WARNING", "propagate": False},
     },
 }
@@ -659,7 +741,8 @@ def verify_gate_readonly(engine: Engine) -> None:
         with engine.connect() as conn:
             conn.execute(text("SET TRANSACTION READ ONLY"))
             db.verify_test_server(conn)
-            db.verify_test_schema(conn)
+            with diagnose_backends_on_failure(conn):
+                db.verify_test_schema(conn)
             conn.rollback()
     except (db.DatabaseConfigError, SQLAlchemyError) as e:
         pytest.exit(f"테스트 DB 보호: 종료 전 게이트 실패 — {e}", returncode=2)

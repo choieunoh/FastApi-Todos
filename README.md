@@ -1,9 +1,11 @@
 # FastAPI To-Do List
 
 FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 할 일과 작업 템플릿은 JSON 파일에 저장합니다.
-**7.0.0 "PostgreSQL Foundation & Authentication"** — 브랜치 `feature/v7.0.0`의 **로컬 개발·시연 전용** 마감 상태입니다(화면 표시 `Version 7.0.0 · 로컬 시연용 · 할 일·템플릿은 모든 사용자 공유`). 운영 배포·공개 대상이 아니며, main 병합·push·Jenkins 배포를 하지 않습니다. 변경 내용은 [RELEASE_NOTES.md](RELEASE_NOTES.md), 개발 명세는 [CLAUDE.md](CLAUDE.md)·[V7_SPEC.md](V7_SPEC.md), 단계·위험은 [V7_PLAN.md](V7_PLAN.md)에 있습니다.
+**8.0.0 "Account Management & UI/UX Improvement"** — 브랜치 `feature/v8.0.0`(미커밋·미병합, 배포 전)입니다. 화면 표시는 `Version 8.0.0 · 할 일·템플릿은 로그인한 모든 사용자가 함께 씁니다`입니다. 변경 내용은 [RELEASE_NOTES.md](RELEASE_NOTES.md), 명세·결정·완료 기준은 [V8_SPEC.md](V8_SPEC.md)와 [CLAUDE.md](CLAUDE.md)에 있습니다.
 
-> **⚠ 보안 한계 (7.0.0)**: 회원가입·로그인·로그아웃이 있지만, **할 일·템플릿 API 15개는 인증·CSRF·사용자별 격리 없이** 모든 호출자가 같은 JSON 데이터를 씁니다. 서버에 접근할 수 있는 누구나 로그인 없이 모든 데이터를 조회·변경·삭제·내보내기할 수 있고, 로그인해도 보이는 데이터는 같습니다. 로그인은 데이터를 보호하지 않습니다. 사용자별 데이터 분리는 8.0.0 "Multi-User Data Migration"에서 합니다.
+> **⚠ 공유 데이터 (8.0.0)**: 할 일·템플릿 API 15개는 이제 **로그인해야** 쓸 수 있고(익명 401), 쓰기 11개는 CSRF 토큰이 필요합니다(403). 하지만 데이터는 여전히 **JSON 파일 하나를 로그인한 모든 사용자가 함께 씁니다** — 다른 사용자가 만든 할 일을 보고 고치고 지우고 되살릴 수 있습니다. **사용자별 데이터 분리는 하지 않았습니다**(후속 과제 "Multi-User Data Migration", 버전 미정). 회원 탈퇴는 계정·로그인 세션만 지우고 **공유 JSON 데이터는 지우지 않습니다.** HTTPS 없이 배포하면 비밀번호와 세션 쿠키가 평문으로 오갑니다.
+
+(7.0.0 당시) 7.0.0 "PostgreSQL Foundation & Authentication"은 로컬 개발·시연 전용이었고, 데이터 API 15개가 인증 없이 열려 있었습니다(로그인은 데이터를 보호하지 않음). 그 기록은 아래 "7.0.0 진행 상황"과 릴리스 노트에 남아 있습니다. 실제로는 PR #3(`7cf68bb`)으로 main에 병합되어 과제 스택에 배포되었습니다(`CLAUDE.md` "Current Version").
 
 (6.0.0 당시) 6.0.0은 릴리스 후보였습니다(화면 표시 `Version 6.0.0`, 배포 전). 그 내용은 아래 4.0.0~6.0.0 표와 릴리스 노트에 그대로 남아 있습니다.
 
@@ -54,7 +56,25 @@ FastAPI와 바닐라 JS로 만든 To-Do 웹 앱입니다. 할 일과 작업 템�
 - **스키마에만 있는 표**: `todos`·`subtasks`·`task_templates`·`data_migrations`는 8.0.0 이전·전환용으로 만들어 두었을 뿐, 지금 앱은 이 표를 읽거나 쓰지 않습니다. 할 일·템플릿은 위와 같이 JSON 파일입니다.
 - 알림 읽음 키·테마 키는 v6 그대로입니다(브라우저 localStorage).
 
-## 실행
+## 8.0.0 — 계정 관리와 화면 정리 (`feature/v8.0.0`)
+| 단계 | 내용 | 상태 |
+|---|---|---|
+| 1 | 계정 API(`/auth/me` 가입일, `POST /auth/password`, `POST /auth/account/delete`), 데이터 API 15개 로그인 필수·쓰기 11개 CSRF | 완료 — PostgreSQL 97/97 |
+| 2 | 화면 로그인 게이트, 계정 메뉴(내 정보·비밀번호 변경·회원 탈퇴), 공유 데이터 안내, CSS 정리(버튼 3단계·로그인 카드) | 완료 — PostgreSQL UI 125/125 |
+| 3 | `Version 8.0.0`, 통합 테스트·JMeter·Jenkins 로그인 절차, 보안 회귀 테스트, 문서 | 진행 중 — 로컬 검증 완료(PostgreSQL 보안 회귀 98/98·UI 125/125, 로컬 통합 9/9, 로컬 JMeter 재검증 통과), Jenkins 사본(C안) 정적 검증 완료. **실제 Jenkins 빌드는 승인 대기** |
+
+**계정 기능**
+- 로그인하지 않으면 로그인·가입 카드만 보이고, 할 일 화면과 데이터 요청은 없습니다. 세션이 만료되거나 다른 기기에서 비밀번호를 바꾸면 다음 요청에서 로그인 화면으로 돌아갑니다.
+- 헤더의 [👤 사용자명] 버튼이 계정 패널을 엽니다.
+  - **내 정보**: 아이디, 가입일(한국 날짜).
+  - **비밀번호 변경**: 현재 비밀번호 + 새 비밀번호(8~128자, 현재와 달라야 함) + 확인. 성공하면 **모든 기기의 로그인을 해제**하고 이 화면에는 새 세션을 줍니다. 현재 비밀번호를 틀리면 400이고, 틀린 횟수는 로그인 실패와 같은 시도 제한(429)에 셉니다.
+  - **회원 탈퇴**: 비밀번호 확인 + 확인 창. 계정과 모든 로그인 세션을 지웁니다. 할 일·템플릿은 공유 데이터라 지우지 않습니다.
+
+**데이터 API 인증 정책**
+- 데이터 경로 15개(아래 API 표)는 세션 쿠키가 없거나 만료되면 401입니다. GET이 아닌 11개는 `X-CSRF-Token` 헤더가 세션 값과 같아야 하고, 없거나 다르면 403입니다. 내보내기 링크도 로그인해야 받을 수 있습니다.
+- 경로·메서드·성공 상태 코드·응답 형식은 7.0.0과 같습니다. 서버의 데이터 저장(JSON)도 같습니다.
+- 인증 우회 설정(환경변수·헤더·IP 예외)은 없습니다. 테스트·부하 측정도 테스트 계정으로 로그인합니다.
+
 
 > **7.0.0 주의**: 아래 "Docker"·"로컬" 명령과 [배포와 데이터 관리](#배포와-데이터-관리)는 **6.0.0(JSON) 기준**이며, 7.0.0 실행 방법이 아닙니다. 7.0.0은 운영에 배포하지 않습니다.
 > - 7.0.0 앱은 시작할 때 `APP_ENV`(`development`·`test`·`production`)와 시도 제한 비밀키 `AUTH_FAILURE_KEY`를 확인합니다(`V7_SPEC.md` §28.1). 코드를 읽어 보면 `APP_ENV`가 `development`·`test`로 명시되지 않고 `AUTH_FAILURE_KEY`도 없으면 시작을 거부하므로, 지금의 compose 설정이나 `uvicorn main:app --reload`만으로는 시작되지 않을 것으로 판단합니다. **코드 분석에 따른 판단이며 실행해서 확인하지는 않았습니다.**
@@ -104,6 +124,8 @@ uvicorn main:app --reload
 http://localhost:8000 에서 열립니다. 데이터 파일 위치는 환경변수 `TODO_FILE`로 바꿀 수 있습니다 (기본값 `fastapi-app/todo.json`). 작업 템플릿은 `TEMPLATE_FILE`(기본값 `fastapi-app/task_templates.json`)에 저장되며, 처음 템플릿을 저장할 때 만들어집니다. 이 파일은 사용자 데이터라 `.gitignore`에 들어 있어 Git에 커밋되지 않습니다.
 
 ## API
+> (8.0.0) 아래 데이터 경로는 **로그인 필수**(세션 쿠키, 없으면 401)이고, GET이 아닌 요청은 `X-CSRF-Token` 헤더도 필요합니다(403). 데이터는 로그인한 모든 사용자가 함께 씁니다.
+
 | 메서드 | 경로 | 동작 |
 |---|---|---|
 | GET | `/todos` | 전체 목록 |
@@ -130,16 +152,19 @@ CSV 컬럼은 `id,title,description,completed,priority,due_date,tags,favorite,re
 
 서버를 띄운 뒤 http://localhost:8000/docs 에서 요청·응답 스키마를 볼 수 있습니다.
 
-### 인증 경로 (7.0.0)
+### 인증·계정 경로 (7.0.0, 8.0.0)
 | 메서드 | 경로 | 동작 |
 |---|---|---|
 | POST | `/auth/register` | 회원가입 (201). `Origin` 검사, 이미 있는 이름이면 409 |
-| POST | `/auth/login` | 로그인 (200). `Origin` 검사, HttpOnly 세션 쿠키 발급(14일 고정) |
+| POST | `/auth/login` | 로그인 (200, `{id, username, csrf_token}`). `Origin` 검사, HttpOnly 세션 쿠키 발급(14일 고정) |
 | POST | `/auth/logout` | 로그아웃 (204). 유효한 세션이 있으면 `X-CSRF-Token` 검사 |
-| GET | `/auth/me` | 현재 로그인 사용자 (200, 세션이 없거나 만료되면 401) |
+| GET | `/auth/me` | 현재 로그인 사용자 (200, (8.0.0) `created_at` 가입 시각 포함. 세션이 없거나 만료되면 401) |
+| POST | `/auth/password` | (8.0.0) `{"current_password", "new_password"}` — 비밀번호 변경 (200 + 새 세션 쿠키·새 `csrf_token`). 그 사용자의 모든 세션을 지운다 |
+| POST | `/auth/account/delete` | (8.0.0) `{"password"}` — 회원 탈퇴 (204, 쿠키 삭제). 공유 JSON 은 그대로 |
 
-- `Origin` 불일치·로그아웃 CSRF 오류는 403, 로그인·가입 시도가 많으면 429(`Retry-After`), 해시 처리 혼잡·잠금 대기 초과는 503입니다.
-- **위 API 표의 데이터 경로 15개는 6.0.0과 같이 인증·CSRF·사용자별 격리 없이 동작합니다.** 로그인 여부와 상관없이 모든 호출자가 같은 JSON 데이터를 씁니다. 인증·격리는 8.0.0 예정입니다.
+- `Origin` 불일치·CSRF 오류는 403, 로그인·가입·현재 비밀번호 확인 시도가 많으면 429(`Retry-After`), 해시 처리 혼잡·잠금 대기 초과는 503입니다.
+- (8.0.0) 비밀번호 변경·탈퇴: 현재 비밀번호 불일치 400, 처리 중 세션이 사라지면 401, 동시 요청 충돌 409(`다른 요청과 충돌했습니다. 다시 시도해 주세요`), 탈퇴를 막는 참조가 있으면 409(`지금은 탈퇴할 수 없는 계정입니다. 관리자에게 문의하세요`), 입력 검증 422. 상세는 `V8_SPEC.md` §37.
+- (7.0.0 당시) 데이터 경로 15개는 인증·CSRF 없이 동작했습니다. 8.0.0에서 위 "API" 절의 정책으로 바뀌었습니다.
 
 ## Jenkins + JMeter 과제 배포 (5002)
 > 과제 전용 예외입니다. v7 공개 시연(5001)과 아래 "배포와 데이터 관리"의 v6 기록은 바뀌지 않습니다.
@@ -150,6 +175,15 @@ CSV 컬럼은 `id,title,description,completed,priority,due_date,tags,favorite,re
 - 성능 그래프: 과제 전용 Grafana `http://127.0.0.1:3001`(SSH 터널 `ssh -L 3001:127.0.0.1:3001 <서버>`), 데이터 소스 `InfluxDB-JMeter`, 대시보드 ID 5496 가져오기.
 - pytest 의 PostgreSQL 테스트는 빌드마다 만드는 임시 DB 에서만 돕니다(호스트 포트 없음, 빌드 후 삭제). 테스트 DB 보호 장치는 그대로입니다.
 - 손으로 실행할 때는 반드시 `-p fastapi-jmeter` 와 서비스 이름을 붙입니다. `docker compose config`(값 출력)·`down -v`·`volume prune` 은 쓰지 않습니다.
+- (8.0.0) 8.0.0 앱을 대상으로 JMeter를 돌리려면 아래 "JMeter 로그인 절차"를 따라야 합니다. 5002 Jenkins 작업의 실제 스크립트는 저장소에 없으므로, 그 작업에도 같은 변경(Credentials 바인딩 → 속성 파일 → `-q` → `--expected-auth`)을 따로 넣어야 합니다(별도 승인).
+
+### JMeter 로그인 절차 (8.0.0)
+- 대상 환경마다 **합성 테스트 계정 1개**를 둡니다. 가입이 막혀 있으면(`REGISTRATION_ENABLED=false`) 잠시 허용 → 계정 생성 → 다시 `false`로 되돌립니다. 계정명·비밀번호는 저장소·로그·보고에 넣지 않습니다.
+- 계획(`jmeter/fastapi_test_plan.jmx`, `jmeter/experiments/concurrency_readonly.jmx`)은 스레드마다 첫 반복에서 `AUTH POST /auth/login`을 1회 보내 세션 쿠키(스레드별 Cookie Manager)와 `csrf_token`을 받고, `POST /todos`에 `X-CSRF-Token`을 붙입니다. 마지막 반복 뒤 `AUTH POST /auth/logout`으로 세션을 지웁니다. 로그인에 실패한 스레드는 측정 샘플을 보내지 않고 멈춥니다(샘플 수가 모자라 판정 실패).
+- **측정 분리**: InfluxDB Backend Listener는 측정 샘플러(`GET /`, `POST /todos`, `GET /todos`)를 묶은 "Measured" 컨트롤러 안에만 있어서 `AUTH ...` 샘플은 InfluxDB 지표(`transaction='all'` 포함)에 들어가지 않습니다. JTL·HTML 리포트에는 별도 라벨로 남고, `jmeter/check_results.py --expected-auth`가 인증 샘플을 측정 샘플과 따로 셉니다(실패율은 측정 샘플 기준).
+- **자격 증명 전달**: 명령줄 `-J`(프로세스 목록·콘솔 로그에 노출)를 쓰지 않습니다. `jmeter/auth_properties.py write <경로>`가 Jenkins Credentials 환경변수(`JM_AUTH_USER`·`JM_AUTH_PASS`) 또는 대화형 입력으로 속성 파일을 **권한 600의 새 파일**로 만들고, JMeter 컨테이너에 읽기 전용으로 붙여 `-q`로 넘깁니다. Jenkins는 워크스페이스 밖 임시 디렉터리(700)에 만들고 끝나면 지웁니다.
+- v8 결과는 요청마다 세션 조회가 더해지므로 v7(인증 없음) 측정값과 직접 비교하지 않습니다.
+- (2026-11-16, 로컬 격리 실행) 첫 실행은 로그아웃 조건식 오류로 미통과였고(로그아웃 0/10), 조건식을 고친 뒤 남은 합성 데이터를 출처 확인 후 테스트 하네스 경로로 정리하고 다시 실행해 **통과**했습니다: 측정 **30/30**, 인증 **20/20**(로그인 10·로그아웃 10), `JMETER_CHECK_OK`, Groovy 오류·ERROR·FATAL 0건, 가짜 InfluxDB의 `AUTH` 지표 **0건**·`all/all` 합계 30. 실제 InfluxDB와 Jenkins에서는 아직 실행하지 않았습니다.
 
 ## 팀 서버 배포 (3004)와 JMeter 동시 사용자 실험
 > 과제 전용입니다. 앱은 같은 v7.0.0 코드라 데이터 API 15개가 인증 없이 열려 있습니다(`V7_PLAN.md` R-34) — 합성 데이터만 둡니다.
@@ -169,16 +203,26 @@ CSV 컬럼은 `id,title,description,completed,priority,due_date,tags,favorite,re
 
 **Jenkins 검증 파이프라인** — `ci/Jenkinsfile.team3004`
 - Jenkins 작업("Jenkins Deploy Jmeter")에 "Pipeline script"로 붙여 넣도록 만든 스크립트의 저장소 사본입니다. 작업에 실제로 들어 있는 스크립트(빌드 Replay 화면)와 같은지는 아직 확인하지 않았습니다 — 다르면 작업 쪽이 기준입니다.
-- main 체크아웃 → pip-audit → pytest(빌드 전용 PostgreSQL 18) → 팀 전용 태그로 로컬 이미지 빌드(push 없음) → 팀 서버 HTTP 확인(`/` 200, `/todos` 200, `/auth/me` 401, `Version 7.0.0`) → JMeter 30 샘플(`POST /todos` 10건 포함) → 결과·InfluxDB 확인. 배포·SSH는 하지 않습니다.
+- (8.0.0 C안, 2026-11-16 — 사본만 수정, **실제 Jenkins 빌드는 하지 않았습니다**) 공유 `todo.json` 오염을 막으려고 JMeter를 팀 서버가 아닌 **빌드마다 띄우는 일회용 v8 앱·PostgreSQL**에 보냅니다(`V8_SPEC.md` §44.3).
+  - 체크아웃: 기본 브랜치 `feature/v8.0.0`(`CHECKOUT_BRANCH`, 허용 목록은 `main`·`feature/v8.0.0`). HEAD가 `origin/<브랜치>`와 같은지, `REQUIRED_COMMIT` 포함·깨끗한 작업 트리를 확인합니다.
+  - 순서: pip-audit → pytest(빌드 전용 PostgreSQL 18) → v8 이미지 로컬 빌드(push 없음) → 팀 서버 확인 → JMeter 이미지 → 일회용 대상 기동 → 테스트 계정 준비 → 격리 게이트 → JMeter → 결과·InfluxDB 확인 → 정리. 배포·SSH는 하지 않습니다.
+  - 팀 서버: `TEAM_APP_VERSION=7.0.0`으로 **읽기 전용 GET 확인**만 합니다(`/` 200, 비로그인 `/todos` 200, `/auth/me` 401, `Version 7.0.0`). **팀 서버에는 JMeter 요청(쓰기 포함)을 보내지 않습니다.**
+  - 일회용 대상: 이름 `todo-eph-team3004-<빌드번호>-*`, 라벨 `org.fastapi-todos.ci-build=<BUILD_TAG>`, 내부 전용 네트워크, 호스트 포트 없음, PostgreSQL·앱 데이터는 tmpfs. 같은 이름이 이미 있으면 멈춥니다. 격리 게이트(대상 이름·라벨·포트·마운트·네트워크 구성원·`DATABASE_URL`·JSON 경로)가 실패하면 JMeter는 돌지 않습니다.
+  - 테스트 계정: 기본 `JM_AUTH_MODE=generated` — 빌드마다 무작위 합성 계정을 일회용 앱에만 가입합니다(Credentials 불필요). `credentials` 모드(Credentials `jm-team3004-test-account`)는 선택 사항이며 **별도 검증이 필요**합니다. 어느 모드든 값은 워크스페이스 밖 속성 파일(700/600) → `-q`로만 넘깁니다.
+  - 판정: 측정 30·인증 20(`check_results.py --expected-auth`), 라벨별 응답 코드, JTL 요청 URL이 모두 일회용 앱, JMeter 로그의 Groovy 오류·ERROR·FATAL 없음, InfluxDB(`application=fastapi-todos-eph-team3004-<빌드번호>`, 이번 실행 구간만)의 이벤트 1건 이상·`AUTH` 지표 0건·`all/all` 합계 30. 쿼리 실패는 0건과 구분해 실패로 처리합니다.
+  - 정리: 파이프라인 `post { always }`에서 이 빌드의 정확한 이름이고 라벨이 같은 자원만 지웁니다(다르면 `EPH_CLEANUP_SKIP`). 성공·실패·중단 모두 실행됩니다.
+  - 남은 것: 커밋·push, 작업 스크립트 교체(기존 스크립트 백업), 빌드 1회 실행 — 각각 별도 승인. tmpfs 옵션, 실제 InfluxDB 쿼리, Jenkins 호스트 `python3`는 첫 실행에서 확인합니다.
+- (7.0.0 당시) 팀 서버 확인은 `/` 200, `/todos` 200, `/auth/me` 401, `Version 7.0.0`이었고 JMeter 30 샘플은 인증 없이 보냈습니다.
 - Test 단계의 `[PG 진단]` 블록(PostgreSQL 로그 옵션, 백엔드 샘플러, `pg-diag/` 아티팩트)은 R-19 연결 수 2 원인 확인용 임시 코드입니다. 판정에는 쓰이지 않으며, 원인이 확인되면 따로 제거합니다.
 
 **InfluxDB·Grafana**
 - JMeter Backend Listener가 개인 서버의 기존 InfluxDB(`fastapi-jmeter-influxdb`, 네트워크 `fastapi_jmeter_net`)에 `http://influxdb:8086/write?db=jmeter`로 기록합니다.
-- 구분 태그: Jenkins 팀 검증은 `application=fastapi-todos-team3004`, 실험은 `team3004-exp-<STAMP>-u1|u3|u5`. 시작·종료는 `events` 측정값의 `build=<RUN_ID>`입니다.
+- 구분 태그: Jenkins 팀 검증은 `application=fastapi-todos-team3004`(7.0.0 당시) → (8.0.0 C안) `fastapi-todos-eph-team3004-<빌드번호>`(빌드마다 고유), 실험은 `team3004-exp-<STAMP>-u1|u3|u5`. 시작·종료는 `events` 측정값의 `build=<RUN_ID>`입니다.
 - 집계는 `transaction='all' AND statut='all'` 행만 씁니다. 그래프는 위 Grafana(3001, SSH 터널)에서 봅니다.
 
 **동시 사용자 실험** — `jmeter/experiments/` (절차는 [jmeter/experiments/README.md](jmeter/experiments/README.md))
 - 동시 사용자 1·3·5명 × 사용자당 50회 × (`GET /`, `GET /todos`) = 총 900요청, 요청마다 400~600ms 대기. **읽기 전용**이라 팀 서버 데이터가 바뀌지 않습니다.
+- (8.0.0) 팀 서버가 v8이면 테스트 계정 속성 파일(`JMETER_AUTH_FILE`, 권한 600)이 필요합니다. 스레드마다 로그인·로그아웃 각 1회(총 18요청)가 더해지며 지표에서는 빠집니다. 기존 u1·u3·u5 결과는 v7(인증 없음) 기준이라 v8 결과와 직접 비교하지 않습니다.
 - 개인 서버에서 손으로 실행합니다(Jenkins와 무관): `--check-only`로 사전 점검 → 실행. 단계마다 판정이 실패하면 다음 단계로 가지 않습니다.
 - 결과는 서버의 `~/jmeter-exp/<STAMP>/`(`summary.md`, 단계별 JTL·HTML 리포트)이며 저장소에 넣지 않습니다.
 
@@ -372,10 +416,11 @@ playwright install chromium        # UI 테스트용 브라우저 (처음 한 �
 ```bash
 python -m pytest -q --ignore=tests/test_ui.py --ignore=tests/test_ui_auth.py --ignore=tests/test_db_postgres.py
 ```
-- 2026-11-09 마지막 실행(화면 버전 변경 후): **994 passed, 3 deselected**. deselected 3개는 기본 실행에서 빠지는 배포 서버 대상 integration 테스트입니다.
+- (8.0.0, 2026-11-16 3단계) **1161 passed, 9 deselected**(2026-11-15 1142 → 통합 테스트 주소 검사·Jenkins C안 정적 테스트 추가). deselected 9개는 기본 실행에서 빠지는 배포 서버 대상 integration 테스트입니다. `tests/test_jmeter_plan.py`(JMeter 계획·자격 증명 처리·판정 스크립트·Jenkins 사본의 정적 검증)가 여기에 포함됩니다.
+- (7.0.0 당시) 2026-11-09: 994 passed, 3 deselected.
 
-**2. `tests/test_ui_auth.py`** — 로그인·가입 화면 Playwright 테스트. DB 없이 `/auth/*` 응답을 모킹해 따로 실행합니다.
-- 마지막 기록은 3-2 중간 단계의 **31 passed**입니다. 3-2 최종 변경과 화면 버전 변경 뒤에는 **다시 실행하지 않았습니다.**
+**2. `tests/test_ui_auth.py`** — 로그인 게이트·로그인·가입·계정 화면 Playwright 테스트. DB 없이 `/auth/*`와 데이터 경로(`/todos`·`/stats`·`/task-templates`) 응답을 브라우저 안에서 흉내 내 따로 실행합니다(앱에 인증 우회 없음).
+- (8.0.0, 2026-11-15) **54 passed**. (7.0.0 당시 31 passed)
 
 **3. PostgreSQL 테스트 (`tests/test_db_postgres.py`, `tests/test_ui.py`)** — 실행 전에 아래를 반드시 확인하세요.
 - **파괴적 초기화**: 테스트 DB의 `public` 스키마를 **지우고 다시 만듭니다.** 테스트 DB 외의 DB에 절대 쓰지 마세요.
@@ -389,11 +434,15 @@ python -m pytest -q --ignore=tests/test_ui.py --ignore=tests/test_ui_auth.py --i
 python -m pytest -q tests/test_db_postgres.py   # PostgreSQL 하네스
 python -m pytest -q tests/test_ui.py            # PostgreSQL UI (인증 UI 서버 + 실제 로그인 세션, 할 일·템플릿은 임시 JSON)
 ```
-- 2026-11-09 마지막 실행: PostgreSQL 하네스 **83 passed**(화면 버전 변경 전), PostgreSQL UI **125 passed**(화면 버전 변경 후). 두 실행 모두 사전·사후 R-19 점검을 통과했고, 종료 후 사용자 데이터 7개 표는 0행이었습니다.
+- (8.0.0, 2026-11-15) PostgreSQL 하네스 **97/97**(1단계), PostgreSQL UI **125/125**(2단계). 두 실행 모두 사전·사후 R-19 점검이 같았고 종료 후 사용자 데이터 7개 표는 0행이었습니다. 3단계(2026-11-15)에 PostgreSQL 보안 회귀 테스트 1개를 더한 하네스 **98/98**, `Version 8.0.0` 문구 변경 뒤 UI **125/125**를 각각 다시 확인했습니다(사전·사후 R-19 점검 일치).
+- R-19 게이트가 간헐적으로 "DB 연결 수 2"를 보고 멈추는 일이 있습니다(원인 미확정, autovacuum은 가설). 게이트가 멈추면 하네스가 그 순간의 백엔드 목록(PID·종류·역할·상태·시작 시각, 진단 연결 표시)을 중단 메시지에 덧붙입니다. 게이트 조건은 그대로입니다.
+- (7.0.0 당시) 2026-11-09: PostgreSQL 하네스 83 passed, PostgreSQL UI 125 passed.
 - UI 종료 때의 스키마 초기화(알려진 8개 표만 RESTRICT로 삭제)는 정상 경로를 코드 구조와 테스트 결과로 **간접 확인**했을 뿐입니다. RESTRICT 실패 경로, 표 재생성과 Alembic 업그레이드 사이의 공백, 출처 확인의 한계는 남아 있습니다(`V7_PLAN.md` R-19·R-36).
 
 ### 그 밖의 주의
-- `pytest -m integration`은 외부 배포 서버(`INTEGRATION_BASE_URL`, 기본 http://163.239.77.78:5014)에 POST·DELETE를 보냅니다. **명시적 승인 없이 실행하지 않습니다.**
+- `pytest -m integration`은 `INTEGRATION_BASE_URL`의 서버에 POST·DELETE를 보냅니다. (8.0.0) 이 주소는 **필수이고 기본값이 없습니다**(없거나 형식이 틀리면 요청 전에 실패). **명시적 승인 없이 실행하지 않습니다.**
+  - (8.0.0, 2026-11-15) 로컬 격리 서버(테스트 DB)에서 1회 실행해 **9/9** 통과했습니다. 외부 서버에서는 실행하지 않았습니다.
+  - (8.0.0) 테스트 계정으로 로그인합니다: `INTEGRATION_USERNAME`·`INTEGRATION_PASSWORD` 환경변수(Jenkins는 Credentials 바인딩)가 없으면 skip이 아니라 실패합니다. 세션 쿠키와 `csrf_token`으로 기존 CRUD를 확인하고, 익명 401·CSRF 없음 403도 확인한 뒤 로그아웃합니다. 값은 명령줄·로그에 넣지 않습니다.
 - 화면·드래그 검증은 Chromium 헤드리스에서만 자동으로 했습니다. 다른 브라우저와 실제 화면의 줄바꿈·px 배치는 확인하지 않았습니다.
 - API 테스트는 FastAPI `TestClient`로, 테스트마다 임시 `todo.json`을 씁니다. 실제 `todo.json`·`task_templates.json`은 `tests/conftest.py`가 해시로 보호합니다.
 - UI 테스트는 임시 데이터 파일로 uvicorn을 따로 띄우고 Playwright로 확인합니다.
@@ -415,8 +464,9 @@ fastapi-app/
 └── tests/                # pytest (API, UI, 통합, DB 없는 인증·스키마, PostgreSQL)
     └── pg_harness.py     # (7.0.0) PostgreSQL 테스트 공용 하네스
 scripts/load-data.sh      # 백업 → 데이터 볼륨 이전·복구 (6.0.0 운영)
-ci/                       # (과제) test-runner.Dockerfile(pytest 이미지), Jenkinsfile.team3004(팀 서버 검증 파이프라인 기록)
+ci/                       # (과제) test-runner.Dockerfile(pytest 이미지), Jenkinsfile.team3004(팀 서버 GET 확인 + 일회용 v8 대상 JMeter 파이프라인 사본)
 jmeter/                   # (과제) JMeter 이미지·계획·판정, experiments/(읽기 전용 동시 사용자 실험)
+                          #   (8.0.0) auth_properties.py — 테스트 계정 속성 파일(600) 작성·로그인 개수 확인
 deploy/team/              # (과제) 팀 서버 3004 compose (계정명·비밀값은 서버의 .env)
 ```
 `migrate_json.py`(JSON → PostgreSQL 이전 도구)는 8.0.0 예정이며 아직 없습니다.

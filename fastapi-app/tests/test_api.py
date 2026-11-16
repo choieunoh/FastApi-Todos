@@ -9,6 +9,17 @@ from conftest import REAL_TODO_FILE, REAL_TODO_HASH, file_hash
 from main import TodoItem, app, load_todos, save_todos
 
 client = TestClient(app)
+TEST_USER = main.CurrentUser(id=1, username="api-test", csrf_token="api-test-csrf")
+
+
+@pytest.fixture(autouse=True)
+def signed_in_user():
+    # (8.0.0) 인증 대체 픽스처 — 이 파일은 v4~v6 데이터 API 의 동작만 검사한다. 데이터 경로 15개의 유일한 인증 의존성
+    # require_csrf(require_user 포함)만 고정 사용자로 바꾼다. 실제 인증·CSRF·계정 보안 검사는 이 대체 없이
+    # test_auth_routes.py·test_db_postgres.py 에서 한다 (V8_SPEC E-15, §43.2). 끝나면 이 항목만 지운다
+    app.dependency_overrides[main.require_csrf] = lambda: TEST_USER
+    yield
+    app.dependency_overrides.pop(main.require_csrf, None)
 
 
 @pytest.fixture(autouse=True)
@@ -212,7 +223,8 @@ def test_a22_real_todo_file_untouched():
 def test_index_served():
     res = client.get("/")
     assert res.status_code == 200
-    assert "Version 7.0.0" in res.text
+    assert "Version 8.0.0 · 할 일·템플릿은 로그인한 모든 사용자가 함께 씁니다" in res.text   # (8.0.0) 버전 문단(V8_SPEC §41.5)
+    assert "Version 7.0.0" not in res.text
 
 
 # ---------- 5.0.0 1단계: 즐겨찾기 ----------
@@ -1320,14 +1332,21 @@ TODO_RESPONSE_FIELDS = {"id", "title", "description", "completed", "priority", "
                         "recurrence", "created_at", "completed_at", "subtasks", "next_spawned"}
 
 
-# (7.0.0 Phase 2-E) 새 경로만 추가된다 — 인증 4개
-AUTH_ROUTES = {("POST", "/auth/register"), ("POST", "/auth/login"), ("POST", "/auth/logout"), ("GET", "/auth/me")}
+# (7.0.0 Phase 2-E) 새 경로만 추가된다 — 인증 4개, (8.0.0) 계정 관리 2개
+AUTH_ROUTES = {("POST", "/auth/register"), ("POST", "/auth/login"), ("POST", "/auth/logout"), ("GET", "/auth/me"),
+               ("POST", "/auth/password"), ("POST", "/auth/account/delete")}
 
 
 def test_routes_are_v6_plus_auth_only():
     from fastapi.routing import APIRoute
-    routes = {(m, r.path) for r in app.routes if isinstance(r, APIRoute) for m in r.methods}
+    # (8.0.0) v6 데이터 경로는 main.data_router 에 선언되어 인증 의존성과 함께 앱에 붙는다(V8_SPEC §40)
+    routes = {(m, r.path) for r in [*app.routes, *main.data_router.routes] if isinstance(r, APIRoute)
+              for m in r.methods}
     assert routes == V6_ROUTES | AUTH_ROUTES                         # 알림용 경로는 없다, v6 경로는 그대로
+    assert {(m, r.path) for r in main.data_router.routes for m in r.methods} == V6_ROUTES - {("GET", "/"), ("GET", "/metrics")}
+    # 선언만이 아니라 앱에 실제로 붙었는지 — 공개 API app.openapi() 기준 (/, /metrics 는 문서에서 뺀 경로)
+    documented = {(m.upper(), p) for p, item in app.openapi()["paths"].items() for m in item}
+    assert documented == (V6_ROUTES | AUTH_ROUTES) - {("GET", "/"), ("GET", "/metrics")}
 
 
 def test_v6_validation_error_body_is_unchanged():

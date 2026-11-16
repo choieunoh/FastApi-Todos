@@ -52,6 +52,13 @@
           --focus: #1a5fd0;
           --chart-bar: #2a4a8a;
           --chart-track: #eef3fc;
+          --on-accent: #fff;                     /* (8.0.0) 주요 버튼 글자 — accent 배경 위 */
+          /* (8.0.0) 간격·모서리 — 색이 아니므로 테마와 무관. 새로 쓰거나 고치는 규칙부터 쓴다(V8_SPEC §41.3) */
+          --space-1: .25rem;
+          --space-2: .5rem;
+          --space-3: .8rem;
+          --space-4: 1.2rem;
+          --radius: 6px;
         }
         @media (prefers-color-scheme: dark) {
           :root:not([data-theme="light"]) {
@@ -78,6 +85,7 @@
             --focus: #9db8ff;
             --chart-bar: #9db8ff;
             --chart-track: #22304d;
+            --on-accent: #15171a;
           }
         }
         :root[data-theme="dark"] {
@@ -104,6 +112,7 @@
           --focus: #9db8ff;
           --chart-bar: #9db8ff;
           --chart-track: #22304d;
+          --on-accent: #15171a;
         }
         body {
           max-width: 640px;
@@ -123,6 +132,8 @@
         #status-message { margin: .3rem 0; color: var(--text-muted); font-size: .9rem; }
         #status-message:empty { display: none; }
         form { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+        /* (8.0.0) 할 일 추가 폼은 높이를 바꾸지 않는다 — 테두리 상자(안쪽 여백)를 넣으면 폼이 184→221px 로 커져 [칸반] 버튼이
+           718→755px(1280×720)로 내려가고, Playwright 칸반 드래그가 다른 카드를 집는다(R-32·R8-5 실측). 주요 버튼 표시만 더한다 */
         input[type="text"] { flex: 1 1 12rem; padding: .5rem; }
         textarea { flex: 1 1 100%; min-height: 3.2rem; padding: .5rem; font: inherit; }
         .template-panel {
@@ -136,6 +147,9 @@
         ul { list-style: none; padding: 0; }
         li { display: flex; align-items: center; gap: .5rem; padding: .4rem 0; border-bottom: 1px solid var(--border); }
         .content { flex: 1; display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
+        /* (8.0.0) 목록 항목: 제목 줄을 메타 줄보다 또렷하게, 줄 간격 정리 (요소 구조·testid 그대로) */
+        #todo-list > li { padding: var(--space-2) 0; }
+        #todo-list > li > .content > span:first-child { font-weight: 500; line-height: 1.35; overflow-wrap: anywhere; }
         .done { text-decoration: line-through; color: var(--text-muted); }
         .version {
           color: var(--text-muted);
@@ -307,37 +321,81 @@
           white-space: nowrap;
         }
         .notify-bar { display: flex; justify-content: flex-end; margin: -1rem 0 .8rem; }
-        /* (7.0.0 Phase 2-G) 로그인·가입 — 과도기에는 앱 영역과 함께 보인다(V7_SPEC §30). 색은 위 토큰만 쓴다 */
-        .auth-user { display: flex; align-items: center; gap: .4rem; font-size: .85rem; }
-        .auth-user span { overflow-wrap: anywhere; }
-        /* 접힌 상태: 알림 바 바로 아래 진입 버튼 한 줄. 칸반 등 아래 영역의 세로 위치가 2-G 이전과 같도록 높이를 상쇄한다:
-           알림 바 아래 여백(.8rem)을 버튼 위 여백으로 쓰지 않고(-.8rem 과 상쇄 → 간격 0, 겹침 없음),
-           접힌 진입점이 보일 때만 할 일 폼·템플릿 패널의 아래 여백(각 1rem)을 .5rem 으로 줄여 버튼 높이를 돌려준다
-           (폼과 템플릿 패널 사이가 붙지 않게 두 곳에 나눈다. 버튼 크기는 줄이지 않는다) */
-        .auth-panel { margin: -.8rem 0 0; }
-        .auth-open { display: block; margin-left: auto; padding: .2rem .7rem; font-size: .85rem; cursor: pointer; }
-        #auth-panel:not([hidden]):not(.open) + #todo-form { margin-bottom: .5rem; }
-        #auth-panel:not([hidden]):not(.open) ~ .template-panel { margin-bottom: .5rem; }
-        /* 접힌 상태에서는 종·진입 버튼·제목이 간격 없이 붙으므로 두 버튼의 윤곽선을 테두리에 붙여(굵기·색은 그대로)
-           이웃 컨트롤 위로 덜 나오게 한다. 로그인 상태(패널 hidden)와 펼친 폼에는 적용하지 않는다 */
-        #auth-panel:not(.open) .auth-open:focus-visible,
-        body:has(#auth-panel:not([hidden]):not(.open)) .notify-bell:focus-visible { outline-offset: 0; }
-        /* 펼친 상태: 테두리 상자 */
-        .auth-panel.open {
-          margin: 0 0 1rem;
-          padding: .6rem .8rem;
+        /* (8.0.0) 알림 줄 왼쪽의 공유 데이터 안내 — 남는 폭을 쓰고, 좁으면 줄바꿈된다 */
+        .notify-bar { align-items: center; gap: var(--space-2); }
+        .notify-bar .shared-note { flex: 1 1 auto; min-width: 0; margin: 0; }
+        /* (8.0.0) 화면 로그인 게이트 — 로그아웃 상태에서는 로그인 카드만, 로그인하면 앱 영역(#app-area)만 보인다(V8_SPEC §41.1).
+           v7 의 접힌 진입 버튼(#auth-open)과 그 높이 상쇄 규칙(R-32)은 없앴다. 색은 위 토큰만 쓴다 */
+        #app-area[hidden], .auth-panel[hidden], .account-panel[hidden], .account-menu[hidden] { display: none; }
+        /* 버튼 3단계(기본·주요·위험) — 클래스만 더한다. 기본은 브라우저 버튼 그대로.
+           크기(안쪽 여백)는 바꾸지 않는다 — 앱 영역의 세로 배치가 칸반 드래그 테스트에 민감하다(R-32). 큰 버튼은 아래 .stack-form 만 */
+        .btn-primary {
+          font-weight: 600;
+          color: var(--on-accent);
+          background: var(--accent);
+          border: 1px solid var(--accent);
+          border-radius: 4px;
+          cursor: pointer;
+        }
+        .btn-danger {
+          color: var(--danger);
+          background: var(--surface);
+          border: 1px solid var(--danger);
+          border-radius: 4px;
+          cursor: pointer;
+        }
+        .btn-link {
+          padding: 0;
+          font: inherit;
+          font-size: .9rem;
+          color: var(--accent);
+          text-decoration: underline;
+          background: none;
+          border: none;
+          cursor: pointer;
+        }
+        .shared-note { margin: 0 0 var(--space-3); font-size: .85rem; color: var(--text-muted); }
+        /* 헤더 계정 영역: [계정(사용자명)] [로그아웃] */
+        .auth-user { display: flex; align-items: center; gap: var(--space-2); font-size: .85rem; }
+        /* 헤더가 줄바꿈되면 아래 .version(위 여백 -1rem)이 버튼과 겹친다 — 헤더 컨트롤을 위로 올려 눌리게 한다(배치는 그대로) */
+        .app-head .auth-user, .app-head .theme-picker { position: relative; z-index: 1; }
+        .account-menu { display: inline-flex; align-items: center; gap: var(--space-1); max-width: 12rem; cursor: pointer; }
+        .account-menu span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        /* 로그인·가입 카드 — 가운데, 라벨이 위에 있는 세로 입력란 */
+        .auth-panel {
+          max-width: 22rem;
+          margin: var(--space-4) auto;
+          padding: var(--space-4);
           border: 1px solid var(--accent-border);
-          border-radius: 6px;
+          border-radius: var(--radius);
         }
-        .auth-panel h2 { margin: 0 0 .4rem; font-size: 1rem; }
-        .auth-panel form { margin-bottom: 0; align-items: flex-end; }
-        .auth-panel label {
-          display: flex; flex-direction: column; gap: .2rem;
-          flex: 1 1 10rem; min-width: 0; font-size: .85rem;
-        }
+        .auth-panel h2 { margin: 0 0 var(--space-2); font-size: 1.15rem; }
+        .auth-panel .shared-note { margin-bottom: var(--space-3); }
+        .stack-form { display: flex; flex-direction: column; align-items: stretch; gap: var(--space-3); margin: 0; }
+        .stack-form label { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; font-size: .85rem; }
         /* 세로 label 안 — 위 input[type="text"] 규칙의 flex 크기가 높이로 적용되지 않게 끈다 */
-        .auth-panel input { flex: 0 0 auto; width: 100%; box-sizing: border-box; padding: .5rem; }
-        #auth-error { margin: .4rem 0 0; color: var(--danger); overflow-wrap: anywhere; }
+        .stack-form input { flex: 0 0 auto; width: 100%; box-sizing: border-box; padding: .5rem; }
+        .stack-form .form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); }
+        .stack-form .btn-primary, .stack-form .btn-danger { padding: .4rem .9rem; }
+        .form-error { margin: var(--space-2) 0 0; color: var(--danger); overflow-wrap: anywhere; }
+        .form-error[hidden] { display: none; }
+        /* 계정 패널 — 알림 패널과 같은 펼침 방식, 폼은 세로로 쌓는다 */
+        .account-panel {
+          padding: var(--space-3);
+          margin-bottom: var(--space-4);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+        }
+        .account-panel:focus { outline: none; }
+        .account-panel:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+        .account-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+        .account-head h2 { flex: 1; margin: 0; font-size: 1rem; }
+        .account-section { padding-top: var(--space-3); margin-top: var(--space-3); border-top: 1px solid var(--border); }
+        .account-section h3 { margin: 0 0 var(--space-2); font-size: .95rem; }
+        .account-info { display: grid; grid-template-columns: auto 1fr; gap: var(--space-1) var(--space-3); margin: 0; font-size: .9rem; }
+        .account-info dt { color: var(--text-muted); }
+        .account-info dd { margin: 0; overflow-wrap: anywhere; }
+        .account-section .shared-note { margin-bottom: var(--space-2); }
         .notify-bell { display: inline-flex; align-items: center; gap: .3rem; padding: .3rem .7rem; cursor: pointer; }
         .notify-badge {
           min-width: 1.2rem;
@@ -385,6 +443,25 @@
         li.flash { outline: 3px solid var(--accent); outline-offset: 2px; }
 
         @media (max-width: 560px) {
+          /* 모바일 헤더: 제목·테마 / 계정·로그아웃을 각각 한 줄로 배치 */
+          .app-head {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            align-items: center;
+            gap: .5rem;
+          }
+          .app-head h1 { min-width: 0; margin: .4rem 0; }
+          .app-head .theme-picker { grid-column: 2; grid-row: 1; }
+          .app-head .auth-user {
+            grid-column: 1 / -1;
+            grid-row: 2;
+            flex-wrap: wrap;
+            min-width: 0;
+          }
+          .app-head .account-menu { max-width: 100%; }
+
+          /* 기존 음수 여백으로 인한 헤더·설명 문구 겹침 방지 */
+          .version { margin-top: .5rem; }
           .kanban-columns { grid-template-columns: minmax(0, 1fr); }   /* 좁은 화면에서는 열을 세로로 쌓는다 */
           /* 목록 항목: 내용이 한 글자 폭으로 눌리지 않게 Edit/Delete 를 다음 줄(오른쪽)로 넘긴다 */
           #todo-list > li { flex-wrap: wrap; }
@@ -507,15 +584,91 @@
           <option value="dark">다크</option>
         </select>
       </label>
-      <!-- (7.0.0 Phase 2-G) 로그인한 사용자 — 로그인 전에는 숨긴다 -->
+      <!-- (8.0.0) 로그인한 사용자 — [계정(사용자명)] 버튼이 계정 패널을 펼친다. 로그인 전에는 숨긴다 -->
       <div class="auth-user">
-        <span id="current-user" data-testid="current-user" hidden></span>
+        <button type="button" id="account-menu" class="account-menu" data-testid="account-menu"
+                aria-expanded="false" aria-controls="account-panel" aria-label="계정" hidden>
+          <span aria-hidden="true">👤</span><span id="current-user" data-testid="current-user" hidden></span>
+        </button>
         <button type="button" id="logout" data-testid="logout" aria-label="로그아웃" hidden>로그아웃</button>
       </div>
     </header>
-    <p class="version">Version 7.0.0</p>
-    <!-- 마감일 알림 센터 — 앱 안에서만 보인다. 읽음 표시는 이 브라우저(localStorage)에만 저장한다 -->
+    <p class="version">Version 8.0.0 · 할 일·템플릿은 로그인한 모든 사용자가 함께 씁니다</p>
+    <!-- (8.0.0) 로그인·가입 카드 — 로그아웃 상태에서만 보인다(화면 로그인 게이트, V8_SPEC §41.1).
+         인증 정보·CSRF 토큰은 메모리에만 둔다 -->
+    <section id="auth-panel" class="auth-panel" data-testid="auth-panel" aria-labelledby="auth-title" hidden>
+      <h2 id="auth-title">로그인</h2>
+      <p class="shared-note">할 일·템플릿은 로그인한 모든 사용자가 함께 쓰는 공유 데이터입니다.</p>
+      <form id="login-form" class="stack-form" data-testid="login-form">
+        <label>아이디
+          <input type="text" id="auth-username" data-testid="auth-username" name="username"
+                 autocomplete="username" maxlength="1024" required>
+        </label>
+        <label>비밀번호
+          <input type="password" id="auth-password" data-testid="auth-password" name="password"
+                 autocomplete="current-password" maxlength="1024" required>
+        </label>
+        <div class="form-actions">
+          <button type="submit" id="auth-submit" class="btn-primary" data-testid="auth-submit">로그인</button>
+          <button type="button" id="auth-mode-toggle" class="btn-link" data-testid="auth-mode-toggle"
+                  aria-pressed="false">회원가입으로 전환</button>
+        </div>
+      </form>
+      <p id="auth-error" class="form-error" data-testid="auth-error" role="alert" hidden></p>
+    </section>
+    <!-- (8.0.0) 앱 영역 — 로그인한 상태에서만 보인다. 숨겨진 동안에는 데이터 요청을 보내지 않는다 -->
+    <div id="app-area" data-testid="app-area" hidden>
+    <!-- (8.0.0) 계정 패널 — 내 정보·비밀번호 변경·회원 탈퇴. 계정 버튼으로 펼치고 Esc·[닫기]로 닫는다 -->
+    <section id="account-panel" class="account-panel" data-testid="account-panel" aria-labelledby="account-title"
+             tabindex="-1" hidden>
+      <div class="account-head">
+        <h2 id="account-title">내 계정</h2>
+        <button type="button" id="account-close">닫기</button>
+      </div>
+      <dl class="account-info">
+        <dt>아이디</dt><dd id="account-username"></dd>
+        <dt>가입일</dt><dd id="account-created" data-testid="account-created"></dd>
+      </dl>
+      <section class="account-section" aria-labelledby="password-title">
+        <h3 id="password-title">비밀번호 변경</h3>
+        <form id="password-form" class="stack-form" data-testid="password-form">
+          <label>현재 비밀번호
+            <input type="password" id="password-current" data-testid="password-current"
+                   autocomplete="current-password" maxlength="1024" required>
+          </label>
+          <label>새 비밀번호 (8~128자)
+            <input type="password" id="password-new" data-testid="password-new"
+                   autocomplete="new-password" maxlength="1024" required>
+          </label>
+          <label>새 비밀번호 확인
+            <input type="password" id="password-confirm" data-testid="password-confirm"
+                   autocomplete="new-password" maxlength="1024" required>
+          </label>
+          <div class="form-actions">
+            <button type="submit" id="password-submit" class="btn-primary" data-testid="password-submit">변경</button>
+          </div>
+        </form>
+        <p id="password-error" class="form-error" data-testid="password-error" role="alert" hidden></p>
+      </section>
+      <section class="account-section" aria-labelledby="delete-title">
+        <h3 id="delete-title">회원 탈퇴</h3>
+        <p class="shared-note">탈퇴하면 계정과 모든 기기의 로그인이 삭제됩니다. 할 일·템플릿은 공유 데이터라 삭제되지 않습니다.</p>
+        <form id="delete-account-form" class="stack-form" data-testid="delete-account-form">
+          <label>탈퇴할 계정의 비밀번호
+            <input type="password" id="delete-password" data-testid="delete-password"
+                   autocomplete="current-password" maxlength="1024" required>
+          </label>
+          <div class="form-actions">
+            <button type="submit" id="delete-submit" class="btn-danger" data-testid="delete-submit">탈퇴</button>
+          </div>
+        </form>
+        <p id="delete-error" class="form-error" data-testid="delete-error" role="alert" hidden></p>
+      </section>
+    </section>
+    <!-- 마감일 알림 센터 — 앱 안에서만 보인다. 읽음 표시는 이 브라우저(localStorage)에만 저장한다.
+         (8.0.0) 같은 줄 왼쪽에 공유 데이터 안내 -->
     <div class="notify-bar">
+      <p class="shared-note" id="shared-note" data-testid="shared-note">할 일·템플릿은 로그인한 모든 사용자가 함께 보고 수정하는 공유 데이터입니다.</p>
       <button type="button" id="notification-bell" class="notify-bell" data-testid="notification-bell"
               aria-expanded="false" aria-controls="notification-panel">
         🔔 알림 <span id="notification-badge" class="notify-badge" data-testid="notification-badge" hidden>0</span>
@@ -531,31 +684,6 @@
       <ul id="notification-list" class="notify-list" aria-labelledby="notification-title"></ul>
     </section>
     <p id="notification-live" class="visually-hidden" data-testid="notification-live" role="status" aria-live="polite"></p>
-    <!-- (7.0.0 Phase 2-G) 로그인·가입 — 과도기: 로그인하지 않아도 아래 앱 영역은 그대로 쓴다(V7_SPEC §30).
-         인증 정보·CSRF 토큰은 메모리에만 둔다. 데이터는 아직 사용자별로 나뉘지 않는다(Phase 3) -->
-    <section id="auth-panel" class="auth-panel" data-testid="auth-panel" aria-labelledby="auth-title">
-      <!-- 기본은 접혀 있다(칸반 등 아래 영역의 세로 위치를 거의 바꾸지 않게). 펼치면 아래 폼이 보인다 -->
-      <button type="button" id="auth-open" class="auth-open" aria-expanded="false" aria-controls="auth-form-area">
-        로그인 / 회원가입
-      </button>
-      <div id="auth-form-area" hidden>
-      <h2 id="auth-title">로그인</h2>
-      <form id="login-form" data-testid="login-form">
-        <label>아이디
-          <input type="text" id="auth-username" data-testid="auth-username" name="username"
-                 autocomplete="username" maxlength="1024" required>
-        </label>
-        <label>비밀번호
-          <input type="password" id="auth-password" data-testid="auth-password" name="password"
-                 autocomplete="current-password" maxlength="1024" required>
-        </label>
-        <button type="submit" id="auth-submit" data-testid="auth-submit">로그인</button>
-        <button type="button" id="auth-mode-toggle" data-testid="auth-mode-toggle"
-                aria-pressed="false">회원가입으로 전환</button>
-      </form>
-      </div>
-      <p id="auth-error" data-testid="auth-error" role="alert" hidden></p>
-    </section>
     <form id="todo-form">
       <input
         type="text"
@@ -592,7 +720,7 @@
         placeholder="하위 작업 (한 줄에 하나)"
       ></textarea>
 
-      <button type="submit">Add To-Do</button>
+      <button type="submit" class="btn-primary">Add To-Do</button>
     </form>
     <section class="template-panel" data-testid="template-panel" aria-label="작업 템플릿">
       <div class="template-row">
@@ -725,11 +853,12 @@
       <button type="button" id="bulk-select-all" data-testid="bulk-select-all">보이는 항목 전체 선택</button>
       <button type="button" id="bulk-complete" data-testid="bulk-complete" disabled>완료</button>
       <button type="button" id="bulk-uncomplete" data-testid="bulk-uncomplete" disabled>미완료</button>
-      <button type="button" id="bulk-delete" data-testid="bulk-delete" disabled>삭제</button>
+      <button type="button" id="bulk-delete" class="btn-danger" data-testid="bulk-delete" disabled>삭제</button>
     </div>
     <p id="error" role="alert" hidden></p>
     <p id="status-message" data-testid="status-message" role="status" aria-live="polite"></p>
     <ul id="todo-list"></ul>
+    </div><!-- /#app-area -->
     <div id="undo-toast" class="undo-toast" data-testid="undo-toast" role="status" hidden>
       <span id="undo-message"></span>
       <button type="button" id="undo-button" data-testid="undo-button">실행 취소</button>
@@ -808,7 +937,11 @@
             error.status = res.status;
             error.detail = errorDetail(text);
             error.retryAfter = res.headers.get("Retry-After");
-            if (res.status === 401 && !url.startsWith("/auth/")) invalidateAuth("다시 로그인하세요.");
+            // (8.0.0) 데이터 경로 401 = 세션 만료·로그아웃·탈퇴 → 로그인 화면으로(게이트). 이 오류는 #error 에 쓰지 않는다
+            if (res.status === 401 && !url.startsWith("/auth/")) {
+              error.sessionExpired = true;
+              invalidateAuth("다시 로그인하세요.");
+            }
             throw error;
           }
           return res.status === 204 ? null : res.json();
@@ -830,9 +963,13 @@
             errorEl.hidden = true;
             if (done) showStatus(done);
           } catch (e) {
+            if (done) showStatus("");
+            if (e.sessionExpired) {              // (8.0.0) 로그인 화면이 안내한다 — 숨은 앱 영역에 오류를 남기지 않는다
+              errorEl.hidden = true;
+              return;
+            }
             errorEl.textContent = `${what} 실패: ${e.message}`;
             errorEl.hidden = false;
-            if (done) showStatus("");
           }
         }
 
@@ -1485,7 +1622,7 @@
         function refreshDay() {
           if (todayStr() === renderedDay) return;
           applyFilters();                        // 알림·D-day·기한 초과·캘린더 오늘·통계 바
-          if (currentView === "stats") run("통계 불러오기", loadStats);
+          if (currentView === "stats" && authUser) run("통계 불러오기", loadStats);   // (8.0.0) 로그인 상태에서만 요청
         }
 
         function scheduleMidnight() {
@@ -1599,7 +1736,9 @@
 
           li.dataset.testid = "todo-item";
           li.dataset.id = todo.id;                 // 알림에서 이 항목으로 이동할 때 찾는다
-          li.append(pick, check, star, content, button("Edit", () => edit(todo)), button("Delete", () => remove(todo.id)));
+          const deleteBtn = button("Delete", () => remove(todo.id));
+          deleteBtn.className = "btn-danger";      // (8.0.0) 위험 버튼 — 텍스트·동작 그대로
+          li.append(pick, check, star, content, button("Edit", () => edit(todo)), deleteBtn);
           return li;
         }
 
@@ -1746,7 +1885,7 @@
           recurrence.setAttribute("aria-label", "반복");
           tags.setAttribute("aria-label", "태그");
 
-          const saveBtn = el("button", { type: "submit", textContent: "저장" });
+          const saveBtn = el("button", { type: "submit", textContent: "저장", className: "btn-primary" });   // (8.0.0) 주요 버튼
           saveBtn.dataset.testid = "edit-save";
           const cancelBtn = button("취소", () => { editingId = null; applyFilters(); });
           cancelBtn.dataset.testid = "edit-cancel";
@@ -1996,14 +2135,22 @@
         };
         syncThemeSelect();
 
-        // ---------- (7.0.0 Phase 2-G) 로그인·가입·로그아웃 — 과도기: 앱 영역은 숨기지 않는다(V7_SPEC §30) ----------
+        // ---------- (8.0.0) 화면 로그인 게이트·로그인·가입·로그아웃·계정 (V8_SPEC §41) ----------
+        // 로그인하지 않으면 로그인 카드만 보이고 데이터 요청(/todos·/stats·/task-templates)을 보내지 않는다.
+        // 인증 정보·CSRF 토큰은 메모리에만 둔다(localStorage·sessionStorage 에 저장하지 않는다)
         const authPanelEl = $("auth-panel"), authFormEl = $("login-form"), authTitleEl = $("auth-title");
         const authUsernameEl = $("auth-username"), authPasswordEl = $("auth-password");
         const authSubmitEl = $("auth-submit"), authToggleEl = $("auth-mode-toggle"), authErrorEl = $("auth-error");
-        const currentUserEl = $("current-user"), logoutEl = $("logout");
-        const authOpenEl = $("auth-open"), authFormAreaEl = $("auth-form-area");
+        const currentUserEl = $("current-user"), logoutEl = $("logout"), appAreaEl = $("app-area");
+        const accountMenuEl = $("account-menu"), accountPanelEl = $("account-panel");
+        const passwordFormEl = $("password-form"), passwordErrorEl = $("password-error");
+        const passwordCurrentEl = $("password-current"), passwordNewEl = $("password-new");
+        const passwordConfirmEl = $("password-confirm"), passwordSubmitEl = $("password-submit");
+        const deleteFormEl = $("delete-account-form"), deletePasswordEl = $("delete-password");
+        const deleteSubmitEl = $("delete-submit"), deleteErrorEl = $("delete-error");
         let authMode = "login";                  // "login" | "register" — 같은 폼에서 바꾼다
         let authBusy = false;                    // 제출 중이면 다시 보내지 않는다
+        let accountBusy = false;                 // 비밀번호 변경·탈퇴 제출 중
 
         // 서버 문구 대신 쓰는 안전한 안내 (500·503·예상하지 못한 형식은 서버 원문을 보여주지 않는다)
         const AUTH_MESSAGES = {
@@ -2032,42 +2179,67 @@
           return AUTH_MESSAGES[error.status] || AUTH_FALLBACK;
         }
 
-        function showAuthError(text) {
-          authErrorEl.textContent = text;
-          authErrorEl.hidden = !text;
+        // (8.0.0) 비밀번호 변경·탈퇴 오류 — 401 은 호출자가 로그인 화면으로 보낸다
+        const ACCOUNT_DELETE_BLOCKED = "지금은 탈퇴할 수 없는 계정입니다. 관리자에게 문의하세요";
+        function accountErrorText(error, kind) {
+          if (error.status === 400) {
+            return kind === "password" ? "현재 비밀번호가 올바르지 않습니다." : "비밀번호가 올바르지 않습니다.";
+          }
+          if (error.status === 403) return "보안 확인(출처·CSRF)에 실패했습니다. 페이지를 새로고침한 뒤 다시 시도해 주세요.";
+          if (error.status === 409) {
+            return kind === "delete" && error.detail === ACCOUNT_DELETE_BLOCKED
+              ? `${ACCOUNT_DELETE_BLOCKED}.` : "다른 요청과 충돌했습니다. 다시 시도해 주세요.";
+          }
+          if (error.status === 422 && kind === "password") {
+            const base = "새 비밀번호는 8~128자이고 현재 비밀번호와 달라야 합니다.";
+            const detail = authErrorText(error);
+            return detail === "입력값을 확인해 주세요." ? base : `${base} (${detail})`;
+          }
+          return authErrorText(error);          // 422(탈퇴)·429·500·503·그 밖
         }
 
-        // 폼 영역 펼치기·접기 — hidden 이라 접힌 입력란·버튼은 Tab 순서에서도 빠진다
-        function setAuthOpen(open) {
-          authFormAreaEl.hidden = !open;
-          authOpenEl.setAttribute("aria-expanded", String(open));
-          authPanelEl.classList.toggle("open", open);
+        function showMessage(target, text) {
+          target.textContent = text;
+          target.hidden = !text;
         }
+        const showAuthError = (text) => showMessage(authErrorEl, text);
 
-        // 화면 표시만 바꾼다 — 사용자명은 textContent 로만 넣는다. 로그인하면 진입점·폼을 숨기고 다음을 위해 접어 둔다
+        // 화면 표시만 바꾼다 — 사용자명은 textContent 로만 넣는다
         function renderAuth() {
           const signedIn = authUser !== null;
           currentUserEl.textContent = signedIn ? authUser.username : "";
           currentUserEl.hidden = !signedIn;
+          accountMenuEl.hidden = !signedIn;
           logoutEl.hidden = !signedIn;
-          authPanelEl.hidden = signedIn;
-          if (signedIn) setAuthOpen(false);
+          authPanelEl.hidden = signedIn;         // 게이트: 로그인 카드와 앱 영역 중 하나만 보인다
+          appAreaEl.hidden = !signedIn;
+          if (!signedIn) setAccountOpen(false, { restoreFocus: false });
+          $("account-username").textContent = signedIn ? authUser.username : "";
+          $("account-created").textContent = signedIn && authUser.createdAt ? kstDate(authUser.createdAt) : "-";
         }
 
         function setSignedIn(data) {
           authEpoch += 1;
-          authUser = { id: data.id, username: String(data.username) };
+          authUser = { id: data.id, username: String(data.username),
+                       createdAt: typeof data.created_at === "string" ? data.created_at : authUser?.createdAt ?? null };
           csrfToken = String(data.csrf_token);
           renderAuth();
+        }
+
+        // 로그인 상태가 된 뒤 데이터 불러오기를 시작한다 (다시 로그인하면 목록을 새로 받는다)
+        function startApp() {
+          load();
+          run("템플릿 목록 불러오기", () => fetchTemplates());
         }
 
         function invalidateAuth(message) {
           authEpoch += 1;
           authUser = null;
           csrfToken = null;
+          setNotificationsOpen(false, false);    // 숨는 앱 영역의 종으로 포커스를 옮기지 않는다
           renderAuth();
-          setAuthOpen(true);                     // 다시 로그인할 수 있게 폼과 안내를 함께 보인다
           showAuthError(message);
+          authUsernameEl.focus();                // 숨은 앱 영역에 있던 포커스를 로그인 카드로
         }
 
         function setAuthMode(mode) {
@@ -2081,13 +2253,15 @@
           showAuthError("");
         }
 
-        // 시작 시 한 번 — 200 이면 로그인 상태, 401 은 로그인하지 않은 상태일 뿐이라 #error 에 쓰지 않는다.
-        // 응답이 오기 전에 로그인·가입·로그아웃·무효화가 있었으면(authEpoch 가 바뀌었으면) 그 응답은 버린다
+        // 시작 시 한 번 — 200 이면 앱을 보이고 불러오기 시작, 401 이면 로그인 카드만(#error 에 쓰지 않는다).
+        // 응답이 오기 전에 로그인·가입·무효화가 있었으면(authEpoch 가 바뀌었으면) 그 응답은 버린다
         async function checkAuth() {
           const epoch = authEpoch;
           try {
             const me = await api("/auth/me");
-            if (epoch === authEpoch) setSignedIn(me);
+            if (epoch !== authEpoch) return;
+            setSignedIn(me);
+            startApp();
           } catch (error) {
             if (epoch !== authEpoch) return;
             if (error.status !== 401) showAuthError("로그인 상태를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.");
@@ -2095,12 +2269,6 @@
         }
 
         authToggleEl.onclick = () => setAuthMode(authMode === "login" ? "register" : "login");
-
-        authOpenEl.onclick = () => {
-          const open = authFormAreaEl.hidden;
-          setAuthOpen(open);
-          if (open) authUsernameEl.focus();      // 펼치면 아이디 입력란으로 — 그다음 Tab 은 비밀번호·제출
-        };
 
         authFormEl.onsubmit = async (event) => {
           event.preventDefault();
@@ -2114,7 +2282,7 @@
             setSignedIn(data);
             authPasswordEl.value = "";
             showAuthError("");
-            load();
+            startApp();
           } catch (error) {
             showAuthError(authErrorText(error));
           } finally {
@@ -2130,10 +2298,101 @@
           location.reload();
         });
 
-        load();
-        run("템플릿 목록 불러오기", () => fetchTemplates());
+        // ---------- 계정 패널 — 알림 패널처럼 펼치고, Esc·[닫기]로 닫으면 계정 버튼으로 포커스를 돌려준다 ----------
+        function clearAccountForms() {
+          for (const input of [passwordCurrentEl, passwordNewEl, passwordConfirmEl, deletePasswordEl]) input.value = "";
+          showMessage(passwordErrorEl, "");
+          showMessage(deleteErrorEl, "");
+        }
+
+        function setAccountOpen(open, { restoreFocus = true } = {}) {
+          const wasOpen = !accountPanelEl.hidden;
+          accountPanelEl.hidden = !open;
+          accountMenuEl.setAttribute("aria-expanded", String(open));
+          if (open) {
+            accountPanelEl.focus();
+            refreshAccountInfo();
+          } else if (wasOpen) {
+            clearAccountForms();                 // 비밀번호 값을 화면에 남기지 않는다
+            if (restoreFocus) accountMenuEl.focus();
+          }
+        }
+
+        // 가입일은 /auth/me 로만 받는다(로그인·가입 응답에는 없다). 늦은 응답은 버린다
+        async function refreshAccountInfo() {
+          const epoch = authEpoch;
+          try {
+            const me = await api("/auth/me");
+            if (epoch !== authEpoch || !authUser) return;
+            authUser.createdAt = typeof me.created_at === "string" ? me.created_at : null;
+            $("account-created").textContent = authUser.createdAt ? kstDate(authUser.createdAt) : "-";
+          } catch (error) {
+            if (epoch !== authEpoch) return;
+            if (error.status === 401) invalidateAuth("다시 로그인하세요.");
+          }
+        }
+
+        accountMenuEl.onclick = () => setAccountOpen(accountPanelEl.hidden);
+        $("account-close").onclick = () => setAccountOpen(false);
+        accountPanelEl.addEventListener("keydown", (event) => {
+          if (event.key === "Escape") setAccountOpen(false);
+        });
+
+        // 비밀번호 변경 — 확인 칸이 다르면 보내지 않는다. 성공하면 새 CSRF 토큰으로 바꾼다(다른 기기 로그인은 서버가 해제)
+        passwordFormEl.onsubmit = async (event) => {
+          event.preventDefault();
+          if (accountBusy) return;
+          if (passwordNewEl.value !== passwordConfirmEl.value) {
+            showMessage(passwordErrorEl, "새 비밀번호 확인이 일치하지 않습니다.");
+            passwordConfirmEl.focus();
+            return;
+          }
+          accountBusy = true;
+          passwordSubmitEl.disabled = true;
+          showMessage(passwordErrorEl, "");
+          const body = { current_password: passwordCurrentEl.value, new_password: passwordNewEl.value };
+          for (const input of [passwordCurrentEl, passwordNewEl, passwordConfirmEl]) input.value = "";   // 요청 뒤 남기지 않는다
+          try {
+            const data = await api("/auth/password", "POST", body);
+            setSignedIn(data);                   // 새 세션의 csrf_token — 이후 쓰기 요청은 이 값을 쓴다
+            showStatus("비밀번호를 변경했습니다. 다른 기기의 로그인은 해제되었습니다.");
+          } catch (error) {
+            if (error.status === 401) invalidateAuth("다시 로그인하세요.");
+            else showMessage(passwordErrorEl, accountErrorText(error, "password"));
+          } finally {
+            accountBusy = false;
+            passwordSubmitEl.disabled = false;
+          }
+        };
+
+        // 회원 탈퇴 — confirm 을 거친다(취소하면 요청 없음, prompt() 금지). 성공하면 새로고침으로 로그인 화면
+        deleteFormEl.onsubmit = async (event) => {
+          event.preventDefault();
+          if (accountBusy) return;
+          if (!confirm("정말 탈퇴할까요? 계정과 모든 기기의 로그인이 삭제되며 되돌릴 수 없습니다. "
+                       + "할 일·템플릿은 공유 데이터라 삭제되지 않습니다.")) return;
+          accountBusy = true;
+          deleteSubmitEl.disabled = true;
+          showMessage(deleteErrorEl, "");
+          const body = { password: deletePasswordEl.value };
+          deletePasswordEl.value = "";
+          try {
+            await api("/auth/account/delete", "POST", body);
+            authEpoch += 1;
+            location.reload();
+          } catch (error) {
+            if (error.status === 401) invalidateAuth("다시 로그인하세요.");
+            else showMessage(deleteErrorEl, accountErrorText(error, "delete"));
+          } finally {
+            accountBusy = false;
+            deleteSubmitEl.disabled = false;
+          }
+        };
+
+        // 시작: 로그아웃 상태로 그린 뒤(로그인 카드만, 데이터 요청 없음) /auth/me 결과로 앱을 연다.
+        // /auth/me 가 늦어도 그사이 로그인할 수 있다(늦은 응답은 authEpoch 로 버린다)
         renderAuth();
-        checkAuth();                             // 기존 불러오기와 따로 — 늦거나 실패해도 목록을 막지 않는다
+        checkAuth();
      </script>
 </body>
 </html>

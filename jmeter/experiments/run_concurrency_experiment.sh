@@ -5,7 +5,11 @@
 #   bash run_concurrency_experiment.sh                # 실험 실행 (약 6분)
 #
 # 하는 일: 실험마다 일회성 JMeter 컨테이너(--rm, 이름 jm-exp-<STAMP>-u<N>)를 기존 네트워크 fastapi_jmeter_net 에 붙여
-#   팀 서버에 GET / , GET /todos 만 보낸다(POST 없음 → 팀 서버 데이터 변경 없음). 결과는 InfluxDB(jmeter DB)에 '추가'만 된다.
+#   팀 서버에 GET / , GET /todos 만 측정한다(할 일 쓰기 없음 → 팀 서버 할 일 데이터 변경 없음). 결과는 InfluxDB(jmeter DB)에 '추가'만 된다.
+# (8.0.0) 데이터 API 가 로그인 필수라 스레드마다 AUTH 로그인 1회·로그아웃 1회를 더 보낸다(세션은 실험 안에서 정리, 지표에서 제외).
+#   자격 증명: 테스트 계정 속성 파일 JMETER_AUTH_FILE (기본 ~/.config/fastapi-todos/jmeter-auth.properties, 권한 600).
+#   만들기: python3 ../auth_properties.py write <경로>  (아이디·비밀번호를 대화형으로 입력, 화면·명령줄·기록에 남지 않음)
+#   JMeter 에는 -q 로만 넘긴다(-J 금지). 파일은 지우지 않는다 — 실험이 끝나면 직접 지운다.
 # 바꾸지 않는 것: Jenkins 작업, 팀 서버 앱·DB, 기존 컨테이너·네트워크·볼륨, 기존 InfluxDB 측정값, Grafana 대시보드.
 # 중단: Ctrl+C — 지금 돌고 있는 이 실험의 컨테이너(이름 지정)만 멈추고, 그때까지의 결과를 정리한다.
 set -Eeuo pipefail
@@ -26,11 +30,13 @@ JMETER_IMAGE="fastapi-jmeter-runner:5.6.3"
 JMETER_NET="fastapi_jmeter_net"
 INFLUX_CONTAINER="fastapi-jmeter-influxdb"
 INFLUX_URL="http://influxdb:8086/write?db=jmeter"   # 기존 Jenkins·수동 실행과 같은 주소(네트워크 안의 이름)
+AUTH_FILE="${JMETER_AUTH_FILE:-$HOME/.config/fastapi-todos/jmeter-auth.properties}"   # (8.0.0) 권한 600, 값은 출력하지 않는다
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLAN="$HERE/concurrency_readonly.jmx"
 ANALYZE="$HERE/analyze_jtl.py"
 CHECK="$HERE/../check_results.py"                  # 기존 판정 스크립트 재사용 (샘플 수·실패율)
+AUTHPY="$HERE/../auth_properties.py"               # (8.0.0) 로그인한 상태로 할 일 개수만 센다(읽기 전용)
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="${OUT_BASE:-$HOME/jmeter-exp}/$STAMP"
 CHECK_ONLY=0
@@ -52,7 +58,8 @@ ts()  { date '+%Y-%m-%d %H:%M:%S %Z'; }
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 JR() { docker run --rm --network "$JMETER_NET" -u "$(id -u):$(id -g)" -e HOME=/tmp "$@"; }
 influx_q() { docker exec "$INFLUX_CONTAINER" influx -database jmeter -format csv -execute "$1" 2>/dev/null | tail -n +2 | cut -d, -f3; }
-todo_count() { curl -s --max-time 10 "http://${TEAM_HOST}:${TEAM_PORT}/todos" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "?"; }
+# (8.0.0) GET /todos 는 로그인 필수 — 같은 테스트 계정으로 로그인 → 개수 → 로그아웃 (값·본문은 출력하지 않는다)
+todo_count() { python3 "$AUTHPY" todo-count "http://${TEAM_HOST}:${TEAM_PORT}" "$AUTH_FILE" 2>/dev/null || echo "?"; }
 
 finish() {
   local code="$1"
@@ -95,9 +102,19 @@ trap on_interrupt INT TERM
 # ---------- 1. 사전 점검 (읽기 전용) ----------
 say "== 사전 점검 =="
 for t in docker python3 curl sha256sum; do command -v "$t" >/dev/null || stop "필요한 명령 없음: $t"; done
-for f in "$PLAN" "$ANALYZE" "$CHECK"; do [ -f "$f" ] || stop "파일 없음: $f"; done
-grep -q 'HTTPSampler.method">POST' "$PLAN" && stop "계획 파일에 POST 샘플러가 있음 — 읽기 전용 계획이 아님"
-[ "$(grep -c '<HTTPSamplerProxy ' "$PLAN")" -eq 2 ] || stop "계획 파일의 샘플러가 2개(GET /, GET /todos)가 아님"
+for f in "$PLAN" "$ANALYZE" "$CHECK" "$AUTHPY"; do [ -f "$f" ] || stop "파일 없음: $f"; done
+# (8.0.0) 샘플러는 4개(AUTH 로그인·로그아웃 + GET / , GET /todos)이고, POST 는 /auth/login·/auth/logout 뿐이어야 한다
+python3 - "$PLAN" <<'PY' || stop "계획 파일이 읽기 전용 측정 + 로그인·로그아웃 구성이 아님"
+import sys, xml.etree.ElementTree as ET
+s = [(e.get("testname"), e.findtext("stringProp[@name='HTTPSampler.method']"), e.findtext("stringProp[@name='HTTPSampler.path']"))
+     for e in ET.parse(sys.argv[1]).iter("HTTPSamplerProxy")]
+want = {("AUTH POST /auth/login", "POST", "/auth/login"), ("AUTH POST /auth/logout", "POST", "/auth/logout"),
+        ("GET /", "GET", "/"), ("GET /todos", "GET", "/todos")}
+sys.exit(0 if len(s) == 4 and set(s) == want else 1)
+PY
+[ -f "$AUTH_FILE" ] || stop "테스트 계정 속성 파일 없음: $AUTH_FILE (python3 $AUTHPY write <경로> 로 만든다)"
+[ "$(stat -c %a "$AUTH_FILE")" = 600 ] || stop "속성 파일 권한이 600 이 아님: $AUTH_FILE"
+[ "$(stat -c %u "$AUTH_FILE")" = "$(id -u)" ] || stop "속성 파일 소유자가 이 계정이 아님: $AUTH_FILE"
 docker image inspect "$JMETER_IMAGE" >/dev/null 2>&1 || stop "JMeter 이미지 없음: $JMETER_IMAGE"
 [ "$(docker inspect -f '{{.State.Running}}' "$INFLUX_CONTAINER" 2>/dev/null)" = true ] || stop "$INFLUX_CONTAINER 가 실행 중이 아님"
 nets="$(docker network inspect "$JMETER_NET" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null)" || stop "네트워크 없음: $JMETER_NET"
@@ -108,9 +125,10 @@ say "PRECHECK: JMeter 컨테이너 → 팀 서버 ${TEAM_HOST}:${TEAM_PORT} ${t_
 [ "$t_code" = 200 ] || stop "JMeter 컨테이너에서 팀 서버에 접속할 수 없음"
 [ "$i_code" = 204 ] || stop "JMeter 컨테이너에서 InfluxDB(${INFLUX_URL})에 접속할 수 없음"
 TODOS_BEFORE="$(todo_count)"
+[[ "$TODOS_BEFORE" =~ ^[0-9]+$ ]] || stop "테스트 계정으로 로그인해 할 일 개수를 읽지 못함 (${TODOS_BEFORE}) — 계정·서버 버전 확인"
 say "PRECHECK: 팀 서버 할 일 개수(실험 전) ${TODOS_BEFORE}"
 say "PRECHECK: 계획 $(sha256sum "$PLAN" | cut -c1-16)…  분석 $(sha256sum "$ANALYZE" | cut -c1-16)…  판정 $(sha256sum "$CHECK" | cut -c1-16)…"
-say "PRECHECK_OK — 예정: u1 100 + u3 300 + u5 500 = 900 요청 (읽기 전용), 실험 사이 ${GAP}초"
+say "PRECHECK_OK — 예정: 측정 u1 100 + u3 300 + u5 500 = 900 요청 (읽기 전용) + 인증 18 요청(지표 제외), 실험 사이 ${GAP}초"
 if [ "$CHECK_ONLY" -eq 1 ]; then
   say "--check-only: 실험은 실행하지 않는다"
   exit 0
@@ -129,7 +147,7 @@ FIRST_START="$(ts)"
 n=0
 for U in "${LEVELS[@]}"; do
   n=$((n + 1))
-  L="u${U}"; EXP=$((U * LOOPS * 2)); APP="team3004-exp-${STAMP}-${L}"; RUN="exp-${STAMP}-${L}"
+  L="u${U}"; EXP=$((U * LOOPS * 2)); EXP_AUTH=$((U * 2)); APP="team3004-exp-${STAMP}-${L}"; RUN="exp-${STAMP}-${L}"
   NAME="jm-exp-${STAMP}-${L}"; D="$OUT/$L"
   mkdir -p "$D"
   say "== 실험 ${L}: 동시 사용자 ${U}, 요청 ${EXP}개, application=${APP} =="
@@ -137,8 +155,9 @@ for U in "${LEVELS[@]}"; do
   CURRENT="$NAME"
   set +e
   docker run --rm --name "$NAME" --network "$JMETER_NET" -u "$(id -u):$(id -g)" -e HOME=/tmp \
-    -v "$HERE:/plan:ro" -v "$D:/out" -w /out "$JMETER_IMAGE" \
-    jmeter -n -t /plan/concurrency_readonly.jmx -l /out/results.jtl -j /out/jmeter.log -e -o /out/report \
+    -v "$HERE:/plan:ro" -v "$D:/out" -v "$AUTH_FILE:/secrets/auth.properties:ro" -w /out "$JMETER_IMAGE" \
+    jmeter -n -t /plan/concurrency_readonly.jmx -q /secrets/auth.properties \
+      -l /out/results.jtl -j /out/jmeter.log -e -o /out/report \
       -JTARGET_HOST="$TEAM_HOST" -JTARGET_PORT="$TEAM_PORT" \
       -JTHREADS="$U" -JLOOPS="$LOOPS" -JRAMP="$RAMP" -JTHINK_MIN_MS="$THINK_MIN_MS" -JTHINK_RANGE_MS="$THINK_RANGE_MS" \
       -JAPP_NAME="$APP" -JRUN_ID="$RUN" "-JINFLUX_URL=${INFLUX_URL}" \
@@ -148,15 +167,17 @@ for U in "${LEVELS[@]}"; do
   CURRENT=""
   echo "${L}_end=$(ts)" >> "$OUT/run-info.txt"
   [ "$rc" -eq 0 ] || stop "${L}: JMeter 종료 코드 ${rc}"
-  if grep -E " (ERROR|FATAL) " "$D/jmeter.log" > "$D/jmeter-errors.txt" 2>/dev/null; then
+  # (8.0.0) Groovy 함수 오류는 WARN 으로만 남는다 — ERROR·FATAL 과 함께 실패로 본다
+  if grep -E " (ERROR|FATAL) |Error running groovy script" "$D/jmeter.log" > "$D/jmeter-errors.txt" 2>/dev/null; then
     stop "${L}: jmeter.log 에 ERROR/FATAL 기록 ($D/jmeter-errors.txt)"
   fi
   # 판정 ① 기존 check_results.py (샘플 수·실패율 0%)
-  python3 "$CHECK" "$D/results.jtl" --expected "$EXP" --max-error-rate 0 || stop "${L}: check_results.py 판정 실패"
+  python3 "$CHECK" "$D/results.jtl" --expected "$EXP" --expected-auth "$EXP_AUTH" --max-error-rate 0 \
+    || stop "${L}: check_results.py 판정 실패"
   # 판정 ② 분석 (라벨·응답 코드·평균 한도) + 요약 CSV 기록
   avg_arg=()
   [ "$U" -eq 1 ] && avg_arg=(--max-avg-ms "$U1_MAX_AVG_MS")
-  python3 "$ANALYZE" check --label "$L" --users "$U" --jtl "$D/results.jtl" --expected "$EXP" \
+  python3 "$ANALYZE" check --label "$L" --users "$U" --jtl "$D/results.jtl" --expected "$EXP" --expected-auth "$EXP_AUTH" \
     "${avg_arg[@]}" --csv "$OUT/summary.csv" || stop "${L}: 분석 판정 실패 (u1 은 오류 또는 평균 ${U1_MAX_AVG_MS}ms 초과 시 중단)"
   [ -f "$D/report/index.html" ] || stop "${L}: HTML 리포트 없음"
   # 판정 ③ InfluxDB 기록 (Backend Listener URL 호환성) — 이번 실행의 시작·종료 이벤트가 있어야 한다
