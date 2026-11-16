@@ -772,6 +772,37 @@ def update_password_hash_if_unchanged(db: Session, user_id: int, old_hash: str, 
     return result.rowcount > 0
 
 
+# ---------- (8.0.0) 계정 관리 헬퍼 (V8_SPEC §38·§39) ----------
+# - 호출자의 트랜잭션 안에서만 동작하고 commit·rollback 하지 않는다. 예외 메시지에 값을 넣지 않는다.
+
+DATA_MIGRATION_OWNER_FK = "fk_data_migrations_owner_user_id_users"   # 0001 — ON DELETE 없음(NO ACTION)
+FOREIGN_KEY_VIOLATION = "23503"
+
+
+class AccountDeleteBlocked(Exception):
+    """사용자를 참조하는 행(data_migrations)이 있어 계정을 지울 수 없음 — 라우트가 409 로 바꾼다."""
+
+
+def delete_user_sessions(db: Session, user_id: int) -> int:
+    # 그 사용자의 세션을 모두 지운다(요청한 세션·다른 기기 포함). 지운 수를 돌려준다
+    return db.execute(delete(UserSession).where(UserSession.user_id == user_id)).rowcount
+
+
+def delete_user_if_unchanged(db: Session, user_id: int, password_hash: str) -> bool:
+    # 회원 탈퇴 — 저장된 해시가 검증한 값 그대로일 때만 users 행을 지운다(지웠으면 True).
+    # 세션·todos·subtasks·task_templates 는 DB 의 ON DELETE CASCADE 로 함께 지워진다(ORM cascade 를 쓰지 않는다).
+    # data_migrations FK 위반만 AccountDeleteBlocked, 그 밖의 무결성 오류·DB 오류는 그대로 올린다
+    try:
+        result = db.execute(
+            delete(User).where(User.id == user_id, User.password_hash == password_hash)
+            .execution_options(synchronize_session=False))
+    except IntegrityError as exc:
+        if _sqlstate(exc) == FOREIGN_KEY_VIOLATION and _constraint_name(exc) == DATA_MIGRATION_OWNER_FK:
+            raise AccountDeleteBlocked() from None
+        raise
+    return result.rowcount > 0
+
+
 # ---------- 사용자 데이터 헬퍼 (Phase 3-1A, V7_SPEC §27.3·§27.4·§29.4) ----------
 # - 아직 데이터 경로 15개는 이 헬퍼를 쓰지 않는다(템플릿 3-4, 할 일 3-5 에서 연결).
 # - 모든 조회·변경 SQL 에 user_id 조건을 직접 넣는다. 다른 사용자의 행은 "없는 행"과 같게 None·False·빈 결과다.

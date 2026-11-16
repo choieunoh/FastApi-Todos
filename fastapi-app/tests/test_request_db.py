@@ -28,6 +28,7 @@ import main
 
 TOKEN = "T" * 43                                 # 쿠키 값(가짜 조회 함수가 받기만 한다)
 CSRF = "csrf-value-1"
+CREATED = datetime(2026, 11, 1, 3, 4, 5, tzinfo=timezone.utc)      # (8.0.0) 가짜 사용자의 가입 시각 (/auth/me)
 KEY = auth.FailureKey(b"k" * 32)                 # 테스트 전용 공개값
 DETAIL_MARK = "DETAIL-SECRET-3f9c"               # 응답·로그에 나오면 안 되는 DB 오류 내용
 BIND_MARK = "BIND-VALUE-77e1"                    # 바인드 값 흉내
@@ -136,7 +137,7 @@ def rec(monkeypatch):
         r.events.append("lookup")
         if not r.active:
             return None
-        return SimpleNamespace(csrf_token=CSRF), SimpleNamespace(id=7, username="alice")
+        return SimpleNamespace(csrf_token=CSRF), SimpleNamespace(id=7, username="alice", created_at=CREATED)
 
     monkeypatch.setattr(db, "get_active_session", get_active_session)
     return r
@@ -267,7 +268,8 @@ def test_main_auth_me_uses_overridden_factory_with_one_transaction(rec):
         res = c.get("/auth/me")
     finally:
         main.app.dependency_overrides.clear()
-    assert res.status_code == 200 and res.json() == {"id": 7, "username": "alice", "csrf_token": CSRF}
+    assert res.status_code == 200 and res.json() == {"id": 7, "username": "alice", "csrf_token": CSRF,
+                                                     "created_at": "2026-11-01T03:04:05Z"}   # (8.0.0) 가입 시각 추가
     assert rec.factory_calls == 1
     assert rec.events == ["open", "begin", "lookup", "commit", "close"]
 
@@ -288,11 +290,20 @@ def test_main_routes_declare_request_db_with_function_scope_only():
                 scopes.add(sub.scope)
             walk(sub)
 
-    for route in main.app.routes:
-        dependant = getattr(route, "dependant", None)
-        if dependant is not None:
-            walk(dependant)
-    assert scopes == {"function"}                 # /auth/me 의 require_user 경로
+    # (8.0.0) 데이터 경로 15개는 include_router 로 붙어 app.routes 에 APIRoute 로 나오지 않는다 — 선언 라우터도 함께
+    # 돌고, 돌아본 경로가 앱에 등록된 모든 경로(공개 API app.openapi())를 덮는지 확인해 조용히 건너뛰지 않게 한다.
+    # include_router 에 준 의존성(require_csrf → require_user → request_db)은 선언 라우터에도 보이지 않는다. 그 scope 는
+    # 비공식 FastAPI 내부 함수 없이 실제 요청으로 본다 — test_auth_routes 의 데이터 경로 매트릭스가 15개 모두
+    # 요청 Session 이 1개만 열리는지(캐시 키가 갈라지지 않음) 확인한다.
+    from fastapi.routing import APIRoute
+    walked = set()
+    for route in [*main.app.routes, *main.data_router.routes]:
+        if isinstance(route, APIRoute):
+            walk(route.dependant)
+            walked |= {(m, route.path) for m in route.methods}
+    documented = {(m.upper(), p) for p, item in main.app.openapi()["paths"].items() for m in item}
+    assert len(documented) == 21 and documented <= walked                # 인증 6 + 데이터 15, 건너뛴 경로 없음
+    assert scopes == {"function"}                 # /auth/me·계정 경로의 require_user
 
 
 # ---------- 4·5·11: Session 공유, 한 번만 열기, 닫기 ----------

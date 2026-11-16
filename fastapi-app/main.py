@@ -16,7 +16,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Annotated, Literal, get_args
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -383,12 +383,21 @@ NOT_FOUND_RESPONSE: dict[int | str, dict[str, object]] = {
 }
 
 
-@app.get("/todos")                               # 목록 조회
+# (8.0.0) 데이터 경로 15개는 이 라우터에 선언하고, 파일 끝에서 인증 의존성(require_csrf)과 함께 앱에 붙인다
+# — 선언 순서(고정 경로가 /todos/{todo_id} 보다 먼저)는 그대로 유지된다 (V8_SPEC §40)
+data_router = APIRouter()
+# (8.0.0) OpenAPI 문서용 — 쓰기 11개의 CSRF 403. 동작은 require_csrf 가 정한다(문서만, 동작 변화 없음)
+CSRF_RESPONSE: dict[int | str, dict[str, object]] = {
+    403: {"description": "X-CSRF-Token 헤더 없음 또는 세션 값과 불일치"},
+}
+
+
+@data_router.get("/todos")                               # 목록 조회
 def get_todos() -> list[TodoItem]:
     return load_todos()
 
 
-@app.post("/todos", status_code=201)             # 추가 — id·시각은 서버가 매긴다
+@data_router.post("/todos", status_code=201, responses=CSRF_RESPONSE)             # 추가 — id·시각은 서버가 매긴다
 def create_todo(payload: TodoIn) -> TodoItem:
     todos = load_todos()
     todo, spawned = apply_completion(todos, None, TodoItem(id=next_id(todos), created_at=now(), **payload.model_dump()))
@@ -421,7 +430,7 @@ def todos_to_csv(todos: list[TodoItem]) -> str:
     return "\ufeff" + buffer.getvalue()          # BOM — 엑셀에서 한글이 깨지지 않게
 
 
-@app.get("/todos/export", responses={200: {"content": {"text/csv": {}}}})
+@data_router.get("/todos/export", responses={200: {"content": {"text/csv": {}}}})
 def export_todos(export_format: Annotated[ExportFormat, Query(alias="format")]) -> Response:
     todos = load_todos()
     filename = f"todos-{now().astimezone(KST):%Y%m%d}.{export_format}"
@@ -476,12 +485,12 @@ def compute_stats(todos: list[TodoItem], today: date) -> StatsOut:
     )
 
 
-@app.get("/stats")                               # 통계 — 저장 파일·복구 버퍼를 바꾸지 않는다
+@data_router.get("/stats")                               # 통계 — 저장 파일·복구 버퍼를 바꾸지 않는다
 def get_stats() -> StatsOut:
     return compute_stats(load_todos(), today_kst())
 
 
-@app.post("/todos/restore", responses={404: {"description": "복구할 수 없는 항목이 있음"}})  # 삭제 실행 취소
+@data_router.post("/todos/restore", responses={404: {"description": "복구할 수 없는 항목이 있음"}, **CSRF_RESPONSE})  # 삭제 실행 취소
 def restore_todos(payload: RestoreIn) -> list[TodoItem]:
     prune_deleted()
     ids = list(dict.fromkeys(payload.ids))       # 중복 제거, 순서 유지
@@ -497,7 +506,7 @@ def restore_todos(payload: RestoreIn) -> list[TodoItem]:
     return [todos[find_index(todos, i)] for i in ids]
 
 
-@app.post("/todos/bulk", responses={404: {"description": "없는 항목이 있음"}})  # 일괄 완료·미완료·삭제
+@data_router.post("/todos/bulk", responses={404: {"description": "없는 항목이 있음"}, **CSRF_RESPONSE})  # 일괄 완료·미완료·삭제
 def bulk_todos(payload: BulkIn) -> BulkOut:
     todos = load_todos()
     positions = {t.id: i for i, t in enumerate(todos)}
@@ -526,7 +535,7 @@ def bulk_todos(payload: BulkIn) -> BulkOut:
     return BulkOut(updated=[todos[positions[i]] for i in payload.ids], deleted=[])
 
 
-@app.put("/todos/{todo_id}", responses=NOT_FOUND_RESPONSE)  # 수정 — created_at 유지, 완료 상태가 바뀔 때만 completed_at 갱신
+@data_router.put("/todos/{todo_id}", responses={**NOT_FOUND_RESPONSE, **CSRF_RESPONSE})  # 수정 — created_at 유지, 완료 상태가 바뀔 때만 completed_at 갱신
 def update_todo(todo_id: int, payload: TodoIn) -> TodoItem:
     todos = load_todos()
     index = find_index(todos, todo_id)
@@ -539,7 +548,7 @@ def update_todo(todo_id: int, payload: TodoIn) -> TodoItem:
     return todo
 
 
-@app.delete("/todos/{todo_id}", status_code=204, responses=NOT_FOUND_RESPONSE)  # 삭제 — 잠시 복구 버퍼에 남긴다
+@data_router.delete("/todos/{todo_id}", status_code=204, responses={**NOT_FOUND_RESPONSE, **CSRF_RESPONSE})  # 삭제 — 잠시 복구 버퍼에 남긴다
 def delete_todo(todo_id: int) -> None:
     todos = load_todos()
     index = find_index(todos, todo_id)
@@ -555,8 +564,9 @@ SUBTASK_RESPONSES: dict[int | str, dict[str, object]] = {
 }
 
 
-@app.post("/todos/{todo_id}/subtasks", status_code=201,
-          responses={**SUBTASK_RESPONSES, 422: {"description": f"제목 검증 실패 또는 {SUBTASK_MAX}개 초과"}})
+@data_router.post("/todos/{todo_id}/subtasks", status_code=201,
+          responses={**SUBTASK_RESPONSES, 422: {"description": f"제목 검증 실패 또는 {SUBTASK_MAX}개 초과"},
+                     **CSRF_RESPONSE})
 def add_subtask(todo_id: int, payload: SubtaskIn) -> TodoItem:
     todos = load_todos()
     todo = todos[find_index(todos, todo_id)]
@@ -568,7 +578,7 @@ def add_subtask(todo_id: int, payload: SubtaskIn) -> TodoItem:
     return todo
 
 
-@app.put("/todos/{todo_id}/subtasks/{subtask_id}", responses=SUBTASK_RESPONSES)
+@data_router.put("/todos/{todo_id}/subtasks/{subtask_id}", responses={**SUBTASK_RESPONSES, **CSRF_RESPONSE})
 def update_subtask(todo_id: int, subtask_id: int, payload: SubtaskUpdate) -> TodoItem:
     todos = load_todos()
     todo = todos[find_index(todos, todo_id)]
@@ -577,7 +587,8 @@ def update_subtask(todo_id: int, subtask_id: int, payload: SubtaskUpdate) -> Tod
     return todo
 
 
-@app.delete("/todos/{todo_id}/subtasks/{subtask_id}", status_code=204, responses=SUBTASK_RESPONSES)
+@data_router.delete("/todos/{todo_id}/subtasks/{subtask_id}", status_code=204,
+                    responses={**SUBTASK_RESPONSES, **CSRF_RESPONSE})
 def delete_subtask(todo_id: int, subtask_id: int) -> None:
     todos = load_todos()
     todo = todos[find_index(todos, todo_id)]
@@ -593,12 +604,12 @@ TEMPLATE_RESPONSES: dict[int | str, dict[str, object]] = {
 }
 
 
-@app.get("/task-templates")
+@data_router.get("/task-templates")
 def get_templates() -> list[TaskTemplate]:
     return load_templates()
 
 
-@app.post("/task-templates", status_code=201, responses={409: TEMPLATE_RESPONSES[409]})
+@data_router.post("/task-templates", status_code=201, responses={409: TEMPLATE_RESPONSES[409], **CSRF_RESPONSE})
 def create_template(payload: TemplateIn) -> TaskTemplate:
     templates = load_templates()
     check_template_name(templates, payload.name)
@@ -607,7 +618,7 @@ def create_template(payload: TemplateIn) -> TaskTemplate:
     return template
 
 
-@app.put("/task-templates/{template_id}", responses=TEMPLATE_RESPONSES)
+@data_router.put("/task-templates/{template_id}", responses={**TEMPLATE_RESPONSES, **CSRF_RESPONSE})
 def update_template(template_id: int, payload: TemplateIn) -> TaskTemplate:
     templates = load_templates()
     index = find_template_index(templates, template_id)
@@ -617,7 +628,8 @@ def update_template(template_id: int, payload: TemplateIn) -> TaskTemplate:
     return templates[index]
 
 
-@app.delete("/task-templates/{template_id}", status_code=204, responses={404: TEMPLATE_RESPONSES[404]})
+@data_router.delete("/task-templates/{template_id}", status_code=204,
+                    responses={404: TEMPLATE_RESPONSES[404], **CSRF_RESPONSE})
 def delete_template(template_id: int) -> None:
     templates = load_templates()
     del templates[find_template_index(templates, template_id)]
@@ -660,6 +672,7 @@ class CurrentUser:                               # 유효한 세션의 사용자
     id: int
     username: str
     csrf_token: str
+    created_at: datetime | None = None           # (8.0.0) 가입 시각 — /auth/me 응답용
 
 
 class LoginIn(BaseModel):                        # 구조만 검사 — username 형식·비밀번호 길이 위반은 401 (§28.1)
@@ -686,6 +699,10 @@ class AuthOut(BaseModel):
     id: int
     username: str
     csrf_token: str
+
+
+class MeOut(AuthOut):                            # (8.0.0) /auth/me 만 가입 시각을 더 준다 (필드 추가 — 기존 클라이언트 호환)
+    created_at: datetime
 
 
 class _LoginStateError(RuntimeError):
@@ -857,7 +874,8 @@ def _load_current_user(request: Request, config: AuthConfig, rdb: RequestDb) -> 
     if found is None:
         return None
     user_session, user = found
-    return CurrentUser(id=user.id, username=user.username, csrf_token=user_session.csrf_token)
+    return CurrentUser(id=user.id, username=user.username, csrf_token=user_session.csrf_token,
+                       created_at=user.created_at)
 
 
 def require_user(request: Request, rdb: RequestDbDep, config: AuthConfig = Depends(auth_config)) -> CurrentUser:
@@ -1024,6 +1042,156 @@ def logout(request: Request, config: AuthConfig = Depends(auth_config),
     return _guarded(run, "auth_logout_error")
 
 
-@app.get("/auth/me", response_model=AuthOut, responses=AUTH_RESPONSES)
-def me(user: CurrentUser = Depends(require_user)) -> AuthOut:
-    return AuthOut(id=user.id, username=user.username, csrf_token=user.csrf_token)
+@app.get("/auth/me", response_model=MeOut, responses=AUTH_RESPONSES)
+def me(user: CurrentUser = Depends(require_user)) -> MeOut:
+    return MeOut(id=user.id, username=user.username, csrf_token=user.csrf_token, created_at=user.created_at)
+
+
+# ────────────────────────── (8.0.0) 계정 관리 (V8_SPEC §37~§39) ──────────────────────────
+# - 검사 순서: Origin(403) → 세션(401) → CSRF(403) → 본문(422) → 시도 제한(429) → 비밀번호(400) → Tx2(401·409).
+# - 세션 확인은 짧은 트랜잭션으로 끝내고 닫는다. Argon2 동안 DB 연결·트랜잭션을 잡지 않는다(E-8).
+# - 비밀번호 확인 실패는 로그인 실패와 같은 기록·같은 제한 예산을 쓴다(E-14).
+# - 409 문구는 일반 문구만 — 표·제약 이름 같은 내부 구조를 응답에 넣지 않는다(E-13).
+
+PASSWORD_MISMATCH = "현재 비밀번호가 올바르지 않습니다"
+ACCOUNT_PASSWORD_MISMATCH = "비밀번호가 올바르지 않습니다"
+ACCOUNT_CONFLICT = "다른 요청과 충돌했습니다. 다시 시도해 주세요"
+ACCOUNT_DELETE_BLOCKED = "지금은 탈퇴할 수 없는 계정입니다. 관리자에게 문의하세요"
+
+
+class PasswordChangeIn(BaseModel):               # 새 비밀번호 규칙 위반·현재와 같음은 422 (입력값은 응답에 넣지 않는다)
+    current_password: str = Field(max_length=LOGIN_FIELD_MAX)
+    new_password: str = Field(max_length=LOGIN_FIELD_MAX)
+
+    @field_validator("new_password")
+    @classmethod
+    def _new_password(cls, value: str) -> str:
+        return auth.check_password(value)
+
+    @model_validator(mode="after")
+    def _must_differ(self) -> "PasswordChangeIn":
+        if self.new_password == self.current_password:
+            raise ValueError("새 비밀번호는 현재 비밀번호와 달라야 합니다")
+        return self
+
+
+class AccountDeleteIn(BaseModel):                # 구조만 검사 — 형식이 틀린 비밀번호도 불일치(400)로 본다
+    password: str = Field(max_length=LOGIN_FIELD_MAX)
+
+
+ACCOUNT_RESPONSES: dict[int | str, dict[str, object]] = {
+    **AUTH_RESPONSES, 400: {"description": "비밀번호 불일치"}, 409: {"description": "동시 요청 충돌·탈퇴 불가"},
+}
+
+
+def require_account_session(request: Request, config: AuthConfig = Depends(auth_config),
+                            factory: Callable[[], Session] = Depends(auth_session_factory)) -> CurrentUser:
+    # 세션(401) → CSRF(403). 요청 Session(RequestDbDep)을 쓰지 않고 짧은 트랜잭션 하나로 확인한 뒤 바로 닫는다
+    token = request.cookies.get(config.settings.cookie_name)
+    if token is None:
+        raise HTTPException(401, AUTH_REQUIRED)
+    try:
+        with factory() as session, session.begin():
+            found = db.get_active_session(session, token, now())
+    except Exception as exc:                     # noqa: BLE001
+        raise _auth_failure(exc, "auth_session_error") from None
+    if found is None:
+        raise HTTPException(401, AUTH_REQUIRED)
+    user_session, user = found
+    if not auth.csrf_matches(user_session.csrf_token, request.headers.get(CSRF_HEADER)):
+        raise HTTPException(403, CSRF_INVALID)
+    return CurrentUser(id=user.id, username=user.username, csrf_token=user_session.csrf_token)
+
+
+def _check_account_password(request: Request, config: AuthConfig, factory: Callable[[], Session],
+                            user: CurrentUser, password: str, mismatch: str) -> tuple[auth.LoginName, db.LoginAttempt]:
+    # Tx1(시도 제한·선기록) → 트랜잭션 밖 Argon2 검증. 불일치 400 (선기록은 실패로 남는다), 계정이 바뀌었으면 401
+    client_ip = _client_ip(request)
+    name = auth.login_name(user.username, config.failure_key)
+    with factory() as session, session.begin():
+        attempt = db.begin_login_attempt(session, name, client_ip, now())
+    if not attempt.decision.allowed:
+        raise _too_many(attempt.decision.retry_after)
+    try:
+        verified = auth.verify_login_password(attempt.password_hash, password)   # DB 연결·잠금 없음
+    except auth.HashBusy:
+        _cancel_attempt(factory, name, attempt.attempt_id)
+        raise
+    if attempt.user_id != user.id or attempt.password_hash is None:
+        raise HTTPException(401, AUTH_REQUIRED)                          # 그 사이 계정이 없어짐
+    if not verified:
+        raise HTTPException(400, mismatch)
+    return name, attempt
+
+
+def _begin_account_tx2(session: Session, request: Request, config: AuthConfig, user: CurrentUser,
+                       name: auth.LoginName, attempt: db.LoginAttempt, moment: datetime) -> None:
+    # Tx2 앞부분 — 자기 선기록 삭제(잠금 대기 상한·username 잠금 포함) → 사용자 행 잠금 → 요청 세션 재확인(401)
+    if attempt.attempt_id is None or not db.finish_login_success(session, name, attempt.attempt_id):
+        raise _LoginStateError()
+    if not db.lock_user(session, user.id):
+        raise HTTPException(401, AUTH_REQUIRED)
+    found = db.get_active_session(session, request.cookies.get(config.settings.cookie_name), moment)
+    if found is None or found[1].id != user.id:
+        raise HTTPException(401, AUTH_REQUIRED)                          # 그 사이 로그아웃·비밀번호 변경·탈퇴
+
+
+@app.post("/auth/password", response_model=AuthOut, responses=ACCOUNT_RESPONSES,
+          dependencies=[Depends(require_same_origin)])
+def change_password(payload: PasswordChangeIn, request: Request,
+                    user: CurrentUser = Depends(require_account_session),
+                    config: AuthConfig = Depends(auth_config),
+                    factory: Callable[[], Session] = Depends(auth_session_factory)) -> Response:
+    # 성공하면 그 사용자의 세션을 모두 지우고 새 세션 하나를 발급한다(E-6). Tx2 가 실패하면 해시·세션이 그대로다
+    def run() -> Response:
+        name, attempt = _check_account_password(request, config, factory, user, payload.current_password,
+                                                PASSWORD_MISMATCH)
+        try:
+            new_hash = auth.hash_password_limited(payload.new_password)   # 트랜잭션 밖
+        except auth.HashBusy:
+            _cancel_attempt(factory, name, attempt.attempt_id)
+            raise
+        moment = now()
+        with factory() as session, session.begin():
+            _begin_account_tx2(session, request, config, user, name, attempt, moment)
+            if not db.update_password_hash_if_unchanged(session, user.id, attempt.password_hash or "", new_hash):
+                raise HTTPException(409, ACCOUNT_CONFLICT)                # 검증 뒤 해시가 바뀜(로그인 rehash 등)
+            db.delete_user_sessions(session, user.id)                     # 요청한 세션과 다른 기기 세션 모두
+            db.purge_expired_sessions(session, moment)
+            token, csrf = db.create_session(session, user.id, moment)
+        return _auth_response(200, user.id, user.username, csrf, token, config)   # commit 뒤에만
+
+    return _guarded(run, "auth_password_error")
+
+
+@app.post("/auth/account/delete", status_code=204, responses=ACCOUNT_RESPONSES,
+          dependencies=[Depends(require_same_origin)])
+def delete_account(payload: AccountDeleteIn, request: Request,
+                   user: CurrentUser = Depends(require_account_session),
+                   config: AuthConfig = Depends(auth_config),
+                   factory: Callable[[], Session] = Depends(auth_session_factory)) -> Response:
+    # 계정 행을 지우면 세션은 DB 의 ON DELETE CASCADE 로 함께 지워진다. 공유 JSON·복구 버퍼는 건드리지 않는다(E-5)
+    def run() -> Response:
+        name, attempt = _check_account_password(request, config, factory, user, payload.password,
+                                                ACCOUNT_PASSWORD_MISMATCH)
+        with factory() as session, session.begin():
+            _begin_account_tx2(session, request, config, user, name, attempt, now())
+            try:
+                deleted = db.delete_user_if_unchanged(session, user.id, attempt.password_hash or "")
+            except db.AccountDeleteBlocked:
+                logger.warning("auth_account_delete_blocked")
+                raise HTTPException(409, ACCOUNT_DELETE_BLOCKED) from None
+            if not deleted:
+                raise HTTPException(409, ACCOUNT_CONFLICT)
+        response = Response(status_code=204)
+        response.delete_cookie(**auth.cookie_delete_kwargs(config.settings))   # type: ignore[arg-type]
+        return response
+
+    return _guarded(run, "auth_account_delete_error")
+
+
+# (8.0.0) 데이터 경로 15개 — 모두 로그인 필수(401), GET 이 아닌 11개는 X-CSRF-Token 필수(403). require_csrf 가
+# require_user 를 거치고 GET·HEAD 는 CSRF 를 보지 않는다. 데이터는 공유 JSON 그대로다(사용자별 격리 없음, E-2)
+# OpenAPI 에는 15개 모두 401 을 적는다(문서만 — 쓰기의 403 은 각 경로 선언의 CSRF_RESPONSE)
+app.include_router(data_router, dependencies=[Depends(require_csrf)],
+                   responses={401: {"description": "로그인 필요 (세션 쿠키 없음·만료·무효)"}})

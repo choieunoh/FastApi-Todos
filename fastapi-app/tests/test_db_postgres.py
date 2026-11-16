@@ -7,6 +7,7 @@
 - 개발 DB(todo_dev)·운영 DB 에는 절대 연결하지 않는다.
 """
 import hashlib
+import json as json_module
 import logging
 import threading
 import time
@@ -33,8 +34,8 @@ import db
 import main
 from pg_harness import (  # (3-2) 공용 하네스 — 본문은 그대로 옮겼다
     APP_DIR, CONNECT_TIMEOUT, SERVER_FAILURE_KEY, SERVER_KEY, Server, TEST_URL, _UNFINISHED_WORKERS, nullpool_engine,
-    open_verified_engine, reset_test_schema, start_server, stop_server, wait_for_backends_released,
-    wait_until_single_backend,
+    diagnose_backends_on_failure, open_verified_engine, reset_test_schema, start_server, stop_server,
+    wait_for_backends_released, wait_until_single_backend,
 )
 
 pytestmark = pytest.mark.postgres
@@ -194,7 +195,7 @@ def failure_row(kind: str, username_key: str | None, client_ip: str = "127.0.0.1
 
 def test_gate_accepts_state_left_by_migrations(fresh_schema):
     wait_until_single_backend(fresh_schema)                                  # (3-1B-3) 업그레이드 직후 — 판정은 아래 게이트
-    with fresh_schema.connect() as conn:
+    with fresh_schema.connect() as conn, diagnose_backends_on_failure(conn):   # (8.0.0) 실패 때만 연결 진단
         assert db.verify_test_schema(conn) == "0002"
 
 
@@ -203,7 +204,7 @@ def test_stepwise_0002_0001_round_trip(fresh_schema, alembic_cfg):
     tables = set(inspect(fresh_schema).get_table_names())
     assert "auth_failures" not in tables and {"users", "todos", "alembic_version"} <= tables
     wait_until_single_backend(fresh_schema)                                  # downgrade 직후 — 판정은 아래 게이트
-    with fresh_schema.connect() as conn:
+    with fresh_schema.connect() as conn, diagnose_backends_on_failure(conn):   # (8.0.0) 실패 때만 연결 진단
         assert db.verify_test_schema(conn) == "0001"
     command.upgrade(alembic_cfg, "head")
     assert "auth_failures" in inspect(fresh_schema).get_table_names()
@@ -685,6 +686,16 @@ def assert_no_secret(res, caplog, *secrets: str) -> None:
     assert "Traceback" not in caplog.text and all(r.exc_info is None for r in caplog.records)
 
 
+def assert_me_matches_auth(me: dict, auth_body: dict) -> None:
+    # (8.0.0, V8_SPEC §37) /auth/me = 가입·로그인 응답(AuthOut)의 모든 필드·값 그대로 + created_at 하나.
+    # 기존 필드 비교는 약화하지 않고, 추가 필드는 이름·형식(시간대 있는 ISO 8601)·시점(지금 이전)을 따로 본다.
+    assert set(auth_body) == {"id", "username", "csrf_token"}
+    assert set(me) == set(auth_body) | {"created_at"}
+    assert {k: me[k] for k in auth_body} == auth_body
+    created_at = datetime.fromisoformat(me["created_at"])
+    assert created_at.tzinfo is not None and created_at <= datetime.now(timezone.utc)
+
+
 def test_http_register_me_logout_flow(http_app):
     c = http_client()
     created = call(c, "POST", "/auth/register", body=creds("Alice"))
@@ -692,7 +703,8 @@ def test_http_register_me_logout_flow(http_app):
     body, token = created.json(), created.cookies.get(COOKIE)
     assert body["username"] == "alice" and token and token not in created.text
     me = call(c, "GET", "/auth/me", token=token)
-    assert me.status_code == 200 and me.json() == body
+    assert me.status_code == 200
+    assert_me_matches_auth(me.json(), body)                  # (8.0.0) 가입 응답 필드 그대로 + created_at
     assert db_state(http_app)["sessions"] == 1
     assert call(c, "POST", "/auth/logout", token=token, csrf=body["csrf_token"]).status_code == 204
     assert call(c, "GET", "/auth/me", token=token).status_code == 401
@@ -1005,6 +1017,377 @@ def test_http_me_with_session_returns_connection_each_request(http_app):
     assert http_app.pool.checkedout() == 0
     assert db_state(http_app)["sessions"] == 1                               # 조회는 세션 행을 바꾸지 않는다
     wait_for_backends_released(http_app)
+
+
+# ---------- (8.0.0) 계정 관리·데이터 API 인증 — 실제 PostgreSQL HTTP (V8_SPEC §37~§40, §43) ----------
+# - 인증 대체 없이 실제 require_user·require_csrf·require_account_session 을 거친다(E-15).
+# - 할 일·템플릿 데이터는 테스트마다 임시 JSON 파일이다(실제 todo.json·task_templates.json 은 쓰지 않는다).
+# - 동시 요청 테스트는 NullPool 엔진을 쓰고 끝나면 연결 반환을 기다린다(다음 R-19 게이트 조건).
+
+V8_NEW_PW = "brand-new-pass-7"
+SEED_JSON = [{"id": 1, "title": "공유 할 일", "description": "", "completed": False}]
+
+
+@pytest.fixture
+def v8_http(http_app, tmp_path, monkeypatch):
+    assert main.require_csrf not in main.app.dependency_overrides           # 인증 대체가 없다 (E-15)
+    todo_file, template_file = tmp_path / "todo.json", tmp_path / "task_templates.json"
+    todo_file.write_text(json_module.dumps(SEED_JSON, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(main, "TODO_FILE", todo_file)
+    monkeypatch.setattr(main, "TEMPLATE_FILE", template_file)
+    monkeypatch.setattr(main, "RECENTLY_DELETED", {})
+    yield http_app
+
+
+def json_fingerprint() -> tuple:
+    files = [main.TODO_FILE, main.TEMPLATE_FILE]
+    return tuple(hashlib.sha256(f.read_bytes()).hexdigest() if f.exists() else None for f in files) + (
+        dict(main.RECENTLY_DELETED),)
+
+
+def signup(c, username: str = "alice", password: str = HTTP_PW) -> tuple[str, str]:
+    res = call(c, "POST", "/auth/register", body=creds(username, password))
+    assert res.status_code == 201
+    return res.cookies.get(COOKIE), res.json()["csrf_token"]
+
+
+def signin(c, username: str = "alice", password: str = HTTP_PW):
+    return call(c, "POST", "/auth/login", body=creds(username, password))
+
+
+def stored_hash(engine, username: str = "alice") -> str | None:
+    with engine.connect() as conn:
+        value = conn.execute(select(db.User.password_hash).where(db.User.username == username)).scalar_one_or_none()
+        conn.rollback()
+    return value
+
+
+def change_pw(c, token, csrf, current=HTTP_PW, new=V8_NEW_PW):
+    return call(c, "POST", "/auth/password", token=token, csrf=csrf,
+                body={"current_password": current, "new_password": new})
+
+
+def run_http_concurrently(jobs: list) -> list:
+    # 스레드마다 HTTP 요청 하나 — Barrier 로 동시에 시작한다. 결과(상태 코드) 또는 예외 이름
+    start = threading.Barrier(len(jobs))
+    results: list = [None] * len(jobs)
+
+    def worker(i: int) -> None:
+        try:
+            start.wait(timeout=BARRIER_TIMEOUT)
+            results[i] = jobs[i]().status_code
+        except BaseException as e:                                       # noqa: BLE001 — 아래에서 실패로 본다
+            results[i] = type(e).__name__
+            start.abort()
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=False) for i in range(len(jobs))]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + JOIN_TIMEOUT
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    alive = [t for t in threads if t.is_alive()]
+    if alive:
+        _UNFINISHED_WORKERS.extend(alive)
+        pytest.fail(f"작업 스레드 {len(alive)}개가 {JOIN_TIMEOUT}초 안에 끝나지 않음")
+    return results
+
+
+def test_http_v8_me_has_created_at(v8_http):
+    c = http_client()
+    token, _ = signup(c)
+    body = call(c, "GET", "/auth/me", token=token).json()
+    assert set(body) == {"id", "username", "csrf_token", "created_at"}
+    assert datetime.fromisoformat(body["created_at"]).tzinfo is not None
+
+
+def test_http_v8_password_change_invalidates_old_sessions_and_password(v8_http, caplog):
+    c = http_client()
+    token1, csrf1 = signup(c)
+    token2 = signin(c).cookies.get(COOKIE)                                   # 다른 기기 세션
+    old_hash = stored_hash(v8_http)
+    res = change_pw(c, token1, csrf1)
+    assert res.status_code == 200
+    token3, csrf3 = res.cookies.get(COOKIE), res.json()["csrf_token"]
+    assert token3 not in (token1, token2) and csrf3 != csrf1
+    # 이전 세션 요청 401 (요청한 세션·다른 기기 모두) — /auth/me 와 데이터 API
+    assert call(c, "GET", "/auth/me", token=token1).status_code == 401
+    assert call(c, "GET", "/auth/me", token=token2).status_code == 401
+    assert call(c, "GET", "/todos", token=token1).status_code == 401
+    assert call(c, "POST", "/todos", token=token2, csrf=csrf1, body={"title": "x"}).status_code == 401
+    assert call(c, "GET", "/auth/me", token=token3).status_code == 200
+    assert call(c, "POST", "/todos", token=token3, csrf=csrf3, body={"title": "새 세션"}).status_code == 201
+    assert db_state(v8_http)["sessions"] == 1                                # 새 세션 하나만
+    # 이전 비밀번호 로그인 401, 새 비밀번호 200
+    assert signin(c).status_code == 401
+    assert signin(c, password=V8_NEW_PW).status_code == 200
+    new_hash = stored_hash(v8_http)
+    assert new_hash != old_hash and new_hash.startswith("$argon2id$")
+    assert_no_secret(res, caplog, V8_NEW_PW, new_hash, token1)
+
+
+def test_http_v8_wrong_current_password_is_400_and_changes_nothing(v8_http):
+    c = http_client()
+    token, csrf = signup(c)
+    before = (stored_hash(v8_http), db_state(v8_http)["sessions"])
+    res = change_pw(c, token, csrf, current="wrong-password-1")
+    assert res.status_code == 400 and res.json() == {"detail": main.PASSWORD_MISMATCH}
+    assert COOKIE not in res.headers.get("set-cookie", "")
+    assert (stored_hash(v8_http), db_state(v8_http)["sessions"]) == before
+    assert call(c, "GET", "/auth/me", token=token).status_code == 200       # 세션 그대로
+    logins = [r for r in db_state(v8_http)["failures"] if r[1] == "login"]
+    assert [u for _, _, u in logins] == [login_as().failure_key]            # 로그인 실패와 같은 기록 (E-14)
+
+
+def test_http_v8_password_failures_share_login_limit(v8_http):
+    c = http_client()
+    token, csrf = signup(c)
+    for _ in range(auth.LOGIN_LIMIT_USER_IP):
+        assert change_pw(c, token, csrf, current="wrong-password-1").status_code == 400
+    blocked = change_pw(c, token, csrf)                                      # 맞는 현재 비밀번호도 검증 전에 차단
+    assert blocked.status_code == 429 and int(blocked.headers["retry-after"]) >= 1
+    assert signin(c).status_code == 429                                      # 로그인도 같은 예산으로 막힌다
+    assert stored_hash(v8_http) is not None and signin(c, password=V8_NEW_PW).status_code == 429
+
+
+def test_http_v8_session_rotation_failure_keeps_password_and_sessions(v8_http, monkeypatch, caplog):
+    c = http_client()
+    token, csrf = signup(c)
+    other = signin(c).cookies.get(COOKIE)
+    before = (stored_hash(v8_http), db_state(v8_http)["sessions"])
+
+    def broken_create_session(*args, **kwargs):
+        raise SQLAlchemyError("boom DETAIL")
+    monkeypatch.setattr(db, "create_session", broken_create_session)
+    res = change_pw(c, token, csrf)
+    assert res.status_code == 500 and COOKIE not in res.headers.get("set-cookie", "")
+    monkeypatch.undo()
+    assert (stored_hash(v8_http), db_state(v8_http)["sessions"]) == before    # 해시·세션 삭제 모두 취소
+    assert call(c, "GET", "/auth/me", token=token).status_code == 200
+    assert call(c, "GET", "/auth/me", token=other).status_code == 200
+    assert signin(c).status_code == 200                                      # 이전 비밀번호가 그대로 유효
+    assert_no_secret(res, caplog, V8_NEW_PW)
+
+
+def test_http_v8_rehash_race_is_409_and_changes_nothing(v8_http, monkeypatch):
+    c = http_client()
+    token, csrf = signup(c)
+    raced = "$argon2id$v=19$m=65536,t=3,p=4$cmFjZWQ$cmFjZWQ"
+
+    def verify_then_rehash(stored, password):
+        ok = REAL_VERIFY_LOGIN(stored, password)
+        with v8_http.begin() as conn:                                       # 검증 뒤 다른 요청이 해시를 바꿈(로그인 rehash 흉내)
+            conn.execute(update(db.User).where(db.User.username == "alice").values(password_hash=raced))
+        return ok
+    monkeypatch.setattr(auth, "verify_login_password", verify_then_rehash)
+    res = change_pw(c, token, csrf)
+    assert res.status_code == 409 and res.json() == {"detail": main.ACCOUNT_CONFLICT}
+    assert stored_hash(v8_http) == raced and db_state(v8_http)["sessions"] == 1
+    assert call(c, "GET", "/auth/me", token=token).status_code == 200
+
+
+@pytest.mark.parametrize("same_session", [True, False], ids=["same-session", "two-sessions"])
+def test_http_v8_concurrent_password_changes(fresh_schema, monkeypatch, tmp_path, same_session):
+    # 같은 사용자의 비밀번호 변경 2건 동시 → 정확히 1건 200, 다른 1건 401(세션이 사라짐). 남는 세션은 승자의 새 세션 1개
+    monkeypatch.setattr(logging.getLogger("todo.auth"), "disabled", False)
+    other = nullpool_engine()
+    try:
+        use_app_engine(other)
+        c = http_client()
+        token1, csrf1 = signup(c)
+        token2, csrf2 = (token1, csrf1) if same_session else (
+            lambda r: (r.cookies.get(COOKIE), r.json()["csrf_token"]))(signin(c))
+        news = ["first-new-pass-1", "second-new-pass-2"]
+        results = run_http_concurrently([
+            lambda: change_pw(http_client(), token1, csrf1, new=news[0]),
+            lambda: change_pw(http_client(), token2, csrf2, new=news[1]),
+        ])
+        assert sorted(results) == [200, 401], results
+        winner = news[results.index(200)]
+        loser = news[results.index(401)]
+        assert db_state(fresh_schema)["sessions"] == 1
+        assert signin(c, password=loser).status_code == 401
+        assert signin(c, password=winner).status_code == 200
+    finally:
+        main.app.dependency_overrides.clear()
+        other.dispose()
+        wait_for_backends_released(fresh_schema)
+
+
+def test_http_v8_concurrent_password_change_and_delete(fresh_schema, monkeypatch, tmp_path):
+    # 비밀번호 변경과 탈퇴 동시 → 정확히 하나만 성공, 다른 하나는 401. 고아 세션 없음
+    monkeypatch.setattr(logging.getLogger("todo.auth"), "disabled", False)
+    monkeypatch.setattr(main, "TODO_FILE", tmp_path / "todo.json")
+    monkeypatch.setattr(main, "TEMPLATE_FILE", tmp_path / "task_templates.json")
+    other = nullpool_engine()
+    try:
+        use_app_engine(other)
+        c = http_client()
+        token, csrf = signup(c)
+        results = run_http_concurrently([
+            lambda: change_pw(http_client(), token, csrf),
+            lambda: call(http_client(), "POST", "/auth/account/delete", token=token, csrf=csrf,
+                         body={"password": HTTP_PW}),
+        ])
+        assert results in ([200, 401], [401, 204]), results
+        state = db_state(fresh_schema)
+        if results[1] == 204:
+            assert state["users"] == 0 and state["sessions"] == 0
+        else:
+            assert state["users"] == 1 and state["sessions"] == 1
+    finally:
+        main.app.dependency_overrides.clear()
+        other.dispose()
+        wait_for_backends_released(fresh_schema)
+
+
+USER_FOREIGN_KEYS = {
+    ("data_migrations", "fk_data_migrations_owner_user_id_users", "a"),     # NO ACTION — 탈퇴를 막는다(409)
+    ("sessions", "fk_sessions_user_id_users", "c"),
+    ("task_templates", "fk_task_templates_user_id_users", "c"),
+    ("todos", "fk_todos_user_id_users", "c"),
+}
+
+
+def test_v8_user_foreign_keys_match_spec(fresh_schema):
+    # V8_SPEC §39.2 — users 를 참조하는 FK 와 ON DELETE 동작(c=CASCADE, a=NO ACTION). 바뀌면 명세와 함께 고친다
+    with rolled_back(fresh_schema) as conn:
+        rows = conn.execute(text(
+            "SELECT conrelid::regclass::text, conname, confdeltype::text FROM pg_constraint "
+            "WHERE contype = 'f' AND confrelid = 'users'::regclass")).all()
+        subtasks = conn.execute(text(
+            "SELECT conname, confdeltype::text FROM pg_constraint "
+            "WHERE contype = 'f' AND conrelid = 'subtasks'::regclass")).all()
+    assert {tuple(r) for r in rows} == USER_FOREIGN_KEYS
+    assert [tuple(r) for r in subtasks] == [("fk_subtasks_todo_id_todos", "c")]
+    assert not conn_has_auth_failures_fk(fresh_schema)
+
+
+def conn_has_auth_failures_fk(engine) -> bool:
+    with rolled_back(engine) as conn:
+        return conn.execute(text("SELECT count(*) FROM pg_constraint WHERE contype = 'f' "
+                                 "AND conrelid = 'auth_failures'::regclass")).scalar_one() > 0
+
+
+def test_http_v8_account_delete_cascades_and_keeps_shared_json(v8_http, caplog):
+    c = http_client()
+    token, csrf = signup(c)
+    other_device = signin(c).cookies.get(COOKIE)
+    bob_token, bob_csrf = signup(c, "bob")
+    assert call(c, "POST", "/todos", token=token, csrf=csrf, body={"title": "alice 가 만든 공유 할 일"}).status_code == 201
+    with v8_http.begin() as conn:                                           # DB 표의 합성 행(앱은 v8 에서 쓰지 않는다)
+        s = orm(conn)
+        alice_id = conn.execute(select(db.User.id).where(db.User.username == "alice")).scalar_one()
+        assert db.lock_user(s, alice_id)
+        db.insert_todo(s, alice_id, {"title": "합성"}, subtasks=[("하위", False)])
+        db.insert_template(s, alice_id, {"name": "합성", "title": "t"})
+        s.flush()
+    shared_before = json_fingerprint()
+    listing_before = call(c, "GET", "/todos", token=bob_token).json()
+    res = call(c, "POST", "/auth/account/delete", token=token, csrf=csrf, body={"password": HTTP_PW})
+    assert res.status_code == 204 and "Max-Age=0" in res.headers["set-cookie"]
+    with v8_http.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(db.User).where(db.User.username == "alice")).scalar_one() == 0
+        assert conn.execute(select(func.count()).select_from(db.UserSession)
+                            .where(db.UserSession.user_id == alice_id)).scalar_one() == 0
+        assert count(conn, db.Todo) == 0 and count(conn, db.Subtask) == 0 and count(conn, db.TaskTemplate) == 0
+        conn.rollback()
+    assert call(c, "GET", "/auth/me", token=token).status_code == 401
+    assert call(c, "GET", "/auth/me", token=other_device).status_code == 401
+    assert signin(c).status_code == 401
+    assert json_fingerprint() == shared_before                               # 공유 JSON·복구 버퍼 보존 (E-5)
+    assert call(c, "GET", "/todos", token=bob_token).json() == listing_before
+    assert call(c, "GET", "/auth/me", token=bob_token).status_code == 200    # 다른 사용자 영향 없음
+    signup(c)                                                                # 같은 username 재가입 가능
+    assert_no_secret(res, caplog)
+
+
+def test_http_v8_account_delete_blocked_by_reference_is_409(v8_http):
+    c = http_client()
+    token, csrf = signup(c)
+    with v8_http.begin() as conn:
+        alice_id = conn.execute(select(db.User.id).where(db.User.username == "alice")).scalar_one()
+        conn.execute(insert(db.DataMigration).values(source_sha256="0" * 64, owner_user_id=alice_id, todo_count=0,
+                                                     template_count=0, migrated_at=datetime.now(timezone.utc)))
+    res = call(c, "POST", "/auth/account/delete", token=token, csrf=csrf, body={"password": HTTP_PW})
+    assert res.status_code == 409 and res.json() == {"detail": main.ACCOUNT_DELETE_BLOCKED}
+    assert "data_migrations" not in res.text and "fk_" not in res.text     # 내부 구조 비노출 (E-13)
+    state = db_state(v8_http)
+    assert state["users"] == 1 and state["sessions"] == 1
+    assert call(c, "GET", "/auth/me", token=token).status_code == 200
+
+
+def test_http_v8_account_delete_wrong_password_is_400(v8_http):
+    c = http_client()
+    token, csrf = signup(c)
+    res = call(c, "POST", "/auth/account/delete", token=token, csrf=csrf, body={"password": "wrong-password-1"})
+    assert res.status_code == 400 and res.json() == {"detail": main.ACCOUNT_PASSWORD_MISMATCH}
+    assert db_state(v8_http)["users"] == 1 and call(c, "GET", "/auth/me", token=token).status_code == 200
+
+
+V8_DATA_CALLS = [
+    ("GET", "/todos", None), ("GET", "/todos/export?format=csv", None), ("GET", "/stats", None),
+    ("GET", "/task-templates", None), ("POST", "/todos", {"title": "t"}), ("POST", "/todos/restore", {"ids": [1]}),
+    ("POST", "/todos/bulk", {"ids": [1], "action": "complete"}), ("PUT", "/todos/1", {"title": "t"}),
+    ("DELETE", "/todos/1", None), ("POST", "/todos/1/subtasks", {"title": "s"}),
+    ("PUT", "/todos/1/subtasks/1", {"title": "s", "completed": True}), ("DELETE", "/todos/1/subtasks/1", None),
+    ("POST", "/task-templates", {"name": "n", "title": "t"}), ("PUT", "/task-templates/1", {"name": "n", "title": "t"}),
+    ("DELETE", "/task-templates/1", None),
+]
+
+
+def test_http_v8_data_api_auth_matrix_and_shared_data(v8_http):
+    c = http_client()
+    a_token, a_csrf = signup(c, "alice")
+    b_token, b_csrf = signup(c, "bob")
+    before = json_fingerprint()
+    for method, path, body in V8_DATA_CALLS:
+        assert call(c, method, path, body=body).status_code == 401, (method, path)            # 익명
+        if method != "GET":
+            assert call(c, method, path, body=body, token=a_token).status_code == 403, path   # CSRF 없음
+            assert call(c, method, path, body=body, token=a_token, csrf=b_csrf).status_code == 403, path   # 남의 토큰
+    assert json_fingerprint() == before                                      # 거부된 요청은 아무것도 바꾸지 않음
+    created = call(c, "POST", "/todos", token=a_token, csrf=a_csrf, body={"title": "A 가 만든 할 일"})
+    assert created.status_code == 201
+    todo_id = created.json()["id"]
+    titles = [t["title"] for t in call(c, "GET", "/todos", token=b_token).json()]
+    assert "A 가 만든 할 일" in titles                                        # 로그인한 모든 사용자가 공유 (E-2)
+    assert call(c, "PUT", f"/todos/{todo_id}", token=b_token, csrf=b_csrf, body={"title": "B 가 고침"}).status_code == 200
+    wait_for_backends_released(v8_http)
+
+
+def test_http_v8_security_regressions(v8_http):
+    # (8.0.0 3단계 3-1) ① 같은 사용자의 다른 세션 CSRF 토큰 재사용 403 ② 비밀번호 변경 뒤 옛 쿠키·옛 CSRF 로 데이터 API 401
+    # ③ 탈퇴 뒤 쿠키 재사용(데이터 읽기·쓰기) 401 ④ 내보내기 링크(CSV·JSON) 비로그인 401. 거부된 요청은 공유 JSON 을 바꾸지 않는다
+    c = http_client()
+    token1, csrf1 = signup(c)
+    login2 = signin(c)
+    token2, csrf2 = login2.cookies.get(COOKIE), login2.json()["csrf_token"]
+    assert csrf1 != csrf2
+    before = json_fingerprint()
+    assert call(c, "POST", "/todos", token=token1, csrf=csrf2, body={"title": "x"}).status_code == 403   # ①
+    assert call(c, "POST", "/todos", token=token2, csrf=csrf1, body={"title": "x"}).status_code == 403
+    for fmt in ("csv", "json"):                                                                          # ④
+        assert call(c, "GET", f"/todos/export?format={fmt}").status_code == 401
+    assert json_fingerprint() == before
+    changed = call(c, "POST", "/auth/password", token=token1, csrf=csrf1,
+                   body={"current_password": HTTP_PW, "new_password": "new-" + HTTP_PW})
+    assert changed.status_code == 200
+    new_token, new_csrf = changed.cookies.get(COOKIE), changed.json()["csrf_token"]
+    for token, csrf in ((token1, csrf1), (token2, csrf2)):                                               # ②
+        assert call(c, "GET", "/todos", token=token).status_code == 401
+        assert call(c, "POST", "/todos", token=token, csrf=csrf, body={"title": "x"}).status_code == 401
+        assert call(c, "POST", "/todos", token=token, csrf=new_csrf, body={"title": "x"}).status_code == 401
+    assert json_fingerprint() == before
+    assert call(c, "GET", "/todos", token=new_token).status_code == 200
+    deleted = call(c, "POST", "/auth/account/delete", token=new_token, csrf=new_csrf,
+                   body={"password": "new-" + HTTP_PW})
+    assert deleted.status_code == 204
+    assert call(c, "GET", "/todos", token=new_token).status_code == 401                                 # ③
+    assert call(c, "GET", "/todos/export?format=csv", token=new_token).status_code == 401
+    assert call(c, "POST", "/todos", token=new_token, csrf=new_csrf, body={"title": "x"}).status_code == 401
+    assert json_fingerprint() == before
+    wait_for_backends_released(v8_http)
 
 
 # ---------- (Phase 3-1B-2) 사용자 데이터 헬퍼의 소유권 격리 (실제 PostgreSQL) ----------
@@ -1889,7 +2272,8 @@ def test_mp_session_and_csrf_shared_across_processes(fresh_schema, tmp_path):
         token, csrf = created.cookies.get(COOKIE), created.json()["csrf_token"]
         secrets_seen += [token, csrf]
         me = http(p2, "GET", "/auth/me", token=token)
-        assert me.status_code == 200 and me.json() == created.json()
+        assert me.status_code == 200
+        assert_me_matches_auth(me.json(), created.json())   # (8.0.0) 다른 프로세스에서도 같은 필드 + created_at
         assert http(p2, "POST", "/auth/logout", token=token, csrf="wrong-csrf").status_code == 403
         assert http(p1, "GET", "/auth/me", token=token).status_code == 200            # 403 은 세션을 지우지 않는다
         assert http(p2, "POST", "/auth/logout", token=token, csrf=csrf).status_code == 204

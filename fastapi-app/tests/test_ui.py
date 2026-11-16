@@ -313,7 +313,7 @@ def test_b21_overdue_style(page: Page, seed):
 
 def test_b22_version(page: Page, seed):
     open_app(page)
-    expect(page.get_by_text("Version 7.0.0")).to_be_visible()
+    expect(page.locator(".version")).to_have_text("Version 8.0.0 · 할 일·템플릿은 로그인한 모든 사용자가 함께 씁니다")   # (8.0.0)
 
 
 # ---------- 5.0.0 1단계: 즐겨찾기 ----------
@@ -2430,7 +2430,9 @@ def test_keyboard_theme_and_focus_visible(page: Page, seed):
     expect(select).to_have_value("light")
     page.keyboard.press("ArrowDown")                                             # 라이트 → 다크
     expect(page.locator("html")).to_have_attribute("data-theme", "dark")
-    page.keyboard.press("Tab")                                                   # (3-2) 로그인 상태: 테마 → 로그아웃 → 종
+    page.keyboard.press("Tab")                                                   # (8.0.0) 로그인 상태: 테마 → 계정 → 로그아웃 → 종
+    expect(page.get_by_test_id("account-menu")).to_be_focused()
+    page.keyboard.press("Tab")
     expect(page.get_by_test_id("logout")).to_be_focused()
     page.keyboard.press("Tab")
     expect(bell(page)).to_be_focused()

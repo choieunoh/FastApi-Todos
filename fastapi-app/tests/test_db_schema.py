@@ -706,9 +706,21 @@ def test_reset_before_drop_locks_and_rechecks_in_same_transaction():
     # with 본문의 문장 구성: None 이면 기존과 같은 문장만 실행된다 (추가는 if before_drop 블록 하나)
     (try_node,) = [n for n in reset.body if isinstance(n, ast.Try)]
     (with_node,) = try_node.body
-    shape = [ast.unparse(s.test) if isinstance(s, ast.If) else _dotted(s.value.func) for s in with_node.body]
+    # (8.0.0) 게이트 호출은 진단 래퍼(diagnose_backends_on_failure(conn)) 안에 그 호출 하나만 둔다 — 진단은 멈출 때만 읽는다
+    def stmt_shape(s):
+        if isinstance(s, ast.If):
+            return ast.unparse(s.test)
+        if isinstance(s, ast.With):
+            (item,) = s.items
+            assert ast.unparse(item.context_expr) == "diagnose_backends_on_failure(conn)" and item.optional_vars is None
+            assert [ast.unparse(b) for b in s.body] == ["db.verify_test_schema(conn)"]
+            return "db.verify_test_schema"
+        return _dotted(s.value.func)
+    shape = [stmt_shape(s) for s in with_node.body]
     assert shape == ["db.verify_test_server", "db.verify_test_schema", "conn.execute", "before_drop is not None",
                      "conn.execute"]
+    rechecks = [s for s in with_node.body[3].body if isinstance(s, ast.With)]     # 잠금 아래 재검사도 같은 래퍼 하나
+    assert [stmt_shape(s) for s in rechecks] == ["db.verify_test_schema"]
     block = with_node.body[3]
     create = with_node.body[4]
     assert ast.unparse(create) == "conn.execute(text('CREATE SCHEMA public'))"
@@ -1067,7 +1079,10 @@ result = {"after_import": list(events), "engine_cache": db.get_engine.cache_info
           "sessionmaker_cache": db.get_sessionmaker.cache_info().currsize}
 
 # v6 데이터 경로는 JSON 저장 그대로 — DB 를 건드리지 않고 TODO_FILE 에 쓴다
+# (8.0.0) 데이터 경로는 로그인 필수다. 여기서는 저장 경로만 보므로 인증 의존성(require_csrf)만 고정 사용자로 바꾼다
+# — 실제 인증은 세션 조회로 DB 를 쓰며, 그 검사는 test_auth_routes.py·test_db_postgres.py 몫이다 (V8_SPEC E-15)
 from fastapi.testclient import TestClient
+main.app.dependency_overrides[main.require_csrf] = lambda: main.CurrentUser(id=1, username="probe", csrf_token="x")
 client = TestClient(main.app)
 created = client.post("/todos", json={"title": "probe"})
 result["post_status"] = created.status_code
@@ -1114,3 +1129,217 @@ def test_importing_main_creates_no_engine_or_connection_and_v6_stays_json(tmp_pa
     assert out["post_status"] == 201 and out["get_titles"] == ["probe"] and out["json_titles"] == ["probe"]
     assert out["after_v6_requests"] == []                       # v6 경로는 DB 를 쓰지 않는다
     assert not (tmp_path / "task_templates.json").exists()      # 템플릿 파일은 처음 저장할 때만 만든다
+
+
+# ---------- (8.0.0) R-19 연결 수 진단 — DB 없이 가짜 연결로 확인 ----------
+# 진단은 멈출 때만 같은 연결·트랜잭션에서 읽기만 하고, 게이트 판정(db.verify_test_schema)·중단(pytest.exit)·삭제 전 중단은 그대로다.
+from contextlib import contextmanager  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from sqlalchemy.exc import OperationalError  # noqa: E402
+
+GATE_STOP = "DB 전체 연결 수 2 (점검 연결 1개만 허용, 다른 역할 세션 포함)"
+T0 = datetime(2026, 11, 15, 13, 0, 0, 123456, tzinfo=timezone.utc)
+
+
+class _Result:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one(self):
+        return self.value
+
+    def scalar_one_or_none(self):
+        return self.value
+
+    def all(self):
+        return self.value
+
+
+class DiagConn:
+    # SQL 을 기록만 하는 가짜 연결. 연결 수·진단 SELECT 에 정해진 값을 돌려주고, 그 밖의 문장은 기록만 한다
+    def __init__(self, pg_harness, *, numbackends=2, others=0, rows=None, fail=None):
+        self.h, self.numbackends, self.others, self.fail = pg_harness, numbackends, others, fail
+        self.rows = rows if rows is not None else [
+            SimpleNamespace(pid=101, is_self=True, backend_type="client backend", usename="todo_test_user",
+                            application_name="", state="active", backend_start=T0, hidden=False, client_kind="loopback"),
+            SimpleNamespace(pid=202, is_self=False, backend_type="autovacuum worker", usename=None,
+                            application_name="", state=None, backend_start=T0 + timedelta(seconds=1), hidden=True,
+                            client_kind="none")]
+        self.sql: list[str] = []
+        self.ended: list[str] = []
+
+    def execute(self, clause, *args):
+        sql = str(clause)
+        self.sql.append(sql)
+        if self.fail is not None and sql in self.h.BACKEND_DIAG_SQL.values():
+            raise self.fail
+        if sql in (self.h.BACKEND_DIAG_SQL["numbackends"], db.TEST_SCHEMA_SQL["database_backends"]):
+            return _Result(self.numbackends)
+        if sql == db.TEST_SCHEMA_SQL["other_sessions"]:
+            return _Result(self.others)
+        if sql == self.h.BACKEND_DIAG_SQL["backends"]:
+            return _Result(self.rows)
+        if sql == self.h.BACKEND_DIAG_SQL["server_kinds"]:
+            return _Result([SimpleNamespace(kind="autovacuum launcher", n=1), SimpleNamespace(kind="client backend", n=3)])
+        return _Result(None)
+
+    def rollback(self):
+        self.ended.append("rollback")
+
+    def commit(self):
+        self.ended.append("commit")
+
+
+class DiagEngine:
+    def __init__(self, conn):
+        self.conn = conn
+
+    @contextmanager
+    def begin(self):
+        yield self.conn
+
+    @contextmanager
+    def connect(self):
+        yield self.conn
+
+
+def diag_only(pg_harness) -> set[str]:
+    # 진단에만 쓰는 SELECT (numbackends 문장은 대기·게이트도 쓰므로 "진단이 없었다" 판단에서 뺀다)
+    return {pg_harness.BACKEND_DIAG_SQL["backends"], pg_harness.BACKEND_DIAG_SQL["server_kinds"]}
+
+
+@pytest.fixture
+def harness():
+    import pg_harness
+    return pg_harness
+
+
+def test_diag_sql_is_read_only_and_records_no_sql_text_or_addresses(harness):
+    for name, sql in harness.BACKEND_DIAG_SQL.items():
+        assert sql.startswith("SELECT ") and not WRITE_SQL.search(sql), name
+    backends = harness.BACKEND_DIAG_SQL["backends"]
+    select_list, rest = backends.split(" FROM pg_stat_activity", 1)
+    assert "a.query = '<insufficient privilege>' AS hidden" in select_list           # query 는 비교만 (본문 미출력)
+    assert re.findall(r"a\.query\b", select_list) == ["a.query"]
+    assert "a.client_addr IS NULL" in select_list and " a.client_addr," not in select_list   # 주소 대신 종류만
+    for column in ("a.pid", "pg_backend_pid()", "a.backend_type", "a.usename", "a.application_name", "a.state",
+                   "a.backend_start"):
+        assert column in select_list
+    assert "current_database()" in rest                                            # 이 DB 의 백엔드만
+    # 진단 함수는 새 연결·commit·rollback·중단을 하지 않는다 (같은 트랜잭션에서 읽기만)
+    tree = ast.parse((APP_DIR / "tests" / "pg_harness.py").read_text(encoding="utf-8"))
+    (fn,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "describe_backends"]
+    calls = {_dotted(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)}
+    assert "conn.execute" in calls and not calls & {"conn.commit", "conn.rollback", "engine.connect", "engine.begin",
+                                                    "nullpool_engine", "db.make_engine", "pytest.exit", "pytest.fail"}
+
+
+def test_describe_backends_marks_self_and_sanitizes(harness):
+    rows = [SimpleNamespace(pid=7, is_self=True, backend_type="client backend", usename="todo_test_user",
+                            application_name="psql\n DROP\tx" + "y" * 80, state="idle in transaction",
+                            backend_start=T0.astimezone(timezone(timedelta(hours=9))), hidden=False,
+                            client_kind="loopback"),
+            SimpleNamespace(pid=8, is_self=False, backend_type="autovacuum worker", usename=None, application_name=None,
+                            state=None, backend_start=None, hidden=True, client_kind="none")]
+    conn = DiagConn(harness, numbackends=2, rows=rows)
+    out = harness.describe_backends(conn)
+    assert out.startswith("[연결 진단 (같은 트랜잭션, 원인 판정 아님): numbackends=2, 이 DB 백엔드 2개 — ")
+    assert "pid=7(자기(진단·점검) 연결) type=client_backend user=todo_test_user" in out
+    assert "state=idle_in_transaction start=2026-11-15T13:00:00.123456Z client=loopback" in out   # UTC 로 맞춘다
+    assert "pid=8(다른 연결) type=autovacuum_worker user=- app=- state=- start=- client=none 세부=권한부족" in out
+    assert "\n" not in out and "\t" not in out and "psql__DROP_x" in out and "y" * 41 not in out and "…" in out
+    assert out.endswith("서버 전체 종류별: autovacuum_launcher=1, client_backend=3]")
+    assert conn.ended == [] and len(conn.sql) == 3                                  # 읽기 3문장, 트랜잭션 제어 없음
+
+
+@pytest.mark.parametrize("fail, label", [(OperationalError("SELECT", {}, Exception("x")), "OperationalError"),
+                                         (RuntimeError("boom"), "RuntimeError")])
+def test_describe_backends_failure_is_reported_not_raised(harness, fail, label):
+    out = harness.describe_backends(DiagConn(harness, fail=fail))
+    assert out.startswith(f"[연결 진단 실패: {label}") and "boom" not in out and "SELECT" not in out
+
+
+def test_diagnose_wrapper_reraises_same_gate_error_with_diagnostics(harness):
+    conn = DiagConn(harness)
+    with pytest.raises(db.DatabaseConfigError) as caught:
+        with harness.diagnose_backends_on_failure(conn):
+            raise db.DatabaseConfigError(GATE_STOP)
+    message = str(caught.value)
+    assert message.startswith(GATE_STOP + " [연결 진단")                             # 원래 사유를 그대로 앞에 둔다
+    assert "pid=202(다른 연결) type=autovacuum_worker" in message
+    # 진단이 실패해도 같은 예외로 멈춘다
+    failing = DiagConn(harness, fail=OperationalError("SELECT", {}, Exception()))
+    with pytest.raises(db.DatabaseConfigError, match=r"DB 전체 연결 수 2 .*\[연결 진단 실패: OperationalError"):
+        with harness.diagnose_backends_on_failure(failing):
+            raise db.DatabaseConfigError(GATE_STOP)
+
+
+@pytest.mark.parametrize("exc", [OperationalError("SELECT", {}, Exception()), AssertionError("x"), KeyError("k")])
+def test_diagnose_wrapper_leaves_success_and_other_errors_alone(harness, exc):
+    conn = DiagConn(harness)
+    with harness.diagnose_backends_on_failure(conn):
+        pass
+    with pytest.raises(type(exc)) as caught:
+        with harness.diagnose_backends_on_failure(conn):
+            raise exc
+    assert caught.value is exc and conn.sql == []                                  # 성공·다른 오류에는 진단 SQL 없음
+
+
+def test_reset_stops_before_drop_with_diagnostics_when_gate_sees_two_backends(harness, monkeypatch):
+    # 판정은 db.py 그대로(인벤토리 연결 수 2 → DatabaseConfigError). 대기는 통과하고 게이트에서 2가 보인 이번 사례를 흉내낸다
+    conn = DiagConn(harness, numbackends=2)
+    monkeypatch.setattr(harness, "wait_until_single_backend", lambda engine: None)
+    monkeypatch.setattr(db, "verify_test_server", lambda c: None)
+    monkeypatch.setattr(db, "read_test_schema_inventory", lambda c: inventory("0002", database_backends=2))
+    upgrades = []
+    monkeypatch.setattr(harness.command, "upgrade", lambda *a: upgrades.append(a))
+    with pytest.raises(pytest.exit.Exception) as stopped:
+        harness.reset_test_schema(DiagEngine(conn), None)
+    message = str(stopped.value)
+    assert "DB 전체 연결 수 2 (점검 연결 1개만 허용" in message and "[연결 진단 (같은 트랜잭션" in message
+    assert "pid=101(자기(진단·점검) 연결)" in message and "pid=202(다른 연결)" in message
+    assert stopped.value.returncode == 2
+    assert not any(re.search(r"\b(DROP|CREATE|LOCK|SET)\b", s) for s in conn.sql) and upgrades == []
+    assert set(conn.sql) == set(harness.BACKEND_DIAG_SQL.values())                  # 진단 SELECT 만 실행됐다
+
+
+def test_reset_gate_pass_runs_no_diagnostics(harness, monkeypatch):
+    conn = DiagConn(harness, numbackends=1)
+    monkeypatch.setattr(harness, "wait_until_single_backend", lambda engine: None)
+    monkeypatch.setattr(db, "verify_test_server", lambda c: None)
+    monkeypatch.setattr(db, "read_test_schema_inventory", lambda c: inventory("0002"))
+    monkeypatch.setattr(harness.command, "upgrade", lambda *a: None)
+    harness.reset_test_schema(DiagEngine(conn), None)
+    assert not set(conn.sql) & diag_only(harness)
+    assert any("DROP SCHEMA public CASCADE" in s for s in conn.sql)                   # 통과하면 기존 경로 그대로
+
+
+@pytest.mark.parametrize("backends, others, timeout, expect", [
+    (1, 0, 10, None),                                            # 1 이면 진단 없이 통과
+    (2, 1, 10, "같은 역할의 다른 세션 1개"),                       # 다른 세션: 기다리지 않고 멈춘다
+    (2, 0, 0, "DB 연결 수 2 가 0초 안에 1로 돌아오지 않음"),         # 상한이 지나면 멈춘다
+    (None, 0, 10, "게이트 전 연결 수를 확인할 수 없음"),
+])
+def test_wait_until_single_backend_stops_with_diagnostics(harness, monkeypatch, backends, others, timeout, expect):
+    conn = DiagConn(harness, numbackends=backends, others=others)
+    monkeypatch.setattr(harness, "BACKEND_RELEASE_TIMEOUT", timeout)
+    if expect is None:
+        harness.wait_until_single_backend(DiagEngine(conn))
+        assert not set(conn.sql) & diag_only(harness)
+        return
+    with pytest.raises(pytest.exit.Exception) as stopped:
+        harness.wait_until_single_backend(DiagEngine(conn))
+    assert expect in str(stopped.value) and "[연결 진단" in str(stopped.value) and stopped.value.returncode == 2
+    assert conn.ended == ["rollback"]
+
+
+def test_wait_for_backends_released_fails_with_diagnostics(harness, monkeypatch):
+    monkeypatch.setattr(harness, "BACKEND_RELEASE_TIMEOUT", 0)
+    conn = DiagConn(harness, numbackends=2)
+    with pytest.raises(pytest.fail.Exception, match=r"정리되지 않음 \(DB 연결 수 2, 다른 세션 0\) \[연결 진단"):
+        harness.wait_for_backends_released(DiagEngine(conn))
+    released = DiagConn(harness, numbackends=1)
+    harness.wait_for_backends_released(DiagEngine(released))
+    assert not set(released.sql) & diag_only(harness)
