@@ -412,7 +412,13 @@ def test_undo_restores_deleted_item(page: Page, seed):
     page.get_by_test_id("undo-button").click()
     expect(toast).to_be_hidden()
     expect(page.locator(ITEM)).to_have_count(3)
-    assert titles(page) == ["첫째", "지울 항목", "셋째"]          # 원래 자리로 돌아온다
+    expect(
+        page.locator(f"{ITEM} .content > span:first-child")
+    ).to_have_text([
+        re.compile(r"^첫째 — "),
+        re.compile(r"^지울 항목 — "),
+        re.compile(r"^셋째 — "),
+    ])  # 원래 자리로 돌아온다
     assert stats(page) == ("3", "1", "2", "0", "33%")
     expect(star(page, "지울 항목")).to_have_text("★")
     expect(item(page, "지울 항목").get_by_test_id("todo-tag")).to_have_text(["#t"])
